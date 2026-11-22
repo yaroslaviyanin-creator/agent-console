@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"019abcde-0123-4567-89ab-0123456789ab"}
+{"type":"turn.started"}
+{"type":"item.updated","item":{"type":"reasoning","id":"item_0","text":"Checking"}}
+{"type":"item.completed","item":{"type":"reasoning","id":"item_0","text":"Checking the context."}}
+{"type":"item.completed","item":{"type":"reasoning","id":"item_0","text":"Checking the context."}}
+{"type":"item.completed","item":{"type":"command_execution","id":"item_1","command":"fixture","aggregated_output":"private tool output","status":"completed"}}
+{"type":"item.completed","item":{"type":"agent_message","id":"item_2","text":"Hello, world."}}
+{"type":"item.completed","item":{"type":"agent_message","id":"item_2","text":"Hello, world."}}
+{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":3}}

@@ -1,0 +1,78 @@
+package provider
+
+import (
+	"os"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+)
+
+const testSessionID = "019abcde-0123-4567-89ab-0123456789ab"
+
+func TestParseCodexJSONL(t *testing.T) {
+	for _, tc := range []struct {
+		file     string
+		events   []Event
+		terminal string
+	}{
+		{"codex-complete", []Event{
+			{Type: Thinking, Delta: "Checking"},
+			{Type: Thinking, Delta: " the context."},
+			{Type: Text, Delta: "Hello, world."},
+		}, Done},
+		{"codex-failed", nil, Error},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			file, err := os.Open("testdata/" + tc.file + ".jsonl")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			var events []Event
+			result, err := parseJSONL(file, func(e Event) bool { events = append(events, e); return true })
+			if err != nil || result.Type != tc.terminal || !reflect.DeepEqual(events, tc.events) {
+				t.Fatalf("events=%#v terminal=%#v error=%v", events, result, err)
+			}
+			if tc.terminal == Done && result.SessionID != testSessionID {
+				t.Fatal("missing resume ID")
+			}
+			if tc.terminal == Error && result.Err == nil {
+				t.Fatal("missing provider error")
+			}
+		})
+	}
+}
+
+func TestParseSessionIDVariantAndInvalidStreams(t *testing.T) {
+	const alternate = `{"type":"session.started","session_id":"` + testSessionID + `"}
+{"type":"item.completed","item":{"type":"agent_message","id":"answer","text":"Ответ"}}
+{"type":"turn.completed"}
+`
+	accept := func(Event) bool { return true }
+	event, err := parseJSONL(strings.NewReader(alternate), accept)
+	if err != nil || event.SessionID != testSessionID {
+		t.Fatalf("session_id variant: %#v %v", event, err)
+	}
+	for _, data := range []string{"invalid JSON", strings.Split(alternate, "{\"type\":\"turn.completed\"}")[0], strings.ReplaceAll(alternate, testSessionID, "--last")} {
+		if _, err := parseJSONL(strings.NewReader(data), accept); err == nil {
+			t.Fatal("accepted malformed or truncated stream")
+		}
+	}
+}
+
+func TestCodexArgs(t *testing.T) {
+	args, err := codexArgs(Request{Model: "default", Prompt: "--dangerously-bypass-approvals-and-sandbox"})
+	if err != nil || slices.Contains(args, "--dangerously-bypass-approvals-and-sandbox") ||
+		!slices.Contains(args, `sandbox_mode="read-only"`) || !slices.Contains(args, "shell_tool") ||
+		!slices.Equal(args[len(args)-1:], []string{"-"}) {
+		t.Fatalf("unsafe or incorrect arguments: %q %v", args, err)
+	}
+	args, err = codexArgs(Request{Model: "test-model", SessionID: testSessionID})
+	if err != nil || !slices.Contains(args, "--model=test-model") || !slices.Equal(args[len(args)-3:], []string{"resume", testSessionID, "-"}) {
+		t.Fatalf("incorrect resume arguments: %q %v", args, err)
+	}
+	if _, err := codexArgs(Request{SessionID: "--last"}); err == nil {
+		t.Fatal("accepted an option as a session ID")
+	}
+}
