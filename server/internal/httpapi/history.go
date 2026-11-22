@@ -89,13 +89,20 @@ func (a *API) indexedMessages(w http.ResponseWriter, r *http.Request, s session)
 			a.indexError(w, err)
 			return
 		}
-		messages := []store.Message{}
+		type indexedMessage struct {
+			store.Message
+			Attachments []provider.IndexedAttachment `json:"attachments,omitempty"`
+		}
+		messages := []indexedMessage{}
 		for _, turn := range turns {
-			if turn.Prompt != "" {
-				messages = append(messages, store.Message{ID: turn.ID + "-user", RunID: turn.ID, ChatID: id, Role: "user", Content: turn.Prompt, CreatedAt: turn.CreatedAt})
+			if turn.Prompt != "" || len(turn.Attachments) > 0 {
+				messages = append(messages, indexedMessage{
+					Message:     store.Message{ID: turn.ID + "-user", RunID: turn.ID, ChatID: id, Role: "user", Content: turn.Prompt, CreatedAt: turn.CreatedAt},
+					Attachments: turn.Attachments,
+				})
 			}
 			if turn.Answer != "" || turn.Progress != "" {
-				messages = append(messages, store.Message{ID: turn.ID, RunID: turn.ID, ChatID: id, Role: "assistant", Content: turn.Answer, Progress: turn.Progress, DurationMs: turn.DurationMs, CreatedAt: turn.CreatedAt})
+				messages = append(messages, indexedMessage{Message: store.Message{ID: turn.ID, RunID: turn.ID, ChatID: id, Role: "assistant", Content: turn.Answer, Progress: turn.Progress, DurationMs: turn.DurationMs, CreatedAt: turn.CreatedAt}})
 			}
 		}
 		reply(w, http.StatusOK, messages)

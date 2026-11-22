@@ -326,6 +326,11 @@ select option { background: #202629; color: #eef0ef; }
 .index-status { margin: 0 8px 8px; }
 
 .response-progress { min-width: 0; }
+.response-duration { color: var(--muted); font-size: 12px; }
+.message-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; list-style: none; }
+.message-attachments li { display: flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; padding: 3px 7px; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); font-size: 12px; }
+.message-attachments svg { flex-shrink: 0; }
+.message-attachments span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .response-progress > summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: fit-content; max-width: 100%; min-height: 34px; padding: 5px 9px; color: var(--muted); border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
 .response-progress > summary:hover { color: var(--mint); }
 .response-progress-body { margin: 8px 0 5px 8px; padding: 2px 0 2px 10px; border-left: 2px solid #46514d; color: var(--muted); font-size: 13px; }

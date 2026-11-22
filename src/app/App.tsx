@@ -5,7 +5,7 @@ import { Incoming, LimitActions, Quotas } from './Quotas'
 import { Login } from './Login'
 import { WorkspaceDialog } from './WorkspaceDialog'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ArrowUp, Brain, Check, ChevronDown, ChevronRight, CodeXml, GitFork, Laptop, Menu, MessageSquare, PanelLeft, Settings2, Share2, Square, Terminal } from 'lucide-react'
+import { ArrowUp, Brain, Check, ChevronDown, ChevronRight, CodeXml, GitFork, Image as ImageIcon, Laptop, Menu, MessageSquare, PanelLeft, Paperclip, Settings2, Share2, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
 import { demoPrompt, availableDevices, models, providerLabels, newChat, retryAnswer, retryHistory, sendPrompt, stopChat, updateChat, useChats } from './chatStore'
@@ -41,14 +41,24 @@ function Transcript({ turn, chatId, writable, busy, retry, demo }: { turn: Turn;
   const authorId = turn.authorId ?? w.chats.find(c => c.id === chatId)?.ownerId
   const author = authorId === w.user.id ? 'Вы' : w.users.find(u => u.id === authorId)?.name ?? 'Участник'
   return <article className="turn">
-    {turn.prompt && <><div className="person"><span className="person-avatar">{author === 'Вы' ? 'Я' : author[0]}</span><strong>{author}</strong><time>{clock.format(turn.time)}</time></div>
-    <div className="user-prompt">{turn.prompt}</div></>}
+    {(turn.prompt || !!turn.attachments?.length) && <>
+      <div className="person"><span className="person-avatar">{author === 'Вы' ? 'Я' : author[0]}</span><strong>{author}</strong><time>{clock.format(turn.time)}</time></div>
+      <div className="user-prompt">
+        {!!turn.attachments?.length && <ul className="message-attachments" aria-label="Вложения">
+          {turn.attachments.map((attachment, index) => {
+            const Icon = attachment.kind === 'image' ? ImageIcon : Paperclip
+            return <li key={index} title={attachment.name}><Icon size={14} aria-hidden="true"/><span>{attachment.name}</span></li>
+          })}
+        </ul>}
+        {turn.prompt}
+      </div>
+    </>}
     <div className="person agent"><span className="agent-avatar"><CodeXml size={17}/></span><strong>{turn.model}</strong>{turn.retryOf && <span className="retry-label">Повтор ответа</span>}<time>{clock.format(turn.time)}</time></div>
     <div className="response">
-      {turn.progress && <details className="response-progress">
+      {turn.progress ? <details className="response-progress">
         <summary>{progressLabel(turn.durationMs)}<ChevronRight size={14}/></summary>
         <div className="response-progress-body"><RichText text={turn.progress}/></div>
-      </details>}
+      </details> : turn.durationMs != null && <span className="response-duration">{progressLabel(turn.durationMs)}</span>}
       {turn.parts.map((p, i) => p.kind === 'tool' ? <ToolCard key={p.callId} chatId={chatId} turn={turn} entry={p}/> : p.kind === 'thinking'
       ? <details className="thinking" key={i}><summary><Brain size={14}/>Thinking<ChevronRight size={13}/></summary><p>{p.text}</p></details>
       : <RichText text={p.text} key={i}/>)}

@@ -87,7 +87,7 @@ func TestUpgradeAndResumeChat(t *testing.T) {
 	if session, err := first.BeginRun(ctx, "owner", "chat", "reply", "hello", "codex", "default"); err != nil || session != "" {
 		t.Fatalf("new Codex run: session=%q err=%v", session, err)
 	}
-	if err := first.FinishRun(ctx, "chat", "reply", "answer", "summary", sessionID); err != nil {
+	if err := first.FinishRun(ctx, "chat", "reply", "answer", "summary", sessionID, 276608); err != nil {
 		t.Fatal(err)
 	}
 	if err := first.Close(); err != nil {
@@ -104,6 +104,9 @@ func TestUpgradeAndResumeChat(t *testing.T) {
 	list, err := reopened.Messages(ctx, "owner", "chat")
 	if err != nil || len(list) != 4 || list[0].ID != "legacy" || list[2].ID != "reply" || list[2].Thinking != "summary" {
 		t.Fatalf("migrated history: %v, %v", list, err)
+	}
+	if list[0].DurationMs != nil || list[2].DurationMs == nil || *list[2].DurationMs != 276608 {
+		t.Fatalf("unexpected durations after reopen: legacy=%v, reply=%v", list[0].DurationMs, list[2].DurationMs)
 	}
 	if session, err := reopened.BeginRun(ctx, "owner", "chat", "switch", "test", "stub", "default"); err != nil || session != "" {
 		t.Fatalf("resume session leaked across provider switch: session=%q err=%v", session, err)

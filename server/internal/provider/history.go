@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -19,12 +20,19 @@ type IndexedChat struct {
 }
 
 type IndexedTurn struct {
-	ID         string
-	Prompt     string
-	Answer     string
-	Progress   string
-	DurationMs *int64
-	CreatedAt  int64
+	ID          string
+	Prompt      string
+	Attachments []IndexedAttachment
+	Answer      string
+	Progress    string
+	DurationMs  *int64
+	CreatedAt   int64
+}
+
+type IndexedAttachment struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	Path string `json:"path,omitempty"`
 }
 
 type appPage[T any] struct {
@@ -116,6 +124,7 @@ type indexedTurn struct {
 		Content []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
+			Path string `json:"path"`
 		} `json:"content"`
 	} `json:"items"`
 }
@@ -129,7 +138,7 @@ func (p CodexCliProvider) ReadIndexedTurns(ctx context.Context, id string) ([]In
 		params := map[string]any{"threadId": id, "itemsView": "full", "sortDirection": "asc", "limit": 20}
 		return appPages(rpc, "thread/turns/list", params, func(turn indexedTurn) {
 			mapped := splitIndexedTurn(turn)
-			if mapped.Prompt != "" || mapped.Answer != "" || mapped.Progress != "" {
+			if mapped.Prompt != "" || len(mapped.Attachments) > 0 || mapped.Answer != "" || mapped.Progress != "" {
 				turns = append(turns, mapped)
 			}
 		})
@@ -139,9 +148,61 @@ func (p CodexCliProvider) ReadIndexedTurns(ctx context.Context, id string) ([]In
 
 var browserCompletion = regexp.MustCompile(`^::browser-complete\{title="[^"\r\n]*"\}$`)
 
+var (
+	filesHeader   = regexp.MustCompile(`^# Files mentioned by the user:[ \t]*\r?\n`)
+	requestHeader = regexp.MustCompile(`(?m)^## My request:[ \t]*\r?(?:\n|$)`)
+	fileHeading   = regexp.MustCompile(`^(?:## |- )(.+?):[ \t]+(.+)$`)
+	fileLink      = regexp.MustCompile(`^(?:- |\* )?\[([^\]]+)\]\((.+)\)$`)
+)
+
+func splitAttachmentPrompt(text string) (string, []IndexedAttachment) {
+	header := filesHeader.FindStringIndex(text)
+	if header == nil {
+		return text, nil
+	}
+	body := text[header[1]:]
+	request := requestHeader.FindStringIndex(body)
+	if request == nil {
+		return text, nil
+	}
+	var attachments []IndexedAttachment
+	for _, line := range strings.Split(body[:request[0]], "\n") {
+		line = strings.TrimSpace(line)
+		entry := fileHeading.FindStringSubmatch(line)
+		if entry == nil {
+			entry = fileLink.FindStringSubmatch(line)
+		}
+		if entry == nil {
+			continue
+		}
+		location := strings.Trim(strings.TrimSpace(entry[2]), "<>`")
+		normalized := strings.ReplaceAll(location, "\\", "/")
+		if path.IsAbs(normalized) || (len(normalized) >= 3 && normalized[1:3] == ":/") {
+			attachments = append(attachments, IndexedAttachment{Kind: "file", Name: strings.TrimSpace(entry[1]), Path: location})
+		}
+	}
+	return strings.TrimLeft(body[request[1]:], "\r\n"), attachments
+}
+
 func splitIndexedTurn(turn indexedTurn) IndexedTurn {
 	type message struct{ text, phase string }
 	var prompts []string
+	var attachments []IndexedAttachment
+	attachmentPaths := make(map[string]int)
+	addAttachment := func(attachment IndexedAttachment) {
+		if attachment.Path != "" {
+			if index, ok := attachmentPaths[attachment.Path]; ok {
+				if attachment.Kind == "image" {
+					attachments[index].Kind = "image"
+				} else {
+					attachments[index].Name = attachment.Name
+				}
+				return
+			}
+			attachmentPaths[attachment.Path] = len(attachments)
+		}
+		attachments = append(attachments, attachment)
+	}
 	var messages []message
 	hasFinal := false
 	lastUnlabelled := -1
@@ -149,8 +210,21 @@ func splitIndexedTurn(turn indexedTurn) IndexedTurn {
 		switch item.Type {
 		case "userMessage":
 			for _, part := range item.Content {
-				if part.Type == "text" && part.Text != "" {
-					prompts = append(prompts, part.Text)
+				switch part.Type {
+				case "text":
+					prompt, files := splitAttachmentPrompt(part.Text)
+					if prompt != "" {
+						prompts = append(prompts, prompt)
+					}
+					for _, file := range files {
+						addAttachment(file)
+					}
+				case "localImage":
+					if part.Path != "" {
+						addAttachment(IndexedAttachment{Kind: "image", Name: path.Base(strings.ReplaceAll(part.Path, "\\", "/")), Path: part.Path})
+					}
+				case "image":
+					addAttachment(IndexedAttachment{Kind: "image", Name: "Изображение"})
 				}
 			}
 		case "agentMessage":
@@ -189,6 +263,7 @@ func splitIndexedTurn(turn indexedTurn) IndexedTurn {
 	}
 	return IndexedTurn{
 		ID: turn.ID, Prompt: strings.Join(prompts, "\n\n"), Answer: strings.Join(final, "\n\n"),
-		Progress: strings.Join(progress, "\n\n"), DurationMs: duration, CreatedAt: turn.StartedAt * 1000,
+		Attachments: attachments,
+		Progress:    strings.Join(progress, "\n\n"), DurationMs: duration, CreatedAt: turn.StartedAt * 1000,
 	}
 }

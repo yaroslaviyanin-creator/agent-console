@@ -27,16 +27,7 @@ npm run tauri -- build --debug --bundles app
 
 Фронтенд: http://127.0.0.1:1420/ → «Сервер» → http://127.0.0.1:8080. Codex должен быть установлен и авторизован на машине сервера. Для Telegram нужен доступный HTTPS-бэкенд и CORS_ORIGIN с точным origin Mini App. Настройки и права подробно описаны в AGENTS.md.
 
-## Баг 1 — служебный текст вложения
+## Исправления истории Codex
 
-- `server/internal/provider/history.go` → `splitIndexedTurn`. Берёт текст из `userMessage.content` целиком. В воспроизведённом ходе текст начинается с `# Files mentioned by the user:`, содержит локальный путь и служебную инструкцию, затем `## My request:` и реальный текст. Изображение сохранено отдельным элементом `localImage`.
-- `server/internal/httpapi/history.go` → `indexedMessages` отдаёт этот текст как user message. `src/app/chatStore.ts` → `restoreTurns` переносит его в `turn.prompt`. `src/app/App.tsx` → `Transcript` выводит его в `.user-prompt`.
-- Следующий шаг: распознать известную обёртку Codex у начала текста и сохранить тело после `## My request:`. Нужен узкий регрессионный тест в `server/internal/provider/history_test.go`. Обычный Markdown пользователя должен сохраниться.
-
-## Баг 2 — пропала строка длительности
-
-- `server/internal/provider/history.go` → `splitIndexedTurn` читает `phase`, статус и длительность. В ходе со скриншота Codex вернул `completed`, пять `commentary`, один `final_answer` и `durationMs: 276608` (4 мин 36 с).
-- `server/internal/httpapi/history.go` → `indexedMessages`, `server/internal/store/store.go` → `Message` и `src/protocol/types.ts` → `ServerMessage` передают `progress` и `durationMs`.
-- `src/app/chatStore.ts` → `restoreTurns`; `src/app/App.tsx` → `Transcript` и `progressLabel`; `src/style.css` → `.response-progress`.
-- Заголовок сейчас отображается только при наличии `turn.progress`. Длительность в исходном ходе подтверждена. Причину отсутствия именно у пользователя ещё не изолировали. Проверь тот же ход через опубликованный HTTPS API и в актуально загруженном Mini App, затем проверь отдельный случай с длительностью и пустым progress.
-- Исправления этих двух случаев ещё не внесены и не опубликованы.
+- Go-парсер выносит вложения в `attachments`; интерфейс показывает их чипсами.
+- `durationMs` отображается и без промежуточных сообщений. Для новых ответов значение записывается в SQLite и передаётся в WebSocket-событии `done`.

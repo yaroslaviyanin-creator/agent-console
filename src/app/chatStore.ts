@@ -1,6 +1,6 @@
 import { historyUntil, previousTurn } from './runHistory'
 import { create } from 'zustand'
-import type { LoginRequest, Workspace, PermissionDecision, Provider, RunEvent, ServerMessage, ServerModel, ShareAccess, Target, ToolCall } from '../protocol/types'
+import type { LoginRequest, MessageAttachment, Workspace, PermissionDecision, Provider, RunEvent, ServerMessage, ServerModel, ShareAccess, Target, ToolCall } from '../protocol/types'
 import { useAccountStore, blockReason } from './accountStore'
 import { readConnection, saveConnection, setTransport, transport } from './runtime'
 import type { ConnectionMode } from './runtime'
@@ -28,6 +28,7 @@ export interface ToolEntry {
 }
 export type Part = { kind: 'thinking' | 'text'; text: string } | ToolEntry
 export interface Turn {
+  attachments?: MessageAttachment[]
   progress?: string
   durationMs?: number
   id: string
@@ -320,6 +321,7 @@ function restoreTurns(messages: ServerMessage[], local: Turn[], label: string): 
       const pending = localByID.get(id)
       previousPrompt = pending ?? {
         id, prompt: message.content, model: label, time: message.createdAt, parts: [], seq: 0,
+        ...(message.attachments?.length ? { attachments: message.attachments } : {}),
         state: 'stopped', notice: 'В истории пока есть только запрос.',
       }
       turns.set(id, previousPrompt)
@@ -332,6 +334,7 @@ function restoreTurns(messages: ServerMessage[], local: Turn[], label: string): 
       turns.set(message.id, {
         id: message.id, prompt: prompt?.prompt ?? '', model: localByID.get(message.id)?.model ?? label,
         time: prompt?.time ?? message.createdAt, parts, seq: 0,
+        ...(prompt?.attachments?.length ? { attachments: prompt.attachments } : {}),
         ...(message.progress ? { progress: message.progress } : {}),
         ...(message.durationMs != null ? { durationMs: message.durationMs } : {}),
         state: 'completed',
@@ -389,7 +392,10 @@ export function applyEvent(turn: Turn, event: RunEvent): Turn {
       break
     case 'refusal_detected': next.refusalReason = event.reason; break
     case 'error': next.state = 'error'; next.notice = event.message; break
-    case 'done': next.state = event.reason; break
+    case 'done':
+      next.state = event.reason
+      if (event.durationMs != null) next.durationMs = event.durationMs
+      break
   }
   return next
 }

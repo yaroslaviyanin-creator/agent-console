@@ -121,7 +121,13 @@ func (s *Store) migrate(ctx context.Context) error {
 			PRAGMA user_version=2;`); err != nil {
 			return err
 		}
+		fallthrough
 	case 2:
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE chat_messages ADD COLUMN duration_ms INTEGER;
+			PRAGMA user_version=3;`); err != nil {
+			return err
+		}
+	case 3:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}
@@ -203,7 +209,7 @@ func (s *Store) Chats(ctx context.Context, userID string) ([]Chat, error) {
 
 func (s *Store) Messages(ctx context.Context, userID, chatID string) ([]Message, error) {
 	// A LEFT JOIN returns one row for an owned, empty chat and none for unknown or foreign chats.
-	rows, err := s.db.QueryContext(ctx, `SELECT CASE WHEN m.role='assistant' THEN COALESCE(m.run_id,m.id) ELSE m.id END, m.role,m.content,m.thinking,m.created_at,m.run_id
+	rows, err := s.db.QueryContext(ctx, `SELECT CASE WHEN m.role='assistant' THEN COALESCE(m.run_id,m.id) ELSE m.id END, m.role,m.content,m.thinking,m.created_at,m.run_id,m.duration_ms
 		FROM chats c LEFT JOIN chat_messages m ON m.chat_id=c.id
 		WHERE c.id=? AND c.user_id=? ORDER BY m.created_at, m.rowid`, chatID, userID)
 	if err != nil {
@@ -216,11 +222,12 @@ func (s *Store) Messages(ctx context.Context, userID, chatID string) ([]Message,
 		found = true
 		var id, role, content, thinking, runID sql.NullString
 		var createdAt sql.NullInt64
-		if err := rows.Scan(&id, &role, &content, &thinking, &createdAt, &runID); err != nil {
+		var durationMs *int64
+		if err := rows.Scan(&id, &role, &content, &thinking, &createdAt, &runID, &durationMs); err != nil {
 			return nil, err
 		}
 		if id.Valid {
-			messages = append(messages, Message{ID: id.String, RunID: runID.String, ChatID: chatID, Role: role.String, Content: content.String, Thinking: thinking.String, CreatedAt: createdAt.Int64})
+			messages = append(messages, Message{ID: id.String, RunID: runID.String, ChatID: chatID, Role: role.String, Content: content.String, Thinking: thinking.String, CreatedAt: createdAt.Int64, DurationMs: durationMs})
 		}
 	}
 	if err := rows.Err(); err != nil {

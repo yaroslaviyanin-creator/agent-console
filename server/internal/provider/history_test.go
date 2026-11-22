@@ -2,6 +2,7 @@ package provider
 
 import (
 	"encoding/json"
+	"slices"
 	"testing"
 )
 
@@ -57,5 +58,36 @@ func TestSplitIndexedTurn(t *testing.T) {
 				t.Fatalf("expected duration %d", tc.duration)
 			}
 		})
+	}
+}
+
+func TestSplitIndexedTurnAttachmentsAndDuration(t *testing.T) {
+	var turn indexedTurn
+	err := json.Unmarshal([]byte(`{
+		"status":"completed","durationMs":276608,"items":[
+			{"type":"userMessage","content":[
+				{"type":"text","text":"# Files mentioned by the user:\r\n\r\n## Screenshot.png: /tmp/Screenshot.png\r\n- [Notes](</tmp/game notes.txt>)\r\n\r\nUse these files for the request.\r\n\r\n## My request:\r\n\r\nЧто на скриншоте?\r\n"},
+				{"type":"localImage","path":"/tmp/Screenshot.png"},
+				{"type":"text","text":"## My request:\nОбычный Markdown"}
+			]},
+			{"type":"agentMessage","phase":"final_answer","text":"Итог"}
+		]
+	}`), &turn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := splitIndexedTurn(turn)
+	if want := "Что на скриншоте?\r\n\n\n## My request:\nОбычный Markdown"; got.Prompt != want {
+		t.Fatalf("prompt = %q, want %q", got.Prompt, want)
+	}
+	want := []IndexedAttachment{
+		{Kind: "image", Name: "Screenshot.png", Path: "/tmp/Screenshot.png"},
+		{Kind: "file", Name: "Notes", Path: "/tmp/game notes.txt"},
+	}
+	if !slices.Equal(got.Attachments, want) {
+		t.Fatalf("attachments = %+v, want %+v", got.Attachments, want)
+	}
+	if got.DurationMs == nil || *got.DurationMs != 276608 || got.Progress != "" || got.Answer != "Итог" {
+		t.Fatalf("unexpected completed turn: %+v", got)
 	}
 }

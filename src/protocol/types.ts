@@ -30,7 +30,7 @@ type RunPayload =
   | { type: 'permission_request'; requestId: string; callId: string; folder: string; deviceId: string; tool: ToolCall }
   | { type: 'tool_result'; callId: string; status: 'ok' | 'denied' | 'error'; output: string }
   | { type: 'refusal_detected'; reason: string }
-  | { type: 'done'; reason: 'completed' | 'refused' | 'denied' }
+  | { type: 'done'; reason: 'completed' | 'refused' | 'denied'; durationMs?: number }
   | { type: 'error'; code: string; message: string; retryable: boolean }
 
 export type RunEvent = RunPayload & { chatId: string; messageId: string; seq: number }
@@ -126,7 +126,13 @@ export interface ServerChat {
   updatedAt: number
 }
 export interface IndexedCodexChat extends ServerChat { archived: boolean }
+export interface MessageAttachment {
+  kind: 'file' | 'image'
+  name: string
+  path?: string
+}
 export interface ServerMessage {
+  attachments?: MessageAttachment[]
   progress?: string
   durationMs?: number
   id: string

@@ -33,15 +33,16 @@ type runRequest struct {
 }
 
 type runEvent struct {
-	ChatID    string `json:"chatId"`
-	MessageID string `json:"messageId"`
-	Seq       int    `json:"seq"`
-	Type      string `json:"type"`
-	Delta     string `json:"delta,omitempty"`
-	Reason    string `json:"reason,omitempty"`
-	Code      string `json:"code,omitempty"`
-	Message   string `json:"message,omitempty"`
-	Retryable *bool  `json:"retryable,omitempty"`
+	ChatID     string `json:"chatId"`
+	MessageID  string `json:"messageId"`
+	Seq        int    `json:"seq"`
+	Type       string `json:"type"`
+	Delta      string `json:"delta,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	DurationMs *int64 `json:"durationMs,omitempty"`
+	Code       string `json:"code,omitempty"`
+	Message    string `json:"message,omitempty"`
+	Retryable  *bool  `json:"retryable,omitempty"`
 }
 
 const (
@@ -275,6 +276,7 @@ func (a *API) streamRun(ctx context.Context, userID, sessionID string, req runRe
 		a.logger.Error("stream response", "chatId", req.ChatID, "code", code, "error", err)
 		return req.failure(seq+1, code, message, true)
 	}
+	started := time.Now()
 	events, err := a.live.backend.Stream(ctx, provider.Request{UserID: userID, Model: req.Model.ID, Prompt: req.Prompt, SessionID: sessionID})
 	if err != nil {
 		return failure("provider_error", "Could not start the provider.", err)
@@ -304,10 +306,12 @@ func (a *API) streamRun(ctx context.Context, userID, sessionID string, req runRe
 				}
 				wire.Delta = event.Delta
 			case provider.Done:
-				if err := a.db.FinishRun(ctx, req.ChatID, req.MessageID, text.String(), thinking.String(), event.SessionID); err != nil {
+				durationMs := time.Since(started).Milliseconds()
+				if err := a.db.FinishRun(ctx, req.ChatID, req.MessageID, text.String(), thinking.String(), event.SessionID, durationMs); err != nil {
 					return failure("storage_error", "Could not save the response.", err)
 				}
 				wire.Reason = "completed"
+				wire.DurationMs = &durationMs
 			case provider.Error:
 				return failure("provider_error", "The provider could not complete the response.", event.Err)
 			default:

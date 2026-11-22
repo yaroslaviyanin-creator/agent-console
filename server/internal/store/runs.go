@@ -50,7 +50,7 @@ func (s *Store) BeginRun(ctx context.Context, userID, chatID, messageID, prompt,
 }
 
 // FinishRun publishes a durable reply and resume session in a single transaction.
-func (s *Store) FinishRun(ctx context.Context, chatID, messageID, text, thinking, sessionID string) error {
+func (s *Store) FinishRun(ctx context.Context, chatID, messageID, text, thinking, sessionID string, durationMs int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -58,8 +58,8 @@ func (s *Store) FinishRun(ctx context.Context, chatID, messageID, text, thinking
 	defer tx.Rollback()
 
 	now := time.Now().UnixMilli()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages (id,chat_id,role,content,thinking,created_at,run_id)
-		VALUES (?,?,'assistant',?,?,?,?)`, randomHex(16), chatID, text, thinking, now, messageID); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages (id,chat_id,role,content,thinking,created_at,run_id,duration_ms)
+		VALUES (?,?,'assistant',?,?,?,?,?)`, randomHex(16), chatID, text, thinking, now, messageID, durationMs); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE chats SET provider_session_id=NULLIF(?,''),updated_at=MAX(updated_at,?) WHERE id=?`,
