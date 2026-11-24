@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { LogOut, Monitor, X } from 'lucide-react'
 import type { ShareAccess, Workspace } from '../protocol/types'
-import { changeServerAddress, logout, revokeDevice, setConnectionMode, setShare, useChats } from './chatStore'
+import { changeServerAddress, logout, refreshServerDevices, revokeDevice, setConnectionMode, setShare, useChats } from './chatStore'
 import { ConnectionMode } from './ConnectionMode'
 
 export const rights = { read: 'Чтение', fork: 'Разветвление (Fork)', write: 'Полный доступ' }
@@ -40,9 +40,22 @@ function Devices({ w }: { w: Workspace }) {
   const [server, setServer] = useState(address)
   const [confirm, setConfirm] = useState('')
   const [error, setError] = useState('')
+  const [revoking, setRevoking] = useState(false)
+  useEffect(() => {
+    if (mode !== 'server') return
+    let open = true
+    void refreshServerDevices().catch(e => {
+      if (open) setError(e instanceof Error ? e.message : String(e))
+    })
+    return () => { open = false }
+  }, [mode])
   async function revoke(id: string) {
+    setError('')
+    setRevoking(true)
     try { await revokeDevice(id); setConfirm('') } catch (e) { setError(String(e)) }
+    finally { setRevoking(false) }
   }
+  const devices = mode === 'server' ? w.devices : w.devices.filter(d => d.ownerId === w.user.id)
   return <>
     <ConnectionMode mode={mode} change={setConnectionMode}/>
     {mode === 'server' && <form className="panel-form server-settings" onSubmit={e => {
@@ -53,8 +66,18 @@ function Devices({ w }: { w: Workspace }) {
       <label>Адрес сервера<input type="url" required value={server} onChange={e => setServer(e.target.value)}/></label>
       {server.trim() !== address && <button className="alt-action">Сменить сервер и выйти</button>}
     </form>}
-    <p className="form-help">{w.user.name}{mode === 'demo' && ' · @' + w.user.id}</p><div className="device-list">{w.devices.filter(d => d.ownerId === w.user.id).map(d => <div key={d.id} className="device-row"><Monitor size={18}/><div><strong>{d.name}</strong><small>{(mode === 'server' ? connected : d.online) ? 'Онлайн' : 'Офлайн'}{w.deviceId === d.id ? ' · Это устройство' : ''}</small></div>
-    {mode === 'demo' && (confirm !== d.id ? <button className="text-action" onClick={() => setConfirm(d.id)}>Отозвать</button> : <div className="device-confirm"><span>{d.id === w.deviceId ? 'Завершить эту сессию?' : 'Отозвать доступ?'}</span><button onClick={() => void revoke(d.id)}>Да, отозвать</button><button onClick={() => setConfirm('')}>Отмена</button></div>)}</div>)}</div>
+    <p className="form-help">{w.user.name}{mode === 'demo' && ' · @' + w.user.id}</p>
+    <div className="device-list">{devices.map(d => {
+      const current = d.id === w.deviceId
+      const online = mode === 'server' ? connected : d.online
+      return <div key={d.id} className="device-row"><Monitor size={18}/><div><strong>{d.name}</strong>
+        {(mode === 'demo' || current) && <small>{online ? 'Онлайн' : 'Офлайн'}{current ? ' · Это устройство' : ''}</small>}</div>
+        {confirm !== d.id ? <button className="text-action" disabled={revoking} onClick={() => setConfirm(d.id)}>Отозвать</button> :
+          <div className="device-confirm"><span>{current ? 'Завершить эту сессию?' : 'Отозвать доступ?'}</span>
+            <button disabled={revoking} onClick={() => void revoke(d.id)}>Да, отозвать</button><button disabled={revoking} onClick={() => setConfirm('')}>Отмена</button>
+          </div>}
+      </div>
+    })}</div>
     {error && <p role="alert">{error}</p>}<button className="alt-action" onClick={logout}><LogOut size={14}/>Выйти из аккаунта</button></>
 }
 

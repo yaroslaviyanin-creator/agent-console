@@ -101,7 +101,7 @@ export interface Workspace {
 }
 export interface WorkspaceAdapter {
   login(request: LoginRequest): Promise<Workspace>
-  logout(): void
+  logout(): void | Promise<void>
   revokeDevice(id: string): Promise<Workspace | null>
   setShare(chatId: string, userId: string, access: ShareAccess | null, trust: boolean): Promise<Workspace>
   createChat(sourceId?: string): Promise<{ id: string; workspace: Workspace }>
@@ -130,7 +130,7 @@ export interface AdminAdapter {
   update(id: string, changes: UpdateAdminUser): Promise<void>
   revokeDevices(id: string): Promise<void>
 }
-export interface ServerDevice { id: string; userId: string; name: string; lastSeenAt: number; createdAt: number }
+export interface ServerDevice { id: string; userId: string; name: string; lastSeenAt: number; createdAt: number; isCurrent?: boolean }
 export interface ServerSession { user: ServerUser; device: ServerDevice }
 export interface ServerLoginResponse extends ServerSession { token: string }
 export interface ServerCreateChatRequest { title?: string; model?: string }

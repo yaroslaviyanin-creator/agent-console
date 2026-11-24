@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { AccountEvent, PermissionDecision, RunEvent, RunRequest } from '../src/protocol/types'
 import { MockTransport } from '../src/transport/MockTransport'
+import { RemoteTransport } from '../src/transport/RemoteTransport'
 
 async function setup(options: ConstructorParameters<typeof MockTransport>[0]) {
   const mock = new MockTransport(options)
@@ -140,4 +141,91 @@ test('approving a stale diff cannot overwrite a change accepted in another chat'
     }
   }
   assert.fail('expected conflict')
+})
+
+test('remote sessions connect with a ticket and manage server devices', async t => {
+  const current = { id: 'current', userId: 'u', name: 'Test', lastSeenAt: 0, createdAt: 0, isCurrent: true }
+  const session = { user: { id: 'u', username: 'demo' }, device: current, token: 'device-token' }
+  const old = { ...current, id: 'old', name: 'Old device', isCurrent: false }
+  let devices = [current, old]
+  let ticketStatus = 200
+  let tickets = 0
+  let logouts = 0
+  let logoutKeepalive: boolean | undefined
+  let closedAtLogout: boolean | undefined
+  let socketUrl: URL | undefined
+  let closed = false
+  class TestSocket {
+    static readonly OPEN = 1
+    readyState = TestSocket.OPEN
+    onclose?: () => void
+    close() { closed = true; this.onclose?.() }
+    constructor(url: URL) { socketUrl = url }
+  }
+  const webSocket = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket')
+  Object.defineProperty(globalThis, 'WebSocket', { configurable: true, value: TestSocket })
+  t.after(() => {
+    if (webSocket) Object.defineProperty(globalThis, 'WebSocket', webSocket)
+    else Reflect.deleteProperty(globalThis, 'WebSocket')
+  })
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    assert.ok(init)
+    const route = init.method + ' ' + new URL(String(input)).pathname
+    if (route !== 'POST /api/auth/login') {
+      assert.equal(new Headers(init.headers).get('Authorization'), 'Bearer device-token')
+    }
+    switch (route) {
+      case 'POST /api/auth/login': return Response.json(session)
+      case 'GET /api/health': return Response.json({ status: 'ok', provider: 'stub' })
+      case 'GET /api/chats': return Response.json([])
+      case 'GET /api/devices': return Response.json(devices)
+      case 'POST /api/ws/ticket':
+        tickets++
+        return ticketStatus === 200 ? Response.json({ ticket: 'single-use' }) :
+          Response.json(ticketStatus === 401 ? {} : { code: 'account_inactive' }, { status: ticketStatus })
+      case 'DELETE /api/devices/old':
+      case 'DELETE /api/devices/current':
+        devices = devices.filter(device => !route.endsWith('/' + device.id))
+        return new Response(null, { status: 204 })
+      case 'POST /api/auth/logout':
+        logouts++
+        logoutKeepalive = init.keepalive
+        closedAtLogout = closed
+        return new Response(null, { status: 204 })
+      default: assert.fail(route)
+    }
+  })
+
+  const login = { connection: 'https://example.test', login: 'demo', password: 'demo', deviceName: 'Test' }
+  const remote = new RemoteTransport(login.connection)
+  t.after(() => remote.close())
+  assert.deepEqual((await remote.workspace.login(login)).devices.map(d => d.id), ['current', 'old'])
+  await Promise.all([remote.connect(), remote.connect()])
+  assert.equal(tickets, 1)
+  assert.equal(socketUrl?.href, 'wss://example.test/ws?ticket=single-use')
+  assert.deepEqual((await remote.workspace.revokeDevice('old'))?.devices.map(d => d.id), ['current'])
+  devices = [current, old]
+  assert.deepEqual((await remote.refreshDevices()).devices.map(d => d.id), ['current', 'old'])
+  await remote.workspace.logout()
+  assert.equal(logouts, 1)
+  assert.equal(logoutKeepalive, true)
+  assert.equal(closedAtLogout, false)
+  assert.equal(closed, true)
+  assert.equal(remote.sessionToken, '')
+
+  const expired = new RemoteTransport(login.connection)
+  t.after(() => expired.close())
+  const events: string[] = []
+  expired.subscribe(event => events.push(event.type))
+  await expired.workspace.login(login)
+  for (const status of [401, 403]) {
+    ticketStatus = status
+    socketUrl = undefined
+    await expired.connect()
+    assert.equal(socketUrl, undefined)
+  }
+  assert.deepEqual(events, ['expired', 'expired'])
+  assert.equal(await expired.workspace.revokeDevice('current'), null)
+  assert.equal(expired.sessionToken, '')
+  assert.equal(logouts, 1)
 })

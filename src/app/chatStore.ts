@@ -158,7 +158,7 @@ export async function login(request: LoginRequest) {
   try {
     attachRemote(remote, await remote.workspace.login(request))
   } catch (error) {
-    remote.workspace.logout()
+    void remote.workspace.logout()
     throw error
   }
 }
@@ -172,8 +172,8 @@ export async function restoreConnection() {
     remote = new RemoteTransport(address)
     attachRemote(remote, await remote.restore(token))
   } catch (error) {
-    remote?.workspace.logout()
-    if (error instanceof RemoteError && error.status === 401) saveConnection({ mode, address })
+    remote?.close()
+    if (error instanceof RemoteError && error.sessionExpired) saveConnection({ mode, address })
     useChats.setState({ connectionError: error instanceof Error ? error.message : 'Не удалось восстановить сессию.' })
   } finally {
     useChats.setState({ restoring: false })
@@ -181,9 +181,13 @@ export async function restoreConnection() {
 }
 
 export function logout() {
+  void transport.workspace.logout()
+  clearSession()
+}
+
+function clearSession() {
   const { remote, mode, address } = useChats.getState()
   for (const id of runs.keys()) stopChat(id)
-  transport.workspace.logout()
   if (remote) {
     setTransport()
     useChats.setState({ remote: null, workspace: null, chats: [], activeId: '', connected: false, connectionError: '', serverModels: [], modelsLoading: false, codexIndex: 'hidden', modelsError: '' })
@@ -209,11 +213,12 @@ function attachRemote(remote: RemoteTransport, workspace: Workspace) {
         void refreshRemote(remote, change.chatId)
         break
       case 'expired':
-        logout()
+        remote.close()
+        clearSession()
         useChats.setState({ connectionError: 'Сессия закончилась. Войдите снова.' })
     }
   })
-  remote.connect()
+  void remote.connect()
   if (remote.provider === 'codex') {
     void refreshServerModels()
     void refreshCodexIndex()
@@ -350,7 +355,20 @@ export function retryHistory() {
   const { remote, activeId } = useChats.getState()
   if (remote && activeId) void loadRemoteHistory(remote, activeId)
 }
+export async function refreshServerDevices() {
+  const { remote } = useChats.getState()
+  if (remote) applyRemoteWorkspace(remote, await remote.refreshDevices())
+}
+
 export async function revokeDevice(id: string) {
+  const { remote } = useChats.getState()
+  if (remote) {
+    const workspace = await remote.workspace.revokeDevice(id)
+    if (useChats.getState().remote !== remote) return
+    if (workspace) applyRemoteWorkspace(remote, workspace)
+    else clearSession()
+    return
+  }
   const workspace = await transport.workspace.revokeDevice(id)
   for (const key of runs.keys()) {
     const target = useChats.getState().chats.find(c => c.id === key)?.target
