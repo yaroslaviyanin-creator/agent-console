@@ -25,6 +25,8 @@ type Store struct{ db *sql.DB }
 type User struct {
 	ID       string `json:"id"`
 	Username string `json:"username"`
+	Role     string `json:"role"`
+	IsActive bool   `json:"isActive"`
 }
 
 type Device struct {
@@ -127,26 +129,41 @@ func (s *Store) migrate(ctx context.Context) error {
 			PRAGMA user_version=3;`); err != nil {
 			return err
 		}
+		fallthrough
 	case 3:
+		for _, column := range []struct{ name, definition string }{
+			{"role", "TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin'))"},
+			{"is_active", "INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1))"},
+		} {
+			var exists bool
+			if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('users') WHERE name=?)", column.name).Scan(&exists); err != nil {
+				return err
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE users ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS devices_by_user ON devices(user_id); PRAGMA user_version=4;"); err != nil {
+			return err
+		}
+	case 4:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}
 	return tx.Commit()
 }
 
-var ErrUsernameTaken = errors.New("username already exists")
+var (
+	ErrUsernameTaken = errors.New("username already exists")
+	ErrInactiveUser  = errors.New("account is inactive")
+)
+
+func ValidRole(role string) bool { return role == "user" || role == "admin" }
 
 func (s *Store) CreateUser(ctx context.Context, username string, passwordHash []byte) error {
-	result, err := s.db.ExecContext(ctx, `INSERT INTO users (id, username, password_hash, created_at)
-		VALUES (?, ?, ?, ?) ON CONFLICT(username) DO NOTHING`,
-		randomHex(16), username, passwordHash, time.Now().UnixMilli())
-	if err != nil {
-		return err
-	}
-	count, err := result.RowsAffected()
-	if err == nil && count == 0 {
-		return ErrUsernameTaken
-	}
+	_, err := s.CreateUserWithRole(ctx, username, passwordHash, "user")
 	return err
 }
 
@@ -154,17 +171,34 @@ func (s *Store) Credentials(ctx context.Context, username string) (User, []byte,
 	var user User
 	var hash []byte
 	err := s.db.QueryRowContext(ctx,
-		"SELECT id, username, password_hash FROM users WHERE username=?", username).Scan(&user.ID, &user.Username, &hash)
+		"SELECT id, username, role, is_active, password_hash FROM users WHERE username=?", username).
+		Scan(&user.ID, &user.Username, &user.Role, &user.IsActive, &hash)
 	return user, hash, err
 }
 
 func (s *Store) IssueDevice(ctx context.Context, userID, name string) (Device, string, error) {
+	return s.IssueDeviceForLogin(ctx, userID, name, nil)
+}
+
+// Match the verified hash at insert time so a concurrent password reset cannot mint a token.
+func (s *Store) IssueDeviceForLogin(ctx context.Context, userID, name string, verifiedHash []byte) (Device, string, error) {
 	token := randomHex(32)
 	hash := sha256.Sum256([]byte(token))
 	now := time.Now().UnixMilli()
 	device := Device{ID: randomHex(16), UserID: userID, Name: name, LastSeenAt: now, CreatedAt: now}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO devices (id,user_id,name,token_hash,last_seen_at,created_at)
-		VALUES (?, ?, ?, ?, ?, ?)`, device.ID, userID, name, hash[:], now, now)
+	var expected any
+	if verifiedHash != nil {
+		expected = verifiedHash
+	}
+	err := s.db.QueryRowContext(ctx, `INSERT INTO devices (id,user_id,name,token_hash,last_seen_at,created_at)
+		SELECT ?, id, ?, ?, ?, ? FROM users WHERE id=? AND is_active=1 AND (? IS NULL OR password_hash=?)
+		RETURNING id`, device.ID, name, hash[:], now, now, userID, expected, expected).Scan(&device.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		var active bool
+		if lookup := s.db.QueryRowContext(ctx, "SELECT is_active FROM users WHERE id=?", userID).Scan(&active); lookup == nil && !active {
+			err = ErrInactiveUser
+		}
+	}
 	return device, token, err
 }
 
@@ -173,11 +207,17 @@ func (s *Store) Authenticate(ctx context.Context, token string) (User, Device, e
 	var device Device
 	hash := sha256.Sum256([]byte(token))
 	now := time.Now().UnixMilli()
-	err := s.db.QueryRowContext(ctx, `UPDATE devices SET last_seen_at = MAX(last_seen_at, ?)
+	err := s.db.QueryRowContext(ctx, `UPDATE devices SET last_seen_at = CASE
+		WHEN (SELECT is_active FROM users WHERE id=devices.user_id)=1 THEN MAX(last_seen_at, ?) ELSE last_seen_at END
 		WHERE token_hash=? RETURNING id, user_id, name, last_seen_at, created_at,
-		(SELECT username FROM users WHERE id=devices.user_id)`, now, hash[:]).
-		Scan(&device.ID, &device.UserID, &device.Name, &device.LastSeenAt, &device.CreatedAt, &user.Username)
+		(SELECT username FROM users WHERE id=devices.user_id),
+		(SELECT role FROM users WHERE id=devices.user_id),
+		(SELECT is_active FROM users WHERE id=devices.user_id)`, now, hash[:]).
+		Scan(&device.ID, &device.UserID, &device.Name, &device.LastSeenAt, &device.CreatedAt, &user.Username, &user.Role, &user.IsActive)
 	user.ID = device.UserID
+	if err == nil && !user.IsActive {
+		err = ErrInactiveUser
+	}
 	return user, device, err
 }
 

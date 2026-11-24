@@ -14,6 +14,7 @@ import { ServerModelSelect } from './ServerModelSelect'
 import { Sidebar } from './Sidebar'
 import { ToolCard } from './ToolCard'
 import { RichText } from './Markdown'
+import { AdminDialog } from './AdminDialog'
 
 const mcpExamples = [
   ['Список файлов', 'Покажи файлы проекта'],
@@ -148,8 +149,9 @@ function Connected() {
   const w = useChats(s => s.workspace)!
   const [view, setView] = useState<'chat' | 'billing'>('chat')
   const incoming = useAccountStore(s => s.requests.find(r => r.to.id === w.user.id && r.status === 'pending'))
-  const [panel, setPanel] = useState<'share' | 'devices' | null>(null)
+  const [panel, setPanel] = useState<'share' | 'devices' | 'admin' | null>(null)
   const { chats, activeId, remote, connectionError } = useChats()
+  const isAdmin = w.user.role === 'admin'
   const chat = chats.find(c => c.id === activeId)!
   const drawer = useRef<HTMLDialogElement>(null)
   const quotaMenu = useRef<HTMLDetailsElement>(null)
@@ -175,10 +177,13 @@ function Connected() {
     <aside className="desktop-side"><Sidebar openBilling={() => setView('billing')} close={() => setView('chat')}/></aside>
     <dialog ref={drawer} onClose={() => setDrawerOpen(false)} className="drawer" aria-label="Список чатов" onClick={e => { if (e.target === drawer.current) drawer.current.close() }}><Sidebar openBilling={() => { drawer.current?.close(); setView('billing') }} close={() => { drawer.current?.close(); setView('chat') }}/></dialog>
     <main className="main"><div className="topbar"><button className="icon-btn desk-toggle" aria-label="Переключить боковую панель" onClick={() => setCollapsed(!collapsed)}><PanelLeft size={17}/></button><button className="icon-btn mobile" aria-label="Открыть список чатов" onClick={() => { drawer.current?.showModal(); setDrawerOpen(true) }}><Menu size={18}/></button>
-      <span className="crumb">Рабочее пространство</span><ChevronRight className="crumb-arrow" size={13}/><span>{view === 'billing' ? 'Биллинг API' : chat?.indexedCodex ? 'Чаты Codex' : (!chat || chat.access === 'owner') ? 'Мои чаты' : 'Доступные мне'}</span>{!remote && <Quotas userId={w.user.id} menuRef={quotaMenu} onOpenChange={setQuotasOpen}/>}<button className="account-button" title="Настройки и устройства" aria-label="Настройки и устройства" onClick={() => setPanel('devices')}><Settings2 size={15}/>{'@' + (remote ? w.user.name : w.user.id)}</button></div>
+      <span className="crumb">Рабочее пространство</span><ChevronRight className="crumb-arrow" size={13}/><span>{view === 'billing' ? 'Биллинг API' : chat?.indexedCodex ? 'Чаты Codex' : (!chat || chat.access === 'owner') ? 'Мои чаты' : 'Доступные мне'}</span>{!remote && <Quotas userId={w.user.id} menuRef={quotaMenu} onOpenChange={setQuotasOpen}/>}
+      {isAdmin && <button className="alt-action admin-entry" onClick={() => setPanel('admin')}>Админка</button>}
+      <button className="account-button" title="Настройки и устройства" aria-label="Настройки и устройства" onClick={() => setPanel('devices')}><Settings2 size={15}/><span>{'@' + (remote ? w.user.name : w.user.id)}</span></button></div>
       {connectionError && <p className="notice connection-error" role="alert">{connectionError}</p>}
       {!remote && incoming && <Incoming key={incoming.requestId} request={incoming}/>}
       {view === 'billing' ? <Billing back={() => setView('chat')}/> : chat ? <Conversation key={chat.id} chat={chat} billing={() => setView('billing')} share={() => setPanel('share')}/> : <div className="empty thread"><h2>Пока нет чатов</h2><button onClick={() => void newChat()}>Создать чат</button></div>}
-      {panel && <WorkspaceDialog kind={panel} w={w} chatId={activeId} close={() => setPanel(null)}/>}
+      {panel === 'admin' && isAdmin && <AdminDialog admin={transport.admin} userId={w.user.id} close={() => setPanel(null)}/>}
+      {panel && panel !== 'admin' && <WorkspaceDialog kind={panel} w={w} chatId={activeId} close={() => setPanel(null)}/>}
     </main></div>
 }

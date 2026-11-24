@@ -75,10 +75,14 @@ func newLiveRuns(ctx context.Context, backend provider.Provider) *liveRuns {
 }
 
 func (a *API) websocket(w http.ResponseWriter, r *http.Request) {
-	s, err := a.authenticate(r.Context(), r.URL.Query().Get("token"))
+	token := r.URL.Query().Get("token")
+	s, err := a.authenticate(r.Context(), token)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		unauthorized(w)
+		return
+	case errors.Is(err, store.ErrInactiveUser):
+		inactive(w)
 		return
 	case err != nil:
 		a.internal(w, r, err)
@@ -100,6 +104,10 @@ func (a *API) websocket(w http.ResponseWriter, r *http.Request) {
 	client := &socket{conn: conn, events: make(chan runEvent, 128)}
 	a.live.add(s.User.ID, client)
 	defer a.live.remove(s.User.ID, client)
+	// A revocation between the handshake and registration must still take effect.
+	if _, err := a.authenticate(r.Context(), token); err != nil {
+		return
+	}
 	go client.write(a.live.ctx)
 	conn.SetReadLimit(128 << 10)
 	_ = conn.SetReadDeadline(time.Now().Add(connectionTimeout))
@@ -158,6 +166,14 @@ func (r *liveRuns) remove(userID string, c *socket) {
 		delete(r.clients, userID)
 	}
 	close(c.events)
+}
+
+func (r *liveRuns) disconnectUser(userID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for client := range r.clients[userID] {
+		_ = client.conn.Close()
+	}
 }
 
 // A slow consumer reconnects and reloads durable history. It cannot delay the others.

@@ -48,6 +48,10 @@ func newHandler(ctx context.Context, db *store.Store, cfg config.Config, logger 
 	mux.HandleFunc("GET /api/health", api.health)
 	mux.HandleFunc("POST /api/auth/login", api.login)
 	mux.HandleFunc("GET /api/auth/me", api.withAuth(api.me))
+	mux.HandleFunc("GET /api/admin/users", api.RequireAdmin(api.adminUsers))
+	mux.HandleFunc("POST /api/admin/users", api.RequireAdmin(api.adminCreateUser))
+	mux.HandleFunc("PATCH /api/admin/users/{id}", api.RequireAdmin(api.adminUpdateUser))
+	mux.HandleFunc("DELETE /api/admin/users/{id}/devices", api.RequireAdmin(api.adminRevokeDevices))
 	mux.HandleFunc("GET /api/codex/chats", api.withAuth(api.indexedChats))
 	mux.HandleFunc("GET /api/codex/chats/{id}/messages", api.withAuth(api.indexedMessages))
 	mux.HandleFunc("GET /api/models", api.withAuth(api.models))
@@ -69,7 +73,7 @@ func (a *API) cors(next http.Handler) http.Handler {
 			}
 			w.Header().Set("Access-Control-Allow-Origin", a.config.CORSOrigin)
 			if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -113,8 +117,19 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusUnauthorized, "invalid_credentials", "Invalid username or password.")
 		return
 	}
-	device, token, err := a.db.IssueDevice(r.Context(), user.ID, req.DeviceName)
-	if err != nil {
+	if !user.IsActive {
+		inactive(w)
+		return
+	}
+	device, token, err := a.db.IssueDeviceForLogin(r.Context(), user.ID, req.DeviceName, hash)
+	switch {
+	case errors.Is(err, store.ErrInactiveUser):
+		inactive(w)
+		return
+	case errors.Is(err, sql.ErrNoRows):
+		fail(w, http.StatusUnauthorized, "invalid_credentials", "Invalid username or password.")
+		return
+	case err != nil:
 		a.internal(w, r, err)
 		return
 	}
@@ -136,6 +151,8 @@ func (a *API) withAuth(next func(http.ResponseWriter, *http.Request, session)) h
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			unauthorized(w)
+		case errors.Is(err, store.ErrInactiveUser):
+			inactive(w)
 		case err != nil:
 			a.internal(w, r, err)
 		default:
@@ -158,6 +175,10 @@ func (a *API) authenticate(ctx context.Context, token string) (session, error) {
 func unauthorized(w http.ResponseWriter) {
 	w.Header().Set("WWW-Authenticate", "Bearer")
 	fail(w, http.StatusUnauthorized, "unauthorized", "A valid device token is required.")
+}
+
+func inactive(w http.ResponseWriter) {
+	fail(w, http.StatusForbidden, "account_inactive", "Account is inactive.")
 }
 
 func (a *API) me(w http.ResponseWriter, _ *http.Request, s session) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -40,8 +41,10 @@ func run(ctx context.Context, args []string, out io.Writer, logger *slog.Logger)
 		switch args[0] {
 		case "create-user":
 			return createUser(ctx, cfg.DBPath, args[1:], out)
+		case "set-role":
+			return setRole(ctx, cfg.DBPath, args[1:], out)
 		case "-h", "--help":
-			fmt.Fprintln(out, "Usage: server [create-user --username NAME --password PASSWORD]")
+			fmt.Fprintln(out, "Usage: server [create-user --username NAME --password PASSWORD [--role admin|user] | set-role --username NAME --role admin|user]")
 			return nil
 		default:
 			return fmt.Errorf("unknown command %q", args[0])
@@ -89,6 +92,7 @@ func createUser(ctx context.Context, path string, args []string, out io.Writer) 
 	flags.SetOutput(out)
 	username := flags.String("username", "", "user name")
 	password := flags.String("password", "", "password (maximum 72 bytes)")
+	role := flags.String("role", "user", "admin or user")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -96,8 +100,8 @@ func createUser(ctx context.Context, path string, args []string, out io.Writer) 
 		return err
 	}
 	name := strings.TrimSpace(*username)
-	if flags.NArg() != 0 || !identity.ValidUsername(name) || !identity.ValidPassword(*password) {
-		return errors.New("use create-user --username NAME --password PASSWORD (1–72 bytes)")
+	if flags.NArg() != 0 || !identity.ValidUsername(name) || !identity.ValidPassword(*password) || !store.ValidRole(*role) {
+		return errors.New("use create-user --username NAME --password PASSWORD (1–72 bytes) [--role admin|user]")
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(*password), bcrypt.DefaultCost)
 	if err != nil {
@@ -108,9 +112,39 @@ func createUser(ctx context.Context, path string, args []string, out io.Writer) 
 		return err
 	}
 	defer db.Close()
-	if err := db.CreateUser(ctx, name, hash); err != nil {
+	if _, err := db.CreateUserWithRole(ctx, name, hash, *role); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "Created user %q.\n", name)
+	return nil
+}
+
+func setRole(ctx context.Context, path string, args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("set-role", flag.ContinueOnError)
+	flags.SetOutput(out)
+	username := flags.String("username", "", "user name")
+	role := flags.String("role", "", "admin or user")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	name := strings.TrimSpace(*username)
+	if flags.NArg() != 0 || !identity.ValidUsername(name) || !store.ValidRole(*role) {
+		return errors.New("use set-role --username NAME --role admin|user")
+	}
+	db, err := store.Open(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.SetUserRole(ctx, name, *role); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("user %q not found", name)
+		}
+		return err
+	}
+	fmt.Fprintf(out, "Set role for %q to %s.\n", name, *role)
 	return nil
 }

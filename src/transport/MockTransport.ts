@@ -2,11 +2,15 @@ import type { MockProject } from './MockProject'
 import { MockAccounting } from './MockAccounting'
 import { MockWorkspace } from './MockWorkspace'
 import type {
-  AccountEvent, PermissionDecision, RunEvent, RunRequest, TransportAdapter,
+  AccountEvent, AdminAdapter, PermissionDecision, RunEvent, RunRequest, TransportAdapter,
 } from '../protocol/types'
 
 type Scenario = 'normal' | 'refusal' | 'error' | 'quota'
 type Pending = { deviceId: string; resolve: (decision: PermissionDecision) => void; signal: AbortSignal }
+
+async function adminUnavailable(): Promise<never> {
+  throw Error('В демо-режиме нет аккаунта администратора.')
+}
 
 function delay(ms: number, signal: AbortSignal) {
   signal.throwIfAborted()
@@ -43,6 +47,9 @@ export class MockTransport implements TransportAdapter {
     }
   })
   readonly accounting: MockAccounting
+  readonly admin: AdminAdapter = {
+    list: adminUnavailable, create: adminUnavailable, update: adminUnavailable, revokeDevices: adminUnavailable,
+  }
 
   constructor(private readonly options: { delayMs?: number; scenario?: Scenario; nearLimit?: boolean; now?: () => number } = {}) {
     this.accounting = new MockAccounting(() => this.workspace.userId, options.now, options.scenario === 'quota' ? 49 : options.nearLimit ? 48 : 18)

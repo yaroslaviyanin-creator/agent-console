@@ -73,6 +73,7 @@ export type ProtocolEvent = RunEvent | AccountEvent
 export interface TransportAdapter {
   accounting: AccountingAdapter
   workspace: WorkspaceAdapter
+  admin: AdminAdapter
   // One ordered stream per message. done/error are terminal; cancellation rejects with AbortError.
   stream(request: RunRequest, signal: AbortSignal): AsyncIterable<RunEvent>
   // False for an unknown, expired or already handled request.
@@ -81,7 +82,7 @@ export interface TransportAdapter {
 }
 
 export interface LoginRequest { connection: string; login: string; password: string; deviceName: string }
-export interface Member { id: string; name: string }
+export interface Member { id: string; name: string; role?: UserRole; isActive?: boolean }
 export interface Device { id: string; ownerId: string; name: string; online: boolean }
 export interface Grant { userId: string; access: ShareAccess; trustedDeviceId?: string }
 export interface ChatAccess {
@@ -112,7 +113,23 @@ export type ServerProvider = 'stub' | 'codex'
 export interface ServerModel { id: string; name: string; isDefault: boolean }
 export interface ServerHealth { status: 'ok'; provider: ServerProvider }
 export interface ServerLoginRequest { username: string; password: string; deviceName: string }
-export interface ServerUser { id: string; username: string }
+export type UserRole = 'user' | 'admin'
+export interface ServerUser { id: string; username: string; role?: UserRole; isActive?: boolean }
+export interface AdminUser extends ServerUser {
+  role: UserRole
+  isActive: boolean
+  devicesCount: number
+  chatsCount: number
+  createdAt: number
+}
+export interface CreateAdminUser { username: string; password: string; role: UserRole }
+export interface UpdateAdminUser { role?: UserRole; isActive?: boolean; newPassword?: string }
+export interface AdminAdapter {
+  list(signal?: AbortSignal): Promise<AdminUser[]>
+  create(user: CreateAdminUser): Promise<AdminUser>
+  update(id: string, changes: UpdateAdminUser): Promise<void>
+  revokeDevices(id: string): Promise<void>
+}
 export interface ServerDevice { id: string; userId: string; name: string; lastSeenAt: number; createdAt: number }
 export interface ServerSession { user: ServerUser; device: ServerDevice }
 export interface ServerLoginResponse extends ServerSession { token: string }

@@ -1,5 +1,5 @@
 import type {
-  AccountingAdapter, IndexedCodexChat, LoginRequest, RunEvent, RunRequest, ServerChat, ServerError, ServerHealth,
+  AccountingAdapter, AdminAdapter, AdminUser, IndexedCodexChat, LoginRequest, RunEvent, RunRequest, ServerChat, ServerError, ServerHealth,
   ServerLoginResponse, ServerMessage, ServerModel, ServerSession, TransportAdapter, Workspace, WorkspaceAdapter,
 } from '../protocol/types'
 
@@ -89,17 +89,24 @@ export class RemoteTransport implements TransportAdapter {
     async setShare() { return unavailable() },
   }
 
+  readonly admin: AdminAdapter = {
+    list: signal => this.request<AdminUser[]>('/api/admin/users', undefined, signal),
+    create: user => this.request<AdminUser>('/api/admin/users', user),
+    update: async (id, changes) => { await this.request('/api/admin/users/' + encodeURIComponent(id), changes, undefined, 'PATCH') },
+    revokeDevices: async id => { await this.request('/api/admin/users/' + encodeURIComponent(id) + '/devices', undefined, undefined, 'DELETE') },
+  }
+
   subscribeAccount() { return () => {} }
   respondToPermission() { return false }
 
-  private async request<T>(path: string, body?: object, signal?: AbortSignal) {
+  private async request<T>(path: string, body?: object, signal?: AbortSignal, method = body ? 'POST' : 'GET') {
     const headers = new Headers()
     if (this.token) headers.set('Authorization', 'Bearer ' + this.token)
     if (body) headers.set('Content-Type', 'application/json')
     let response: Response
     try {
       response = await fetch(this.address + path, {
-        method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : null,
+        method, headers, body: body ? JSON.stringify(body) : null,
         signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(10_000), ...(signal ? [signal] : [])]),
         cache: 'no-store', redirect: 'error',
       })
@@ -108,13 +115,17 @@ export class RemoteTransport implements TransportAdapter {
     }
     if (!response.ok) {
       const detail: Partial<ServerError> = await response.json().catch(() => ({})) ?? {}
-      if (response.status === 401 && this.session) this.emit({ type: 'expired' })
+      if ((response.status === 401 || detail.code === 'account_inactive') && this.session) this.emit({ type: 'expired' })
       const message = path === '/api/auth/login' && response.status === 401
         ? 'Неверный логин или пароль.'
-        : response.status === 401 ? 'Сессия закончилась. Войдите снова.' : detail.message ?? 'Сервер отклонил запрос.'
+        : response.status === 401 ? 'Сессия закончилась. Войдите снова.'
+        : detail.code === 'account_inactive' ? 'Аккаунт заблокирован.'
+        : detail.code === 'admin_required' ? 'Требуются права администратора.'
+        : detail.code === 'username_taken' ? 'Этот логин уже занят.'
+        : detail.message ?? 'Сервер отклонил запрос.'
       throw new RemoteError(response.status, message)
     }
-    return await response.json() as T
+    return (response.status === 204 ? undefined : await response.json()) as T
   }
 
   restore(token: string) {
@@ -169,7 +180,7 @@ export class RemoteTransport implements TransportAdapter {
   private snapshot(): Workspace {
     if (!this.session) throw Error('Сессия закончилась. Войдите снова.')
     const { user, device } = this.session
-    const member = { id: user.id, name: user.username }
+    const member = { id: user.id, name: user.username, role: user.role ?? 'user', isActive: user.isActive ?? true }
     return {
       user: member, deviceId: device.id, users: [member],
       devices: [{ id: device.id, ownerId: user.id, name: device.name, online: true }],
