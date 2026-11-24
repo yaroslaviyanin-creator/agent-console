@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -31,7 +30,6 @@ func (p CodexCliProvider) withAppServer(ctx context.Context, timeout time.Durati
 	if err != nil {
 		return err
 	}
-	defer output.Close()
 	if err := cmd.Start(); err != nil {
 		return stderr.wrap("start Codex app-server", err)
 	}
@@ -53,17 +51,18 @@ func (p CodexCliProvider) withAppServer(ctx context.Context, timeout time.Durati
 	stopShutdown := context.AfterFunc(shutdownCtx, func() {
 		defer close(finished)
 		_ = cmd.Process.Kill()
-		_ = output.Close()
 	})
 	_, _ = io.Copy(io.Discard, output)
-	waitErr := cmd.Wait()
-	if !stopShutdown() {
+	// Join the shutdown callback before Wait closes the process pipes.
+	shutdownTimedOut := !stopShutdown()
+	if shutdownTimedOut {
 		<-finished
 	}
+	waitErr := cmd.Wait()
 	if err := ctx.Err(); err != nil {
 		return stderr.wrap("Codex app-server", err)
 	}
-	if waitErr != nil && !errors.Is(shutdownCtx.Err(), context.DeadlineExceeded) {
+	if waitErr != nil && !shutdownTimedOut {
 		return stderr.wrap("Codex app-server", waitErr)
 	}
 	return nil

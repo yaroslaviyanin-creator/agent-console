@@ -132,6 +132,7 @@ export class RemoteTransport implements TransportAdapter {
       const detail: Partial<ServerError> = await response.json().catch(() => ({})) ?? {}
       const message = path === '/api/auth/login' && response.status === 401
         ? 'Неверный логин или пароль.'
+        : response.status === 429 || detail.code === 'rate_limited' ? 'Слишком много попыток входа. Попробуйте позже.'
         : response.status === 401 ? 'Сессия закончилась. Войдите снова.'
         : detail.code === 'account_inactive' ? 'Аккаунт заблокирован.'
         : detail.code === 'admin_required' ? 'Требуются права администратора.'
@@ -212,7 +213,7 @@ export class RemoteTransport implements TransportAdapter {
     return {
       user: member, deviceId, users: [member],
       devices: this.devices.map(entry => ({
-        id: entry.id, ownerId: entry.userId, name: entry.name, online: entry.id === deviceId,
+        id: entry.id, ownerId: entry.userId, name: entry.name, online: entry.id === deviceId, lastSeenAt: entry.lastSeenAt,
       })),
       chats: [...this.chatList.map(chat => access(chat, user.id)),
         ...this.indexedChats.map(chat => ({ ...access(chat, user.id), access: 'read' as const }))],
@@ -290,15 +291,16 @@ export class RemoteTransport implements TransportAdapter {
   }
 
   private async logout() {
-    if (this.token) {
+    const token = this.token
+    this.close()
+    if (token) {
       try {
         await fetch(this.address + '/api/auth/logout', {
-          method: 'POST', headers: { Authorization: 'Bearer ' + this.token },
+          method: 'POST', headers: { Authorization: 'Bearer ' + token },
           keepalive: true, signal: AbortSignal.timeout(1000), redirect: 'error',
         })
-      } catch { /* The local session still ends if the server is unreachable. */ }
+      } catch { /* The local session is already closed. */ }
     }
-    this.close()
   }
 
   close() {

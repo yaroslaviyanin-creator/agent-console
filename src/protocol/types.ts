@@ -83,7 +83,7 @@ export interface TransportAdapter {
 
 export interface LoginRequest { connection: string; login: string; password: string; deviceName: string }
 export interface Member { id: string; name: string; role?: UserRole; isActive?: boolean }
-export interface Device { id: string; ownerId: string; name: string; online: boolean }
+export interface Device { id: string; ownerId: string; name: string; online: boolean; lastSeenAt?: number }
 export interface Grant { userId: string; access: ShareAccess; trustedDeviceId?: string }
 export interface ChatAccess {
   id: string

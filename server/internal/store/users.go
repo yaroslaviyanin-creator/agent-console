@@ -32,9 +32,9 @@ func (s *Store) SetUserRole(ctx context.Context, username, role string) error {
 
 func (s *Store) AdminUsers(ctx context.Context) ([]AdminUser, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, username, role, is_active, created_at,
-		(SELECT COUNT(*) FROM devices WHERE user_id=users.id),
+		(SELECT COUNT(*) FROM devices WHERE user_id=users.id AND (expires_at=0 OR expires_at>?)),
 		(SELECT COUNT(*) FROM chats WHERE user_id=users.id)
-		FROM users ORDER BY username`)
+		FROM users ORDER BY username`, time.Now().UnixMilli())
 	if err != nil {
 		return nil, err
 	}

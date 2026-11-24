@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"database/sql"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -17,7 +18,8 @@ import (
 
 func TestAdminUsersLifecycle(t *testing.T) {
 	ctx := t.Context()
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "admin.db"))
+	dbPath := filepath.Join(t.TempDir(), "admin.db")
+	db, err := store.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,6 +85,18 @@ func TestAdminUsersLifecycle(t *testing.T) {
 	if _, err := db.CreateChat(ctx, alice.ID, "Fixture", "stub", "default"); err != nil {
 		t.Fatal(err)
 	}
+	expired, _, err := db.IssueDevice(ctx, alice.ID, "Expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtureDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fixtureDB.Close()
+	if _, err := fixtureDB.ExecContext(ctx, "UPDATE devices SET expires_at=1 WHERE id=?", expired.ID); err != nil {
+		t.Fatal(err)
+	}
 	var list []store.AdminUser
 	request("GET", users, adminToken, "", 200, &list)
 	if len(list) != 2 || list[0].ID != alice.ID || list[0].DevicesCount != 1 || list[0].ChatsCount != 1 || list[0].CreatedAt == 0 {
@@ -142,12 +156,16 @@ func TestAdminUsersLifecycle(t *testing.T) {
 }
 
 func TestLoginRateLimit(t *testing.T) {
-	api := New(t.Context(), nil, config.Config{Provider: "stub", CORSOrigin: "*"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	request := func(ip, username string, want int) {
+	newAPI := func(t *testing.T, trust bool) http.Handler {
+		return New(t.Context(), nil, config.Config{Provider: "stub", CORSOrigin: "*", TrustProxyHeaders: trust}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}
+	request := func(t *testing.T, api http.Handler, ip, username, forwarded, realIP string, want int) {
 		t.Helper()
 		// Invalid passwords count as attempts without exercising bcrypt or SQLite.
 		r := httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"`+username+`","password":"","deviceName":"test"}`))
 		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Forwarded-For", forwarded)
+		r.Header.Set("X-Real-IP", realIP)
 		r.RemoteAddr = ip
 		w := httptest.NewRecorder()
 		api.ServeHTTP(w, r)
@@ -155,11 +173,32 @@ func TestLoginRateLimit(t *testing.T) {
 			t.Fatalf("login: got %d, want %d (%s)", w.Code, want, w.Body)
 		}
 	}
+	api := newAPI(t, false)
 	for range 5 {
-		request("192.0.2.1:1000", "alice", 400)
-		request("192.0.2.1:1001", "bob", 400)
+		request(t, api, "192.0.2.1:1000", "alice", "", "", 400)
+		request(t, api, "192.0.2.1:1001", "bob", "", "", 400)
 	}
-	request("192.0.2.2:1002", "alice", 429)
-	request("192.0.2.1:1002", "charlie", 429)
-	request("192.0.2.2:1002", "charlie", 400)
+	request(t, api, "192.0.2.2:1002", "alice", "", "", 429)
+	request(t, api, "192.0.2.1:1002", "charlie", "", "", 429)
+	request(t, api, "192.0.2.2:1002", "charlie", "", "", 400)
+
+	for _, tc := range []struct {
+		name, remote string
+		trust        bool
+		want         int
+	}{
+		{"trusted loopback", "127.0.0.1:1234", true, 400},
+		{"proxy trust disabled", "127.0.0.1:1234", false, 429},
+		{"non-loopback peer", "192.0.2.3:1234", true, 429},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newAPI(t, tc.trust)
+			for range 10 {
+				request(t, api, tc.remote, "", "198.51.100.3, 198.51.100.1, invalid", "", 400)
+			}
+			request(t, api, tc.remote, "", "198.51.100.4, 198.51.100.1", "", 429)
+			request(t, api, tc.remote, "", "198.51.100.3, 198.51.100.2", "", tc.want)
+			request(t, api, tc.remote, "", "invalid", "198.51.100.2", tc.want)
+		})
+	}
 }

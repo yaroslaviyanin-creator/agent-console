@@ -17,6 +17,7 @@ type Config struct {
 	Provider             string
 	CodexBin             string
 	CORSOrigin           string
+	TrustProxyHeaders    bool
 	MaxConcurrentStreams int
 	CodexHistoryUsername string
 }
@@ -51,6 +52,12 @@ func Load() (Config, error) {
 		return Config{}, errors.New("MAX_CONCURRENT_STREAMS must be an integer >= 1")
 	}
 	cfg.MaxConcurrentStreams = limit
+	if raw, ok := os.LookupEnv("TRUST_PROXY_HEADERS"); ok {
+		cfg.TrustProxyHeaders, err = strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse TRUST_PROXY_HEADERS: %w", err)
+		}
+	}
 	return cfg, nil
 }
 

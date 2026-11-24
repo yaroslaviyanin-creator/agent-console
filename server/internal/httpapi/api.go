@@ -145,12 +145,31 @@ func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 
 var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("dummy login hash"), bcrypt.DefaultCost)
 
-func (a *API) login(w http.ResponseWriter, r *http.Request) {
+func (a *API) clientIP(r *http.Request) string {
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		ip = r.RemoteAddr
 	}
-	if !a.logins.allow("ip:"+ip, 10) {
+	if !a.config.TrustProxyHeaders || !net.ParseIP(ip).IsLoopback() {
+		return ip
+	}
+	forwarded := r.Header.Values("X-Forwarded-For")
+	for i := len(forwarded) - 1; i >= 0; i-- {
+		addresses := strings.Split(forwarded[i], ",")
+		for j := len(addresses) - 1; j >= 0; j-- {
+			if addr := net.ParseIP(strings.TrimSpace(addresses[j])); addr != nil {
+				return addr.String()
+			}
+		}
+	}
+	if addr := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); addr != nil {
+		return addr.String()
+	}
+	return ip
+}
+
+func (a *API) login(w http.ResponseWriter, r *http.Request) {
+	if !a.logins.allow("ip:"+a.clientIP(r), 10) {
 		loginRateLimited(w)
 		return
 	}

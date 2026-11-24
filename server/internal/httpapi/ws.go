@@ -309,7 +309,7 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 		}
 		return
 	}
-	ctx, cancel := context.WithTimeout(a.live.ctx, 5*time.Minute)
+	ctx, cancel := context.WithCancel(a.live.ctx)
 	release, code := a.live.acquire(userID, req.ChatID, client, cancel)
 	if release == nil {
 		cancel()
@@ -351,32 +351,41 @@ func (a *API) streamRun(ctx context.Context, userID, sessionID string, req runRe
 		a.logger.Error("stream response", "chatId", req.ChatID, "code", code, "error", err)
 		return req.failure(seq+1, code, message, true)
 	}
+	queueCtx, queueCancel := context.WithTimeout(ctx, 5*time.Minute)
 	select {
 	case a.live.slots <- struct{}{}:
 		defer func() { <-a.live.slots }()
-	case <-ctx.Done():
-		return failure("run_interrupted", "The response was interrupted.", ctx.Err())
+	case <-queueCtx.Done():
+		queueCancel()
+		return failure("run_interrupted", "The response was interrupted.", queueCtx.Err())
 	}
+	queueErr := queueCtx.Err()
+	queueCancel()
 	// Revoking a user cancels all of their runs under this lock. A queued
 	// run must see that cancellation even if an active run just freed a slot.
 	a.live.mu.Lock()
 	err := ctx.Err()
 	a.live.mu.Unlock()
+	if err == nil {
+		err = queueErr
+	}
 	if err != nil {
 		return failure("run_interrupted", "The response was interrupted.", err)
 	}
+	runCtx, runCancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer runCancel()
 	started := time.Now()
-	events, err := a.live.backend.Stream(ctx, provider.Request{UserID: userID, Model: req.Model.ID, Prompt: req.Prompt, SessionID: sessionID})
+	events, err := a.live.backend.Stream(runCtx, provider.Request{UserID: userID, Model: req.Model.ID, Prompt: req.Prompt, SessionID: sessionID})
 	if err != nil {
 		return failure("provider_error", "Could not start the provider.", err)
 	}
 	var text, thinking bytes.Buffer
 	for {
 		select {
-		case <-ctx.Done():
-			return failure("run_interrupted", "The response was interrupted.", ctx.Err())
+		case <-runCtx.Done():
+			return failure("run_interrupted", "The response was interrupted.", runCtx.Err())
 		case event, ok := <-events:
-			if err := ctx.Err(); err != nil {
+			if err := runCtx.Err(); err != nil {
 				return failure("run_interrupted", "The response was interrupted.", err)
 			}
 			if !ok {
@@ -399,7 +408,7 @@ func (a *API) streamRun(ctx context.Context, userID, sessionID string, req runRe
 				wire.Delta = event.Delta
 			case provider.Done:
 				durationMs := time.Since(started).Milliseconds()
-				if err := a.db.FinishRun(ctx, req.ChatID, req.MessageID, text.String(), thinking.String(), event.SessionID, durationMs); err != nil {
+				if err := a.db.FinishRun(runCtx, req.ChatID, req.MessageID, text.String(), thinking.String(), event.SessionID, durationMs); err != nil {
 					return failure("storage_error", "Could not save the response.", err)
 				}
 				wire.Reason = "completed"

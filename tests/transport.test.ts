@@ -146,8 +146,9 @@ test('approving a stale diff cannot overwrite a change accepted in another chat'
 test('remote sessions connect with a ticket and manage server devices', async t => {
   const current = { id: 'current', userId: 'u', name: 'Test', lastSeenAt: 0, createdAt: 0, isCurrent: true }
   const session = { user: { id: 'u', username: 'demo' }, device: current, token: 'device-token' }
-  const old = { ...current, id: 'old', name: 'Old device', isCurrent: false }
+  const old = { ...current, id: 'old', name: 'Old device', lastSeenAt: 1_700_000_000_000, isCurrent: false }
   let devices = [current, old]
+  let loginLimited = true
   let ticketStatus = 200
   let tickets = 0
   let logouts = 0
@@ -175,7 +176,8 @@ test('remote sessions connect with a ticket and manage server devices', async t 
       assert.equal(new Headers(init.headers).get('Authorization'), 'Bearer device-token')
     }
     switch (route) {
-      case 'POST /api/auth/login': return Response.json(session)
+      case 'POST /api/auth/login':
+        return loginLimited ? Response.json({ code: 'rate_limited' }, { status: 429 }) : Response.json(session)
       case 'GET /api/health': return Response.json({ status: 'ok', provider: 'stub' })
       case 'GET /api/chats': return Response.json([])
       case 'GET /api/devices': return Response.json(devices)
@@ -199,17 +201,25 @@ test('remote sessions connect with a ticket and manage server devices', async t 
   const login = { connection: 'https://example.test', login: 'demo', password: 'demo', deviceName: 'Test' }
   const remote = new RemoteTransport(login.connection)
   t.after(() => remote.close())
-  assert.deepEqual((await remote.workspace.login(login)).devices.map(d => d.id), ['current', 'old'])
+  await assert.rejects(remote.workspace.login(login), {
+    status: 429, message: 'Слишком много попыток входа. Попробуйте позже.',
+  })
+  loginLimited = false
+  const workspace = await remote.workspace.login(login)
+  assert.deepEqual(workspace.devices.map(d => d.id), ['current', 'old'])
+  assert.equal(workspace.devices.find(d => d.id === old.id)?.lastSeenAt, old.lastSeenAt)
   await Promise.all([remote.connect(), remote.connect()])
   assert.equal(tickets, 1)
   assert.equal(socketUrl?.href, 'wss://example.test/ws?ticket=single-use')
   assert.deepEqual((await remote.workspace.revokeDevice('old'))?.devices.map(d => d.id), ['current'])
   devices = [current, old]
   assert.deepEqual((await remote.refreshDevices()).devices.map(d => d.id), ['current', 'old'])
-  await remote.workspace.logout()
+  const logout = remote.workspace.logout()
+  assert.equal(remote.sessionToken, '')
+  await logout
   assert.equal(logouts, 1)
   assert.equal(logoutKeepalive, true)
-  assert.equal(closedAtLogout, false)
+  assert.equal(closedAtLogout, true)
   assert.equal(closed, true)
   assert.equal(remote.sessionToken, '')
 

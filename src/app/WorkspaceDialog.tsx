@@ -35,6 +35,8 @@ function ShareForm({ w, chatId }: { w: Workspace; chatId: string }) {
   </form>
 }
 
+const deviceActivityFormat = new Intl.DateTimeFormat('ru', { dateStyle: 'medium', timeStyle: 'short' })
+
 function Devices({ w }: { w: Workspace }) {
   const { mode, address, connected } = useChats()
   const [server, setServer] = useState(address)
@@ -52,7 +54,9 @@ function Devices({ w }: { w: Workspace }) {
   async function revoke(id: string) {
     setError('')
     setRevoking(true)
-    try { await revokeDevice(id); setConfirm('') } catch (e) { setError(String(e)) }
+    try { await revokeDevice(id); setConfirm('') } catch (e) {
+      setError(e instanceof Error ? e.message : 'Не удалось отозвать устройство.')
+    }
     finally { setRevoking(false) }
   }
   const devices = mode === 'server' ? w.devices : w.devices.filter(d => d.ownerId === w.user.id)
@@ -70,8 +74,10 @@ function Devices({ w }: { w: Workspace }) {
     <div className="device-list">{devices.map(d => {
       const current = d.id === w.deviceId
       const online = mode === 'server' ? connected : d.online
+      const lastSeenAt = d.lastSeenAt ?? 0
       return <div key={d.id} className="device-row"><Monitor size={18}/><div><strong>{d.name}</strong>
-        {(mode === 'demo' || current) && <small>{online ? 'Онлайн' : 'Офлайн'}{current ? ' · Это устройство' : ''}</small>}</div>
+        {mode === 'demo' || current ? <small>{online ? 'Онлайн' : 'Офлайн'}{current ? ' · Это устройство' : ''}</small> :
+          lastSeenAt > 0 && <small>Активность: {deviceActivityFormat.format(lastSeenAt)}</small>}</div>
         {confirm !== d.id ? <button className="text-action" disabled={revoking} onClick={() => setConfirm(d.id)}>Отозвать</button> :
           <div className="device-confirm"><span>{current ? 'Завершить эту сессию?' : 'Отозвать доступ?'}</span>
             <button disabled={revoking} onClick={() => void revoke(d.id)}>Да, отозвать</button><button disabled={revoking} onClick={() => setConfirm('')}>Отмена</button>
