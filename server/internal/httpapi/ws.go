@@ -3,7 +3,9 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -54,29 +56,78 @@ var correlationID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
 var modelID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$`)
 
 type liveRuns struct {
-	ctx     context.Context
-	backend provider.Provider
-	mu      sync.Mutex
-	clients map[string]map[*socket]bool
-	chats   map[string]*sync.Mutex
-	slots   chan struct{}
+	ctx               context.Context
+	backend           provider.Provider
+	mu                sync.Mutex
+	clients           map[string]map[*socket]bool
+	chats             map[string]activeRun
+	slots             chan struct{}
+	tickets           map[string]wsTicket
+	nextTicketCleanup time.Time
+}
+
+type activeRun struct {
+	userID, deviceID string
+	cancel           context.CancelFunc
+}
+
+type wsTicket struct {
+	userID, deviceID string
+	expiresAt        time.Time
 }
 
 type socket struct {
-	conn   *websocket.Conn
-	events chan runEvent
+	conn     *websocket.Conn
+	events   chan runEvent
+	deviceID string
+	revoked  bool // guarded by liveRuns.mu
 }
 
-func newLiveRuns(ctx context.Context, backend provider.Provider) *liveRuns {
+func newLiveRuns(ctx context.Context, backend provider.Provider, concurrency int) *liveRuns {
 	return &liveRuns{
 		ctx: ctx, backend: backend, clients: make(map[string]map[*socket]bool),
-		chats: make(map[string]*sync.Mutex), slots: make(chan struct{}, 32),
+		chats: make(map[string]activeRun), slots: make(chan struct{}, concurrency),
+		tickets: make(map[string]wsTicket),
 	}
 }
 
+func (a *API) issueWSTicket(w http.ResponseWriter, r *http.Request, s session) {
+	var secret [32]byte
+	if _, err := rand.Read(secret[:]); err != nil {
+		a.internal(w, r, err)
+		return
+	}
+	key := hex.EncodeToString(secret[:])
+	a.live.mu.Lock()
+	now := time.Now()
+	if !now.Before(a.live.nextTicketCleanup) {
+		for key, ticket := range a.live.tickets {
+			if !now.Before(ticket.expiresAt) {
+				delete(a.live.tickets, key)
+			}
+		}
+		a.live.nextTicketCleanup = now.Add(30 * time.Second)
+	}
+	a.live.tickets[key] = wsTicket{s.User.ID, s.Device.ID, now.Add(30 * time.Second)}
+	a.live.mu.Unlock()
+	reply(w, http.StatusOK, map[string]string{"ticket": key})
+}
+
+func (r *liveRuns) takeTicket(key string) (wsTicket, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ticket, ok := r.tickets[key]
+	delete(r.tickets, key)
+	return ticket, ok && time.Now().Before(ticket.expiresAt)
+}
+
 func (a *API) websocket(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
-	s, err := a.authenticate(r.Context(), token)
+	ticket, ok := a.live.takeTicket(r.URL.Query().Get("ticket"))
+	if !ok {
+		unauthorized(w)
+		return
+	}
+	_, _, err := a.db.AuthenticateDevice(r.Context(), ticket.userID, ticket.deviceID)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		unauthorized(w)
@@ -92,8 +143,7 @@ func (a *API) websocket(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{
 		HandshakeTimeout: writeTimeout,
 		CheckOrigin: func(r *http.Request) bool {
-			origin := r.Header.Get("Origin")
-			return origin == "" || a.config.CORSOrigin == "*" || a.config.CORSOrigin == origin
+			return a.allowsOrigin(r.Header.Get("Origin"))
 		},
 	}
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -101,11 +151,11 @@ func (a *API) websocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	client := &socket{conn: conn, events: make(chan runEvent, 128)}
-	a.live.add(s.User.ID, client)
-	defer a.live.remove(s.User.ID, client)
+	client := &socket{conn: conn, events: make(chan runEvent, 128), deviceID: ticket.deviceID}
+	a.live.add(ticket.userID, client)
+	defer a.live.remove(ticket.userID, client)
 	// A revocation between the handshake and registration must still take effect.
-	if _, err := a.authenticate(r.Context(), token); err != nil {
+	if _, _, err := a.db.AuthenticateDevice(r.Context(), ticket.userID, ticket.deviceID); err != nil {
 		return
 	}
 	go client.write(a.live.ctx)
@@ -125,7 +175,7 @@ func (a *API) websocket(w http.ResponseWriter, r *http.Request) {
 				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Invalid RunRequest"), time.Now().Add(writeTimeout))
 			return
 		}
-		a.submit(s.User.ID, client, req)
+		a.submit(ticket.userID, client, req)
 	}
 }
 
@@ -169,10 +219,24 @@ func (r *liveRuns) remove(userID string, c *socket) {
 }
 
 func (r *liveRuns) disconnectUser(userID string) {
+	r.disconnectDevice(userID, "")
+}
+
+// An empty device ID revokes all live activity for the user.
+func (r *liveRuns) disconnectDevice(userID, deviceID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	matches := func(id string) bool { return deviceID == "" || deviceID == id }
 	for client := range r.clients[userID] {
-		_ = client.conn.Close()
+		if matches(client.deviceID) {
+			client.revoked = true
+			_ = client.conn.Close()
+		}
+	}
+	for _, run := range r.chats {
+		if run.userID == userID && matches(run.deviceID) {
+			run.cancel()
+		}
 	}
 }
 
@@ -193,29 +257,20 @@ func (r *liveRuns) publish(userID string, event runEvent) {
 	}
 }
 
-func (r *liveRuns) acquire(userID, chatID string) (func(*runEvent), string) {
+func (r *liveRuns) acquire(userID, chatID string, client *socket, cancel context.CancelFunc) (func(*runEvent), string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	lock := r.chats[chatID]
-	if lock == nil {
-		lock = &sync.Mutex{}
+	if client.revoked {
+		return nil, "session_revoked"
 	}
-	if !lock.TryLock() {
+	if _, busy := r.chats[chatID]; busy {
 		return nil, "chat_busy"
 	}
-	select {
-	case r.slots <- struct{}{}:
-	default:
-		lock.Unlock()
-		return nil, "server_busy"
-	}
-	r.chats[chatID] = lock
+	r.chats[chatID] = activeRun{userID, client.deviceID, cancel}
 	return func(terminal *runEvent) {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		delete(r.chats, chatID)
-		lock.Unlock()
-		<-r.slots
 		if terminal != nil {
 			for client := range r.clients[userID] {
 				enqueue(client, *terminal)
@@ -254,12 +309,18 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 		}
 		return
 	}
-	release, code := a.live.acquire(userID, req.ChatID)
+	ctx, cancel := context.WithTimeout(a.live.ctx, 5*time.Minute)
+	release, code := a.live.acquire(userID, req.ChatID, client, cancel)
 	if release == nil {
+		cancel()
+		if code == "session_revoked" {
+			return
+		}
 		reject(code, "Another response is running. Try again later.", true)
 		return
 	}
-	if err := a.startRun(userID, req, release); err != nil {
+	if err := a.startRun(ctx, cancel, userID, req, release); err != nil {
+		cancel()
 		release(nil)
 		switch {
 		case errors.Is(err, store.ErrDuplicateRun):
@@ -271,11 +332,9 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 	}
 }
 
-func (a *API) startRun(userID string, req runRequest, release func(*runEvent)) error {
-	ctx, cancel := context.WithTimeout(a.live.ctx, 5*time.Minute)
+func (a *API) startRun(ctx context.Context, cancel context.CancelFunc, userID string, req runRequest, release func(*runEvent)) error {
 	sessionID, err := a.db.BeginRun(ctx, userID, req.ChatID, req.MessageID, req.Prompt, a.config.Provider, req.Model.ID)
 	if err != nil {
-		cancel()
 		return err
 	}
 	go func() {
@@ -292,6 +351,20 @@ func (a *API) streamRun(ctx context.Context, userID, sessionID string, req runRe
 		a.logger.Error("stream response", "chatId", req.ChatID, "code", code, "error", err)
 		return req.failure(seq+1, code, message, true)
 	}
+	select {
+	case a.live.slots <- struct{}{}:
+		defer func() { <-a.live.slots }()
+	case <-ctx.Done():
+		return failure("run_interrupted", "The response was interrupted.", ctx.Err())
+	}
+	// Revoking a user cancels all of their runs under this lock. A queued
+	// run must see that cancellation even if an active run just freed a slot.
+	a.live.mu.Lock()
+	err := ctx.Err()
+	a.live.mu.Unlock()
+	if err != nil {
+		return failure("run_interrupted", "The response was interrupted.", err)
+	}
 	started := time.Now()
 	events, err := a.live.backend.Stream(ctx, provider.Request{UserID: userID, Model: req.Model.ID, Prompt: req.Prompt, SessionID: sessionID})
 	if err != nil {
@@ -303,6 +376,9 @@ func (a *API) streamRun(ctx context.Context, userID, sessionID string, req runRe
 		case <-ctx.Done():
 			return failure("run_interrupted", "The response was interrupted.", ctx.Err())
 		case event, ok := <-events:
+			if err := ctx.Err(); err != nil {
+				return failure("run_interrupted", "The response was interrupted.", err)
+			}
 			if !ok {
 				return failure("incomplete_response", "Provider did not complete the response.", nil)
 			}

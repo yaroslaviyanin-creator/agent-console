@@ -47,7 +47,8 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = root
 	cmd.Stdin = strings.NewReader(req.Prompt)
-	cmd.Stderr = io.Discard
+	var stderr stderrTail
+	cmd.Stderr = &stderr
 	cmd.WaitDelay = 3 * time.Second
 	cmd.Env = cliEnvironment()
 	stdout, err := cmd.StdoutPipe()
@@ -55,7 +56,7 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		return nil, stderr.wrap("start codex exec", err)
 	}
 	out := make(chan Event)
 	go func() {
@@ -72,14 +73,42 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 		case ctx.Err() != nil:
 			return
 		case parseErr != nil:
-			terminal = Event{Type: Error, Err: parseErr}
+			terminal = Event{Type: Error, Err: stderr.wrap("parse codex exec", parseErr)}
 		case terminal.Err != nil:
+			terminal.Err = stderr.wrap("codex exec", terminal.Err)
 		case waitErr != nil:
-			terminal = Event{Type: Error, Err: fmt.Errorf("codex exec: %w", waitErr)}
+			terminal = Event{Type: Error, Err: stderr.wrap("codex exec", waitErr)}
 		}
 		send(ctx, out, terminal)
 	}()
 	return out, nil
+}
+
+// os/exec writes stderr from one goroutine. Read the tail after Wait.
+type stderrTail struct {
+	data [8 << 10]byte
+	size int
+}
+
+func (t *stderrTail) Write(p []byte) (int, error) {
+	n := len(p)
+	if n >= len(t.data) {
+		copy(t.data[:], p[n-len(t.data):])
+		t.size = len(t.data)
+		return n, nil
+	}
+	if overflow := t.size + n - len(t.data); overflow > 0 {
+		t.size = copy(t.data[:], t.data[overflow:t.size])
+	}
+	t.size += copy(t.data[t.size:], p)
+	return n, nil
+}
+
+func (t *stderrTail) wrap(operation string, err error) error {
+	if tail := strings.TrimSpace(string(t.data[:t.size])); tail != "" {
+		return fmt.Errorf("%s: %w (stderr: %q)", operation, err, tail)
+	}
+	return fmt.Errorf("%s: %w", operation, err)
 }
 
 func codexArgs(req Request) ([]string, error) {

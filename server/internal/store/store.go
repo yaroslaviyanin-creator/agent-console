@@ -60,7 +60,9 @@ type Message struct {
 
 func randomHex(n int) string {
 	b := make([]byte, n)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -86,7 +88,11 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		}
 		dsn = (&url.URL{Scheme: "file", Path: filepath.ToSlash(absolute)}).String()
 	}
-	db, err := sql.Open("sqlite", dsn+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	dsn += "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	if path != ":memory:" {
+		dsn += "&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +154,21 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS devices_by_user ON devices(user_id); PRAGMA user_version=4;"); err != nil {
 			return err
 		}
+		fallthrough
 	case 4:
+		var exists bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('devices') WHERE name='expires_at')").Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, "ALTER TABLE devices ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version=5"); err != nil {
+			return err
+		}
+	case 5:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}
@@ -180,6 +200,8 @@ func (s *Store) IssueDevice(ctx context.Context, userID, name string) (Device, s
 	return s.IssueDeviceForLogin(ctx, userID, name, nil)
 }
 
+const deviceLifetime = 30 * 24 * time.Hour
+
 // Match the verified hash at insert time so a concurrent password reset cannot mint a token.
 func (s *Store) IssueDeviceForLogin(ctx context.Context, userID, name string, verifiedHash []byte) (Device, string, error) {
 	token := randomHex(32)
@@ -190,29 +212,59 @@ func (s *Store) IssueDeviceForLogin(ctx context.Context, userID, name string, ve
 	if verifiedHash != nil {
 		expected = verifiedHash
 	}
-	err := s.db.QueryRowContext(ctx, `INSERT INTO devices (id,user_id,name,token_hash,last_seen_at,created_at)
-		SELECT ?, id, ?, ?, ?, ? FROM users WHERE id=? AND is_active=1 AND (? IS NULL OR password_hash=?)
-		RETURNING id`, device.ID, name, hash[:], now, now, userID, expected, expected).Scan(&device.ID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Device{}, "", err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM devices WHERE expires_at > 0 AND expires_at <= ?", now); err != nil {
+		return Device{}, "", err
+	}
+	err = tx.QueryRowContext(ctx, `INSERT INTO devices (id,user_id,name,token_hash,last_seen_at,created_at,expires_at)
+  SELECT ?, id, ?, ?, ?, ?, ? FROM users WHERE id=? AND is_active=1 AND (? IS NULL OR password_hash=?)
+		RETURNING id`, device.ID, name, hash[:], now, now, now+deviceLifetime.Milliseconds(), userID, expected, expected).Scan(&device.ID)
 	if errors.Is(err, sql.ErrNoRows) {
 		var active bool
-		if lookup := s.db.QueryRowContext(ctx, "SELECT is_active FROM users WHERE id=?", userID).Scan(&active); lookup == nil && !active {
+		if lookup := tx.QueryRowContext(ctx, "SELECT is_active FROM users WHERE id=?", userID).Scan(&active); lookup == nil && !active {
 			err = ErrInactiveUser
 		}
+	}
+	if err == nil {
+		err = tx.Commit()
 	}
 	return device, token, err
 }
 
 func (s *Store) Authenticate(ctx context.Context, token string) (User, Device, error) {
-	var user User
-	var device Device
 	hash := sha256.Sum256([]byte(token))
 	now := time.Now().UnixMilli()
-	err := s.db.QueryRowContext(ctx, `UPDATE devices SET last_seen_at = CASE
-		WHEN (SELECT is_active FROM users WHERE id=devices.user_id)=1 THEN MAX(last_seen_at, ?) ELSE last_seen_at END
-		WHERE token_hash=? RETURNING id, user_id, name, last_seen_at, created_at,
-		(SELECT username FROM users WHERE id=devices.user_id),
-		(SELECT role FROM users WHERE id=devices.user_id),
-		(SELECT is_active FROM users WHERE id=devices.user_id)`, now, hash[:]).
+	user, device, err := s.activeDevice(ctx, "d.token_hash=?", now, hash[:])
+	cutoff := now - time.Minute.Milliseconds()
+	if err != nil || device.LastSeenAt > cutoff {
+		return user, device, err
+	}
+	err = s.db.QueryRowContext(ctx, `UPDATE devices SET last_seen_at=?, expires_at=?
+  WHERE id=? AND last_seen_at <= ? AND (expires_at=0 OR expires_at>?)
+   AND user_id IN (SELECT id FROM users WHERE id=? AND is_active=1)
+  RETURNING last_seen_at`, now, now+deviceLifetime.Milliseconds(), device.ID, cutoff, now, user.ID).Scan(&device.LastSeenAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		// A concurrent refresh or revocation can change the row after the initial read.
+		return s.activeDevice(ctx, "d.token_hash=?", now, hash[:])
+	}
+	return user, device, err
+}
+
+func (s *Store) AuthenticateDevice(ctx context.Context, userID, deviceID string) (User, Device, error) {
+	return s.activeDevice(ctx, "d.user_id=? AND d.id=?", time.Now().UnixMilli(), userID, deviceID)
+}
+
+func (s *Store) activeDevice(ctx context.Context, predicate string, now int64, args ...any) (User, Device, error) {
+	var user User
+	var device Device
+	args = append(args, now)
+	err := s.db.QueryRowContext(ctx, `SELECT d.id,d.user_id,d.name,d.last_seen_at,d.created_at,
+  u.username,u.role,u.is_active FROM devices d JOIN users u ON u.id=d.user_id
+  WHERE `+predicate+` AND (d.expires_at=0 OR d.expires_at>?)`, args...).
 		Scan(&device.ID, &device.UserID, &device.Name, &device.LastSeenAt, &device.CreatedAt, &user.Username, &user.Role, &user.IsActive)
 	user.ID = device.UserID
 	if err == nil && !user.IsActive {

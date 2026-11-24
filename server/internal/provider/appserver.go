@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -18,7 +19,9 @@ func (p CodexCliProvider) withAppServer(ctx context.Context, timeout time.Durati
 	defer cancel()
 	cmd := exec.CommandContext(ctx, p.Bin, "app-server", "--listen", "stdio://")
 	cmd.Env = cliEnvironment()
-	cmd.Stderr = io.Discard
+	var stderr stderrTail
+	cmd.Stderr = &stderr
+	cmd.WaitDelay = 3 * time.Second
 	input, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -30,17 +33,40 @@ func (p CodexCliProvider) withAppServer(ctx context.Context, timeout time.Durati
 	}
 	defer output.Close()
 	if err := cmd.Start(); err != nil {
-		return err
+		return stderr.wrap("start Codex app-server", err)
 	}
-	defer func() {
+	rpc, err := initializeAppRPC(input, output)
+	if err == nil {
+		err = use(rpc)
+	}
+	if err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-	}()
-	rpc, err := initializeAppRPC(input, output)
-	if err != nil {
-		return err
+		return stderr.wrap("Codex app-server RPC", err)
 	}
-	return use(rpc)
+
+	// EOF lets the stdio server exit normally so unexpected exit codes can be reported.
+	_ = input.Close()
+	shutdownCtx, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	finished := make(chan struct{})
+	stopShutdown := context.AfterFunc(shutdownCtx, func() {
+		defer close(finished)
+		_ = cmd.Process.Kill()
+		_ = output.Close()
+	})
+	_, _ = io.Copy(io.Discard, output)
+	waitErr := cmd.Wait()
+	if !stopShutdown() {
+		<-finished
+	}
+	if err := ctx.Err(); err != nil {
+		return stderr.wrap("Codex app-server", err)
+	}
+	if waitErr != nil && !errors.Is(shutdownCtx.Err(), context.DeadlineExceeded) {
+		return stderr.wrap("Codex app-server", waitErr)
+	}
+	return nil
 }
 
 type rpcResponse struct {

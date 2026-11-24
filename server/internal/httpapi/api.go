@@ -9,8 +9,10 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"agent-console/server/internal/config"
@@ -27,6 +29,7 @@ type API struct {
 	live    *liveRuns
 	catalog modelCatalog
 	index   indexedHistory
+	logins  loginLimiter
 }
 
 type session struct {
@@ -43,11 +46,15 @@ func New(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.L
 }
 
 func newHandler(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.Logger, backend provider.Provider) http.Handler {
-	api := &API{db: db, config: cfg, logger: logger, live: newLiveRuns(ctx, backend)}
+	api := &API{db: db, config: cfg, logger: logger, live: newLiveRuns(ctx, backend, max(1, cfg.MaxConcurrentStreams))}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", api.health)
 	mux.HandleFunc("POST /api/auth/login", api.login)
 	mux.HandleFunc("GET /api/auth/me", api.withAuth(api.me))
+	mux.HandleFunc("POST /api/auth/logout", api.withAuth(api.logout))
+	mux.HandleFunc("GET /api/devices", api.withAuth(api.devices))
+	mux.HandleFunc("DELETE /api/devices/{id}", api.withAuth(api.deleteDevice))
+	mux.HandleFunc("POST /api/ws/ticket", api.withAuth(api.issueWSTicket))
 	mux.HandleFunc("GET /api/admin/users", api.RequireAdmin(api.adminUsers))
 	mux.HandleFunc("POST /api/admin/users", api.RequireAdmin(api.adminCreateUser))
 	mux.HandleFunc("PATCH /api/admin/users/{id}", api.RequireAdmin(api.adminUpdateUser))
@@ -67,11 +74,15 @@ func (a *API) cors(next http.Handler) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Add("Vary", "Origin")
 		if origin := r.Header.Get("Origin"); origin != "" {
-			if a.config.CORSOrigin != "*" && a.config.CORSOrigin != origin {
+			if !a.allowsOrigin(origin) {
 				fail(w, http.StatusForbidden, "origin_denied", "Origin is not allowed.")
 				return
 			}
-			w.Header().Set("Access-Control-Allow-Origin", a.config.CORSOrigin)
+			allowed := origin
+			if a.config.CORSOrigin == "*" {
+				allowed = "*"
+			}
+			w.Header().Set("Access-Control-Allow-Origin", allowed)
 			if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
@@ -83,6 +94,51 @@ func (a *API) cors(next http.Handler) http.Handler {
 	})
 }
 
+func (a *API) allowsOrigin(origin string) bool {
+	if origin == "" || a.config.CORSOrigin == "*" {
+		return true
+	}
+	for _, allowed := range strings.Split(a.config.CORSOrigin, ",") {
+		if strings.TrimSpace(allowed) == origin {
+			return true
+		}
+	}
+	return false
+}
+
+type loginLimiter struct {
+	mu          sync.Mutex
+	attempts    map[string][]time.Time
+	nextCleanup time.Time
+}
+
+func (l *loginLimiter) allow(key string, limit int) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-time.Minute)
+	if l.attempts == nil {
+		l.attempts = make(map[string][]time.Time)
+	}
+	if !now.Before(l.nextCleanup) {
+		for key, times := range l.attempts {
+			if !times[len(times)-1].After(cutoff) {
+				delete(l.attempts, key)
+			}
+		}
+		l.nextCleanup = now.Add(time.Minute)
+	}
+	times := l.attempts[key]
+	for len(times) > 0 && !times[0].After(cutoff) {
+		times = times[1:]
+	}
+	if len(times) >= limit {
+		return false
+	}
+	l.attempts[key] = append(times, now)
+	return true
+}
+
 func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 	reply(w, http.StatusOK, map[string]string{"status": "ok", "provider": a.config.Provider})
 }
@@ -90,6 +146,14 @@ func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("dummy login hash"), bcrypt.DefaultCost)
 
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
+	}
+	if !a.logins.allow("ip:"+ip, 10) {
+		loginRateLimited(w)
+		return
+	}
 	var req struct {
 		Username   string `json:"username"`
 		Password   string `json:"password"`
@@ -100,6 +164,10 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Username = strings.TrimSpace(req.Username)
 	req.DeviceName = strings.TrimSpace(req.DeviceName)
+	if identity.ValidUsername(req.Username) && !a.logins.allow("user:"+req.Username, 5) {
+		loginRateLimited(w)
+		return
+	}
 	if !identity.ValidUsername(req.Username) || !identity.ValidPassword(req.Password) || !identity.ValidName(req.DeviceName, 80) {
 		fail(w, http.StatusBadRequest, "invalid_login", "Provide a username, password and device name.")
 		return
@@ -139,15 +207,21 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	}{session{user, device}, token})
 }
 
+func loginRateLimited(w http.ResponseWriter) {
+	fail(w, http.StatusTooManyRequests, "rate_limited", "Too many login attempts. Try again later.")
+}
+
+func bearerToken(r *http.Request) string {
+	scheme, token, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !strings.EqualFold(scheme, "Bearer") {
+		return ""
+	}
+	return strings.TrimSpace(token)
+}
+
 func (a *API) withAuth(next func(http.ResponseWriter, *http.Request, session)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		scheme, token, _ := strings.Cut(r.Header.Get("Authorization"), " ")
-		token = strings.TrimSpace(token)
-		if !strings.EqualFold(scheme, "Bearer") {
-			unauthorized(w)
-			return
-		}
-		s, err := a.authenticate(r.Context(), token)
+		s, err := a.authenticate(r.Context(), bearerToken(r))
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			unauthorized(w)
@@ -183,6 +257,45 @@ func inactive(w http.ResponseWriter) {
 
 func (a *API) me(w http.ResponseWriter, _ *http.Request, s session) {
 	reply(w, http.StatusOK, s)
+}
+
+func (a *API) logout(w http.ResponseWriter, r *http.Request, s session) {
+	if err := a.db.DeleteDeviceByToken(r.Context(), bearerToken(r)); err != nil {
+		a.internal(w, r, err)
+		return
+	}
+	a.live.disconnectDevice(s.User.ID, s.Device.ID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) devices(w http.ResponseWriter, r *http.Request, s session) {
+	devices, err := a.db.UserDevices(r.Context(), s.User.ID)
+	if err != nil {
+		a.internal(w, r, err)
+		return
+	}
+	type listedDevice struct {
+		store.Device
+		IsCurrent bool `json:"isCurrent"`
+	}
+	result := make([]listedDevice, 0, len(devices))
+	for _, device := range devices {
+		result = append(result, listedDevice{device, device.ID == s.Device.ID})
+	}
+	reply(w, http.StatusOK, result)
+}
+
+func (a *API) deleteDevice(w http.ResponseWriter, r *http.Request, s session) {
+	deviceID := r.PathValue("id")
+	switch err := a.db.DeleteDeviceByID(r.Context(), s.User.ID, deviceID); {
+	case errors.Is(err, sql.ErrNoRows):
+		fail(w, http.StatusNotFound, "device_not_found", "Device not found.")
+	case err != nil:
+		a.internal(w, r, err)
+	default:
+		a.live.disconnectDevice(s.User.ID, deviceID)
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func (a *API) chats(w http.ResponseWriter, r *http.Request, s session) {

@@ -63,7 +63,7 @@ func run(ctx context.Context, args []string, out io.Writer, logger *slog.Logger)
 		Handler:           httpapi.New(ctx, db, cfg, logger),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 	logger.Info("HTTP server listening", "addr", listener.Addr(), "provider", cfg.Provider)

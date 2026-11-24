@@ -5,10 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestMigrationsAndHashedDeviceToken(t *testing.T) {
@@ -57,6 +57,37 @@ func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 	currentUser, currentDevice, err := reopened.Authenticate(ctx, token)
 	if err != nil || currentUser != user || currentDevice.ID != device.ID {
 		t.Fatalf("auth after reopening DB failed: %v", err)
+	}
+	var version int
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 5 {
+		t.Fatalf("schema version %d: %v", version, err)
+	}
+	if currentDevice.LastSeenAt != device.LastSeenAt {
+		t.Fatal("recent device was refreshed")
+	}
+	before := time.Now().Add(-2 * time.Minute).UnixMilli()
+	if _, err := reopened.db.Exec("UPDATE devices SET last_seen_at=? WHERE id=?", before, device.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, refreshed, err := reopened.Authenticate(ctx, token)
+	if err != nil || refreshed.LastSeenAt <= before {
+		t.Fatalf("stale device was not refreshed: %+v (%v)", refreshed, err)
+	}
+	var expiresAt int64
+	if err := reopened.db.QueryRow("SELECT expires_at FROM devices WHERE id=?", device.ID).Scan(&expiresAt); err != nil || expiresAt != refreshed.LastSeenAt+deviceLifetime.Milliseconds() {
+		t.Fatalf("incorrect refreshed expiry: %d (%v)", expiresAt, err)
+	}
+	if _, err := reopened.db.Exec("UPDATE devices SET expires_at=1 WHERE id=?", device.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reopened.Authenticate(ctx, token); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expired token: %v", err)
+	}
+	if _, _, err := reopened.IssueDevice(ctx, user.ID, "new"); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.DeleteDeviceByID(ctx, user.ID, device.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expired device was not purged: %v", err)
 	}
 }
 

@@ -91,10 +91,13 @@ func TestAdminUsersLifecycle(t *testing.T) {
 	request("PATCH", users+"/"+admin.ID, adminToken, `{"role":"user"}`, 400, nil)
 	request("PATCH", users+"/"+admin.ID, adminToken, `{"isActive":false}`, 400, nil)
 	path := users + "/" + alice.ID
+	var ws struct{ Ticket string }
+	request("POST", "/api/ws/ticket", aliceToken, "", 200, &ws)
 	request("PATCH", path, adminToken, `{"isActive":false}`, 204, nil)
 	login(loginAlice, 403)
 	request("GET", "/api/auth/me", aliceToken, "", 403, nil)
-	request("GET", "/ws?token="+aliceToken, "", "", 403, nil)
+	request("GET", "/ws?ticket="+ws.Ticket, "", "", 403, nil)
+	request("GET", "/ws?token="+adminToken, "", "", 401, nil)
 	request("PATCH", path, adminToken, `{"isActive":true,"role":"admin","newPassword":"changed-pass"}`, 204, nil)
 	login(loginAlice, 401)
 	request("GET", "/api/auth/me", aliceToken, "", 401, nil)
@@ -103,8 +106,60 @@ func TestAdminUsersLifecycle(t *testing.T) {
 		t.Fatalf("incorrect patched user: %+v", updated)
 	}
 	request("GET", users, newToken, "", 200, nil)
+	_, secondaryToken, err := db.IssueDevice(ctx, alice.ID, "Desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var devices []struct {
+		store.Device
+		IsCurrent bool
+	}
+	request("GET", "/api/devices", newToken, "", 200, &devices)
+	if len(devices) != 2 || devices[0].IsCurrent == devices[1].IsCurrent {
+		t.Fatalf("device list: %+v", devices)
+	}
+	var secondary session
+	request("GET", "/api/auth/me", secondaryToken, "", 200, &secondary)
+	for _, device := range devices {
+		if device.IsCurrent == (device.ID == secondary.Device.ID) {
+			t.Fatalf("unexpected current flag: %+v", device)
+		}
+	}
+	devicePath := "/api/devices/" + secondary.Device.ID
+	request("DELETE", devicePath, adminToken, "", 404, nil)
+	request("DELETE", devicePath, newToken, "", 204, nil)
+	request("GET", "/api/auth/me", secondaryToken, "", 401, nil)
+	request("POST", "/api/auth/logout", newToken, "", 204, nil)
+	request("GET", "/api/devices", newToken, "", 401, nil)
+	_, newToken, err = db.IssueDevice(ctx, alice.ID, "Telegram")
+	if err != nil {
+		t.Fatal(err)
+	}
 	request("DELETE", path+"/devices", adminToken, "", 204, nil)
 	request("GET", "/api/auth/me", newToken, "", 401, nil)
 	request("PATCH", users+"/missing", adminToken, `{"role":"user"}`, 404, nil)
 	request("DELETE", users+"/missing/devices", adminToken, "", 404, nil)
+}
+
+func TestLoginRateLimit(t *testing.T) {
+	api := New(t.Context(), nil, config.Config{Provider: "stub", CORSOrigin: "*"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	request := func(ip, username string, want int) {
+		t.Helper()
+		// Invalid passwords count as attempts without exercising bcrypt or SQLite.
+		r := httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"`+username+`","password":"","deviceName":"test"}`))
+		r.Header.Set("Content-Type", "application/json")
+		r.RemoteAddr = ip
+		w := httptest.NewRecorder()
+		api.ServeHTTP(w, r)
+		if w.Code != want || want == 429 && !strings.Contains(w.Body.String(), `"rate_limited"`) {
+			t.Fatalf("login: got %d, want %d (%s)", w.Code, want, w.Body)
+		}
+	}
+	for range 5 {
+		request("192.0.2.1:1000", "alice", 400)
+		request("192.0.2.1:1001", "bob", 400)
+	}
+	request("192.0.2.2:1002", "alice", 429)
+	request("192.0.2.1:1002", "charlie", 429)
+	request("192.0.2.2:1002", "charlie", 400)
 }

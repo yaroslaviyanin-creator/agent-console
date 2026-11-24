@@ -57,7 +57,7 @@ func TestWebSocketChatLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := config.Config{Provider: "stub", CORSOrigin: "http://localhost:1420"}
+	cfg := config.Config{Provider: "stub", CORSOrigin: "http://localhost:1420, tauri://localhost", MaxConcurrentStreams: 1}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -65,11 +65,34 @@ func TestWebSocketChatLifecycle(t *testing.T) {
 	handler := newHandler(ctx, db, cfg, logger, gatedStub{first: gate})
 	server := httptest.NewServer(handler)
 	defer server.Close()
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws?token="
-	dial := func(token, origin string, status int) *websocket.Conn {
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws?ticket="
+	const origin = "tauri://localhost"
+	issueTicket := func(token string) string {
+		t.Helper()
+		req, err := http.NewRequest("POST", server.URL+"/api/ws/ticket", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Origin", origin)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		var result struct{ Ticket string }
+		if res.StatusCode != 200 || res.Header.Get("Access-Control-Allow-Origin") != origin {
+			t.Fatalf("ticket response: %d %v", res.StatusCode, res.Header)
+		}
+		if err := json.NewDecoder(res.Body).Decode(&result); err != nil || result.Ticket == "" {
+			t.Fatalf("missing ticket: %v", err)
+		}
+		return result.Ticket
+	}
+	dial := func(ticket, origin string, status int) *websocket.Conn {
 		t.Helper()
 		headers := http.Header{"Origin": []string{origin}}
-		c, res, err := websocket.DefaultDialer.Dial(wsURL+url.QueryEscape(token), headers)
+		c, res, err := websocket.DefaultDialer.Dial(wsURL+url.QueryEscape(ticket), headers)
 		if c != nil {
 			t.Cleanup(func() { c.Close() })
 		}
@@ -81,11 +104,13 @@ func TestWebSocketChatLifecycle(t *testing.T) {
 		}
 		return c
 	}
-	dial("", cfg.CORSOrigin, 401)
-	dial(token, "https://other.example", 403)
-	writer := dial(token, cfg.CORSOrigin, 101)
-	watcher := dial(secondToken, cfg.CORSOrigin, 101)
-	bob := dial(bobToken, cfg.CORSOrigin, 101)
+	dial("", origin, 401)
+	ticket := issueTicket(token)
+	dial(ticket, "https://other.example", 403)
+	writer := dial(ticket, origin, 101)
+	dial(ticket, origin, 401)
+	watcher := dial(issueTicket(secondToken), origin, 101)
+	bob := dial(issueTicket(bobToken), origin, 101)
 	write := func(c *websocket.Conn, chatID, messageID, mode string) {
 		t.Helper()
 		if err := c.WriteJSON(map[string]any{
@@ -147,7 +172,7 @@ func TestWebSocketChatLifecycle(t *testing.T) {
 	}
 
 	_ = writer.Close()
-	writer = dial(token, cfg.CORSOrigin, 101)
+	writer = dial(issueTicket(token), origin, 101)
 	write(writer, chat.ID, "answer-1", "chat")
 	expectError(read(writer), "answer-1", "duplicate_run", false)
 	write(writer, other.ID, "answer-1", "chat")
@@ -218,4 +243,67 @@ func (s gatedStub) Stream(ctx context.Context, req provider.Request) (<-chan pro
 		}
 	}()
 	return out, nil
+}
+
+func TestDisconnectUserCancelsActiveAndQueuedRuns(t *testing.T) {
+	ctx := t.Context()
+	started := make(chan context.Context, 2)
+	a := &API{
+		live:   newLiveRuns(ctx, blockingProvider{started}, 1),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	terminal := make(chan runEvent, 2)
+	start := func(userID, chatID string) {
+		runCtx, cancel := context.WithCancel(ctx)
+		t.Cleanup(cancel)
+		release, code := a.live.acquire(userID, chatID, &socket{deviceID: "device"}, cancel)
+		if release == nil {
+			t.Fatal(code)
+		}
+		go func() {
+			event := a.streamRun(runCtx, userID, "", runRequest{ChatID: chatID})
+			release(nil)
+			terminal <- event
+		}()
+	}
+	start("alice", "active")
+	var activeCtx context.Context
+	select {
+	case activeCtx = <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("provider did not start")
+	}
+	start("alice", "queued")
+	a.live.disconnectUser("bob")
+	if activeCtx.Err() != nil {
+		t.Fatal("disconnecting another user canceled the run")
+	}
+	a.live.disconnectUser("alice")
+	for range 2 {
+		select {
+		case event := <-terminal:
+			if event.Code != "run_interrupted" {
+				t.Fatalf("unexpected terminal event: %+v", event)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("run did not cancel")
+		}
+	}
+	select {
+	case <-started:
+		t.Fatal("queued run started")
+	default:
+	}
+	if len(a.live.slots) != 0 {
+		t.Fatal("stream slot leaked")
+	}
+}
+
+type blockingProvider struct {
+	started chan<- context.Context
+}
+
+func (p blockingProvider) Stream(ctx context.Context, _ provider.Request) (<-chan provider.Event, error) {
+	p.started <- ctx
+	return make(chan provider.Event), nil
 }

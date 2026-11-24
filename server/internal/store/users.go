@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"time"
@@ -78,5 +79,34 @@ func (s *Store) RevokeUserDevices(ctx context.Context, id string) error {
 		return err
 	}
 	_, err := s.db.ExecContext(ctx, "DELETE FROM devices WHERE user_id=?", id)
+	return err
+}
+
+func (s *Store) UserDevices(ctx context.Context, userID string) ([]Device, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,last_seen_at,created_at FROM devices
+  WHERE user_id=? AND (expires_at=0 OR expires_at>?) ORDER BY last_seen_at DESC,id`,
+		userID, time.Now().UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	devices := []Device{}
+	for rows.Next() {
+		d := Device{UserID: userID}
+		if err := rows.Scan(&d.ID, &d.Name, &d.LastSeenAt, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		devices = append(devices, d)
+	}
+	return devices, rows.Err()
+}
+
+func (s *Store) DeleteDeviceByID(ctx context.Context, userID, deviceID string) error {
+	return s.db.QueryRowContext(ctx, "DELETE FROM devices WHERE id=? AND user_id=? RETURNING id", deviceID, userID).Scan(new(string))
+}
+
+func (s *Store) DeleteDeviceByToken(ctx context.Context, token string) error {
+	hash := sha256.Sum256([]byte(token))
+	_, err := s.db.ExecContext(ctx, "DELETE FROM devices WHERE token_hash=?", hash[:])
 	return err
 }
