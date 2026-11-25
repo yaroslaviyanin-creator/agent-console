@@ -4,6 +4,7 @@ src-tauri/target/
 src-tauri/gen/
 .DS_Store
 *.local
+!deploy/Caddyfile.local
 
 /server/.env
 /server/data/
