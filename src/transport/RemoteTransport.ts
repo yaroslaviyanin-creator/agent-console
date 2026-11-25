@@ -407,8 +407,8 @@ export class RemoteTransport implements TransportAdapter {
         this.responses.set(key, controller)
         try {
           // SQLite history is authoritative in server mode.
-          const { chatId, messageId, model, target, prompt } = request
-          socket.send(JSON.stringify({ chatId, messageId, model, target, prompt }))
+          const { chatId, messageId, model, target, prompt, reasoning } = request
+          socket.send(JSON.stringify({ chatId, messageId, model, target, prompt, ...(reasoning ? { reasoning } : {}) }))
         } catch (error) {
           this.responses.delete(key)
           throw error

@@ -68,7 +68,7 @@ func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 		t.Fatalf("auth after reopening DB failed: %v", err)
 	}
 	var version int
-	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 9 {
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 11 {
 		t.Fatalf("schema version %d: %v", version, err)
 	}
 	if currentDevice.LastSeenAt != device.LastSeenAt {
@@ -506,5 +506,61 @@ func TestProfileMigrationAndMemoryIsolation(t *testing.T) {
 	}
 	if profile, err = db.UserProfile(ctx, owner); err != nil || profile.MemoryMD != "" || profile.MemoryUpdatedAt <= 21 {
 		t.Fatalf("manual clear was overwritten: %+v %v", profile, err)
+	}
+}
+
+func TestGeminiChatAndMigration(t *testing.T) {
+	ctx := t.Context()
+	db, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	user, err := db.CreateUserWithRole(ctx, "gemini_user", []byte("hash"), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat, err := db.CreateChat(ctx, user.ID, "Gemini Chat", "gemini", "gemini-3.8-flash")
+	if err != nil {
+		t.Fatalf("create gemini chat failed: %v", err)
+	}
+	if chat.Provider != "gemini" {
+		t.Fatalf("expected provider gemini, got %q", chat.Provider)
+	}
+	_, err = db.BeginRun(ctx, user.ID, chat.ID, "msg1", "Hello Gemini", "gemini", "gemini-3.8-flash")
+	if err != nil {
+		t.Fatalf("begin run failed: %v", err)
+	}
+	if err := db.FinishRun(ctx, user.ID, chat.ID, "msg1", "Hi there!", "", "019abcde-0123-4567-89ab-0123456789ab", 100, nil); err != nil {
+		t.Fatalf("finish run failed: %v", err)
+	}
+}
+
+func TestAntigravityChatAndMigration(t *testing.T) {
+	ctx := t.Context()
+	db, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	user, err := db.CreateUserWithRole(ctx, "agy_user", []byte("hash"), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat, err := db.CreateChat(ctx, user.ID, "Antigravity Chat", "antigravity", "gemini-3.8-flash-high")
+	if err != nil {
+		t.Fatalf("create antigravity chat failed: %v", err)
+	}
+	if chat.Provider != "antigravity" {
+		t.Fatalf("expected provider antigravity, got %q", chat.Provider)
+	}
+	_, err = db.BeginRun(ctx, user.ID, chat.ID, "msg1", "Hello Antigravity", "antigravity", "gemini-3.8-flash-high")
+	if err != nil {
+		t.Fatalf("begin run failed: %v", err)
+	}
+	if err := db.FinishRun(ctx, user.ID, chat.ID, "msg1", "Hi there!", "", "834a3b51-377b-4b32-b712-b0b6e81e8377", 100, nil); err != nil {
+		t.Fatalf("finish run failed: %v", err)
 	}
 }

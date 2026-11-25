@@ -314,7 +314,7 @@ select option { background: #202629; color: #eef0ef; }
 .quota-menu + .account-button { margin-left: 0; }
 .connection-error { padding: 8px 16px; }
 
-.server-model-select { display: flex; align-items: center; flex-wrap: wrap; gap: 0 6px; min-width: 0; max-width: 100%; }
+.server-model-select { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; min-width: 0; max-width: 100%; }
 .server-model-select .catalog-select select { max-width: min(46vw, 26ch); text-overflow: ellipsis; }
 .models-refresh { width: 28px; height: 28px; }
 .models-status { color: var(--muted); font-size: 11px; flex-basis: 100%; }

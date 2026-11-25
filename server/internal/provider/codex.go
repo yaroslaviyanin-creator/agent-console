@@ -179,6 +179,14 @@ func codexArgs(req Request) ([]string, error) {
 	if model := req.Model; model != "" && model != "codex" && model != "default" {
 		args = append(args, "--model="+model)
 	}
+	if effort := strings.ToLower(strings.TrimSpace(req.Reasoning)); effort != "" && effort != "default" {
+		switch effort {
+		case "minimal", "low", "medium", "high", "xhigh":
+			args = append(args, "-c", fmt.Sprintf("model_reasoning_effort=%q", effort))
+		default:
+			return nil, errors.New("invalid Codex reasoning effort")
+		}
+	}
 	if req.SessionID != "" {
 		if !sessionPattern.MatchString(req.SessionID) {
 			return nil, errors.New("invalid Codex session ID")

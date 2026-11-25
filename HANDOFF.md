@@ -5,6 +5,8 @@
 - React 19 / TypeScript / Vite / Zustand, Tauri v2 и опубликованный Telegram Mini App.
 - Go-сервер поддерживает вход с ограничением частоты запросов, REST, WebSocket и восстановление истории. SQLite работает в режиме WAL. `MAX_CONCURRENT_STREAMS` ограничивает число одновременных потоков ответов.
 - В режиме Server работает реальный `codex exec --json`, включая resume и динамический список моделей через `model/list`. Сквозной запрос из Telegram подтверждён.
+- Поддерживается серверный провайдер `PROVIDER=antigravity` через локальный Antigravity CLI (`ANTIGRAVITY_BIN=agy`, модель `ANTIGRAVITY_MODEL=gemini-3.8-flash-high`). Провайдер использует авторизованный аккаунт Antigravity и его квоты, поддерживает сохранение и продолжение сессий (`--conversation`), потоковый вывод `stream-json`, безопасный режим `--mode plan` и каталог моделей через `GET /api/models` (`agy models`).
+- Поддерживается серверный провайдер `PROVIDER=gemini` через локальный Gemini CLI (`GEMINI_BIN=gemini`, модель `GEMINI_MODEL=gemini-3.8-flash`). Поддерживаются сессии (`-r`), потоковый вывод `stream-json`, безопасный режим `--approval-mode plan` и список моделей через `GET /api/models`.
 - Раздел «Чаты Codex» показывает локальные обычные и архивные чаты владельца через Codex App Server. Проверены 46 чатов, включая 2 архивных. Импортированная история доступна для чтения.
 - Для Telegram Mini App сервер доступен по постоянному HTTPS через Tailscale Funnel. [Agent Console Preview](https://t.me/AgentConsolePreview26Bot). Сборка для Sites размещена в отдельном checkout `telegram-demo-site/`.
 - Go-сервер обслуживает режим «Только чат». Демо-учёт провайдеров и перевод квот доступны в MockTransport.
@@ -15,8 +17,12 @@
 ```sh
 (cd server && go run ./cmd/server create-user --username demo --password 'demo-password')
 (cd server && SERVER_ADDR=127.0.0.1:8080 PROVIDER=stub go run ./cmd/server)
+# Для Antigravity CLI (agy):
+(cd server && SERVER_ADDR=127.0.0.1:8080 PROVIDER=antigravity ANTIGRAVITY_BIN=agy ANTIGRAVITY_MODEL=gemini-3.8-flash-high go run ./cmd/server)
 # Для настоящего Codex и собственного индекса вместо StubProvider:
 (cd server && SERVER_ADDR=127.0.0.1:8080 PROVIDER=codex CODEX_HISTORY_USERNAME=demo go run ./cmd/server)
+# Для Gemini CLI:
+(cd server && SERVER_ADDR=127.0.0.1:8080 PROVIDER=gemini GEMINI_BIN=gemini GEMINI_MODEL=gemini-3.8-flash go run ./cmd/server)
 npm ci
 npm run dev
 npm run build
@@ -26,7 +32,7 @@ npm test
 npm run tauri -- build --debug --bundles app
 ```
 
-Фронтенд: http://127.0.0.1:1420/ → «Сервер» → http://127.0.0.1:8080. Codex должен быть установлен и авторизован на машине сервера. Для Telegram нужен доступный HTTPS-бэкенд и CORS_ORIGIN с точным origin Mini App. Настройки и права подробно описаны в AGENTS.md.
+Фронтенд: http://127.0.0.1:1420/ → «Сервер» → http://127.0.0.1:8080. Codex или Antigravity должны быть установлены и авторизованы на машине сервера. Для Telegram нужен доступный HTTPS-бэкенд и CORS_ORIGIN с точным origin Mini App. Настройки и права подробно описаны в AGENTS.md.
 
 ## Исправления истории Codex
 

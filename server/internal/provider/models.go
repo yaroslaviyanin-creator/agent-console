@@ -11,7 +11,9 @@ import (
 type Model struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
-	IsDefault bool   `json:"isDefault"`
+	IsDefault        bool     `json:"isDefault"`
+	ReasoningEfforts []string `json:"reasoningEfforts,omitempty"`
+	DefaultReasoning string   `json:"defaultReasoning,omitempty"`
 }
 
 // ListModels asks the installed Codex for the catalog visible to its account.

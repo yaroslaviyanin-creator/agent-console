@@ -131,7 +131,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version == 9 {
+	if version == 11 {
 		return nil
 	}
 	// SQLite requires disabling foreign keys outside the transaction on this connection.
@@ -273,7 +273,61 @@ func (s *Store) migrate(ctx context.Context) error {
    PRAGMA user_version=9;`); err != nil {
 			return err
 		}
+		fallthrough
 	case 9:
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE chats_v10 (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			title TEXT NOT NULL,
+			provider TEXT NOT NULL CHECK (provider IN ('codex', 'stub', 'gemini')),
+			model TEXT NOT NULL,
+			provider_session_id TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+		INSERT INTO chats_v10 (id,user_id,title,provider,model,provider_session_id,created_at,updated_at)
+			SELECT id,user_id,title,provider,model,provider_session_id,created_at,updated_at FROM chats;
+		DROP TABLE chats;
+		ALTER TABLE chats_v10 RENAME TO chats;
+		CREATE INDEX chats_by_user ON chats (user_id, updated_at DESC);
+		PRAGMA user_version=10;`); err != nil {
+			return err
+		}
+		var table string
+		switch err := tx.QueryRowContext(ctx, "PRAGMA foreign_key_check").Scan(&table, new(sql.NullInt64), new(string), new(int)); {
+		case err == nil:
+			return fmt.Errorf("foreign key violation in %s", table)
+		case !errors.Is(err, sql.ErrNoRows):
+			return err
+		}
+		fallthrough
+	case 10:
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE chats_v11 (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			title TEXT NOT NULL,
+			provider TEXT NOT NULL CHECK (provider IN ('codex', 'stub', 'gemini', 'antigravity')),
+			model TEXT NOT NULL,
+			provider_session_id TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+		INSERT INTO chats_v11 (id,user_id,title,provider,model,provider_session_id,created_at,updated_at)
+			SELECT id,user_id,title,provider,model,provider_session_id,created_at,updated_at FROM chats;
+		DROP TABLE chats;
+		ALTER TABLE chats_v11 RENAME TO chats;
+		CREATE INDEX chats_by_user ON chats (user_id, updated_at DESC);
+		PRAGMA user_version=11;`); err != nil {
+			return err
+		}
+		var tableV11 string
+		switch err := tx.QueryRowContext(ctx, "PRAGMA foreign_key_check").Scan(&tableV11, new(sql.NullInt64), new(string), new(int)); {
+		case err == nil:
+			return fmt.Errorf("foreign key violation in %s", tableV11)
+		case !errors.Is(err, sql.ErrNoRows):
+			return err
+		}
+	case 11:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}

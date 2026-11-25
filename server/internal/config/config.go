@@ -13,18 +13,22 @@ import (
 )
 
 type Config struct {
-	Addr                 string
-	DBPath               string
-	Provider             string
-	CodexBin             string
-	CORSOrigin           string
-	TrustProxyHeaders    bool
-	MaxConcurrentStreams int
-	CodexHistoryUsername string
-	MemoryAutoUpdate     bool
-	MemoryModel          string
-	MemoryCheckInterval  time.Duration
-	MemoryMinNewMessages int
+	Addr                    string
+	DBPath                  string
+	Provider                string
+	CodexBin                string
+	GeminiBin               string
+	GeminiDefaultModel      string
+	AntigravityBin          string
+	AntigravityDefaultModel string
+	CORSOrigin              string
+	TrustProxyHeaders       bool
+	MaxConcurrentStreams    int
+	CodexHistoryUsername    string
+	MemoryAutoUpdate        bool
+	MemoryModel             string
+	MemoryCheckInterval     time.Duration
+	MemoryMinNewMessages    int
 }
 
 func Load() (Config, error) {
@@ -32,15 +36,19 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("load .env: %w", err)
 	}
 	cfg := Config{
-		Addr:                 value("SERVER_ADDR", ":8080"),
-		DBPath:               value("DB_PATH", "./data/app.db"),
-		Provider:             value("PROVIDER", "stub"),
-		CodexBin:             value("CODEX_BIN", "codex"),
-		CORSOrigin:           strings.TrimSpace(value("CORS_ORIGIN", "*")),
-		CodexHistoryUsername: strings.TrimSpace(os.Getenv("CODEX_HISTORY_USERNAME")),
+		Addr:                    value("SERVER_ADDR", ":8080"),
+		DBPath:                  value("DB_PATH", "./data/app.db"),
+		Provider:                value("PROVIDER", "stub"),
+		CodexBin:                value("CODEX_BIN", "codex"),
+		GeminiBin:               value("GEMINI_BIN", "gemini"),
+		GeminiDefaultModel:      value("GEMINI_MODEL", "gemini-3.8-flash"),
+		AntigravityBin:          value("ANTIGRAVITY_BIN", "agy"),
+		AntigravityDefaultModel: value("ANTIGRAVITY_MODEL", "gemini-3.8-flash-high"),
+		CORSOrigin:              strings.TrimSpace(value("CORS_ORIGIN", "*")),
+		CodexHistoryUsername:    strings.TrimSpace(os.Getenv("CODEX_HISTORY_USERNAME")),
 	}
-	if cfg.Provider != "stub" && cfg.Provider != "codex" {
-		return Config{}, errors.New("PROVIDER must be stub or codex")
+	if cfg.Provider != "stub" && cfg.Provider != "codex" && cfg.Provider != "gemini" && cfg.Provider != "antigravity" {
+		return Config{}, errors.New("PROVIDER must be stub, codex, gemini or antigravity")
 	}
 	if cfg.CORSOrigin != "*" {
 		for _, origin := range strings.Split(cfg.CORSOrigin, ",") {

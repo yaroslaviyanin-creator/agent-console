@@ -8,6 +8,7 @@ import (
 type Request struct {
 	UserID             string
 	Model              string
+	Reasoning          string
 	Prompt             string
 	SessionID          string
 	SystemInstructions string

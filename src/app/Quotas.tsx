@@ -4,7 +4,7 @@ import type { MeteredProvider, Provider, Transfer, Workspace } from '../protocol
 import { useAccountStore, blockReason } from './accountStore'
 import { transport } from './runtime'
 
-const label = { claude: 'Claude', codex: 'Codex', paid_api: 'API' }
+const label: Record<Provider, string> = { claude: 'Claude', codex: 'Codex', paid_api: 'API', gemini: 'Gemini', antigravity: 'Antigravity' }
 const transferState = { pending: 'ожидает ответа', accepted: 'одобрен', declined: 'отклонён', expired: 'истёк' }
 export const dollars = (cents: number) => '$' + (cents / 100).toFixed(2)
 export const limitDollars = (cents: number) => cents % 100 === 0 ? '$' + cents / 100 : dollars(cents)
@@ -97,7 +97,7 @@ export function LimitActions({ w, provider, reason, switchCodex, billing }: { w:
   const quotas = useAccountStore(s => s.quotas)
   const q = quotas[provider]
   return <div className="limit-actions"><strong>{label[provider]} · {reason}</strong>
-    {provider !== 'paid_api' && q && q.provider !== 'paid_api' && q.sevenDay.usedPercent < 100 && <RequestForm w={w} provider={provider}/>}
+    {provider !== 'paid_api' && provider !== 'gemini' && provider !== 'antigravity' && q && q.provider !== 'paid_api' && q.sevenDay.usedPercent < 100 && <RequestForm w={w} provider={provider}/>}
     {provider === 'paid_api' && <button onClick={billing}>Открыть биллинг API</button>}
     {provider !== 'codex' && !blockReason(quotas.codex) && <button onClick={switchCodex}>Продолжить этот чат в Codex</button>}
   </div>

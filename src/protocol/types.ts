@@ -1,5 +1,5 @@
 // Wire payloads contain only JSON values. Timestamps are Unix milliseconds.
-export type Provider = 'claude' | 'codex' | 'paid_api'
+export type Provider = 'claude' | 'codex' | 'paid_api' | 'gemini' | 'antigravity'
 export type ShareAccess = 'read' | 'fork' | 'write'
 export type Target = { mode: 'chat' } | { mode: 'mcp'; deviceId: string }
 
@@ -10,6 +10,7 @@ export interface RunRequest {
   chatId: string
   messageId: string // ID of the new assistant message
   model: { provider: Provider; id: string }
+  reasoning?: string
   target: Target
   prompt: string
 }
@@ -40,7 +41,7 @@ export interface QuotaWindow {
   usedPercent: number
   resetsAt: number
 }
-export type MeteredProvider = Exclude<Provider, 'paid_api'>
+export type MeteredProvider = 'claude' | 'codex'
 export interface Transfer {
   requestId: string
   from: Member
@@ -110,8 +111,14 @@ export interface WorkspaceAdapter {
 
 // REST payloads used by the server transport. Chat provider identifies the server
 // backend, while RunRequest.model.provider identifies the client model family.
-export type ServerProvider = 'stub' | 'codex'
-export interface ServerModel { id: string; name: string; isDefault: boolean }
+export type ServerProvider = 'stub' | 'codex' | 'gemini' | 'antigravity'
+export interface ServerModel {
+  id: string
+  name: string
+  isDefault: boolean
+  reasoningEfforts?: string[]
+  defaultReasoning?: string
+}
 export interface ServerHealth { status: 'ok'; provider: ServerProvider }
 export interface ServerLoginRequest { username: string; password: string; deviceName: string }
 export type UserRole = 'pending' | 'user' | 'admin'

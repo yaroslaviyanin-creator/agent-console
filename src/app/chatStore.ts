@@ -6,7 +6,7 @@ import { readConnection, saveConnection, setTransport, transport } from './runti
 import type { ConnectionMode } from './runtime'
 import { RemoteError, RemoteTransport, normalizeServerAddress } from '../transport/RemoteTransport'
 
-export const providerLabels = { claude: 'Claude', codex: 'Codex', paid_api: 'Paid API' } satisfies Record<Provider, string>
+export const providerLabels = { claude: 'Claude', codex: 'Codex', paid_api: 'Paid API', gemini: 'Gemini', antigravity: 'Antigravity' } satisfies Record<Provider, string>
 export const models = [
   { id: 'sonnet', provider: 'claude', label: 'Claude Sonnet', shortLabel: 'Sonnet' },
   { id: 'opus', provider: 'claude', label: 'Claude Opus', shortLabel: 'Opus' },
@@ -14,7 +14,17 @@ export const models = [
   { id: 'gpt-5.2-codex', provider: 'codex', label: 'GPT-5.2-Codex', shortLabel: 'GPT-5.2-Codex' },
   { id: 'deepseek', provider: 'paid_api', label: 'DeepSeek', shortLabel: 'DeepSeek' },
   { id: 'deepseek-reasoner', provider: 'paid_api', label: 'DeepSeek Reasoner', shortLabel: 'DeepSeek Reasoner' },
-] as const satisfies ReadonlyArray<{ id: string; provider: Provider; label: string; shortLabel: string }>
+  { id: 'gemini-4-hydrogen-low', provider: 'antigravity', label: 'Gemini 4 Hydrogen (Low)', shortLabel: 'Gemini 4 Hydrogen', reasoning: 'Low' },
+  { id: 'gemini-4-hydrogen-medium', provider: 'antigravity', label: 'Gemini 4 Hydrogen (Medium)', shortLabel: 'Gemini 4 Hydrogen', reasoning: 'Medium' },
+  { id: 'gemini-4-hydrogen-high', provider: 'antigravity', label: 'Gemini 4 Hydrogen (High)', shortLabel: 'Gemini 4 Hydrogen', reasoning: 'High' },
+  { id: 'gemini-4-hydrogen-xhigh', provider: 'antigravity', label: 'Gemini 4 Hydrogen (XHigh)', shortLabel: 'Gemini 4 Hydrogen', reasoning: 'XHigh' },
+  { id: 'gemini-3.8-flash-low', provider: 'antigravity', label: 'Gemini 3.8 Flash (Low)', shortLabel: 'Gemini 3.8 Flash', reasoning: 'Low' },
+  { id: 'gemini-3.8-flash-medium', provider: 'antigravity', label: 'Gemini 3.8 Flash (Medium)', shortLabel: 'Gemini 3.8 Flash', reasoning: 'Medium' },
+  { id: 'gemini-3.8-flash-high', provider: 'antigravity', label: 'Gemini 3.8 Flash (High)', shortLabel: 'Gemini 3.8 Flash', reasoning: 'High' },
+  { id: 'claude-sonnet-4-6', provider: 'antigravity', label: 'Claude Sonnet 4.6 (Thinking)', shortLabel: 'Claude Sonnet 4.6', reasoning: 'Thinking' },
+  { id: 'claude-opus-4-6-thinking', provider: 'antigravity', label: 'Claude Opus 4.6 (Thinking)', shortLabel: 'Claude Opus 4.6', reasoning: 'Thinking' },
+  { id: 'gpt-oss-120b-medium', provider: 'antigravity', label: 'GPT-OSS 120B (Medium)', shortLabel: 'GPT-OSS 120B', reasoning: 'Medium' },
+] as const satisfies ReadonlyArray<{ id: string; provider: Provider; label: string; shortLabel: string; reasoning?: string }>
 export const demoPrompt = 'Увеличь тайм-аут подключения в settings.ts с 1 до 3 секунд.'
 export interface ToolEntry {
   kind: 'tool'
@@ -50,6 +60,7 @@ export interface Chat {
   title: string
   access: ShareAccess | 'owner'
   model: string
+  reasoning?: string | undefined
   target: Target
   draft: string
   turns: Turn[]
@@ -259,23 +270,25 @@ function startRemote(remote: RemoteTransport) {
   if (remote.provider === 'codex') {
     void refreshServerModels()
     void refreshCodexIndex()
+  } else if (remote.provider === 'gemini' || remote.provider === 'antigravity') {
+    void refreshServerModels()
   }
 }
 
 export async function refreshServerModels() {
   const { remote, modelsLoading } = useChats.getState()
-  if (!remote || remote.provider !== 'codex' || modelsLoading || useChats.getState().workspace?.user.role === 'pending') return
+  if (!remote || (remote.provider !== 'codex' && remote.provider !== 'gemini' && remote.provider !== 'antigravity') || modelsLoading || useChats.getState().workspace?.user.role === 'pending') return
   useChats.setState({ modelsLoading: true, modelsError: '' })
   try {
     const serverModels = await remote.models()
     if (useChats.getState().remote === remote) {
-      useChats.setState({ serverModels, modelsError: serverModels.length ? '' : 'Codex не вернул доступных моделей.' })
+      useChats.setState({ serverModels, modelsError: serverModels.length ? '' : (remote.provider === 'antigravity' ? 'Antigravity не вернул доступных моделей.' : remote.provider === 'gemini' ? 'Gemini не вернул доступных моделей.' : 'Codex не вернул доступных моделей.') })
     }
   } catch (error) {
     if (useChats.getState().remote === remote) {
       useChats.setState({ modelsError: error instanceof RemoteError && error.status === 404
         ? 'Обновите сервер, чтобы загрузить список моделей.'
-        : 'Не удалось загрузить список моделей Codex.' })
+        : (remote.provider === 'antigravity' ? 'Не удалось загрузить список моделей Antigravity.' : remote.provider === 'gemini' ? 'Не удалось загрузить список моделей Gemini.' : 'Не удалось загрузить список моделей Codex.') })
     }
   } finally {
     if (useChats.getState().remote === remote) useChats.setState({ modelsLoading: false })
@@ -303,7 +316,7 @@ function applyRemoteWorkspace(remote: RemoteTransport, workspace: Workspace, pre
   const accessById = new Map(workspace.chats.map(c => [c.id, c.access]))
   const chats = remote.chats.map(item => {
     const previous = existing.get(item.id)
-    const model = remote.provider === 'stub' || item.model === 'codex' ? 'default' : item.model
+    const model = remote.provider === 'stub' || item.model === 'codex' || item.model === 'gemini' || item.model === 'antigravity' ? 'default' : item.model
     if ('archived' in item && typeof item.archived === 'boolean') {
       return { ...(previous ?? chat(item.id, item.title, 'read')), title: item.title, model, indexedCodex: true, archived: item.archived }
     }
@@ -378,7 +391,7 @@ async function loadRemoteHistory(remote: RemoteTransport, id: string) {
   try {
     const messages = await remote.messages(id, controller.signal)
     if (controller.signal.aborted || useChats.getState().remote !== remote) return
-    updateChat(id, c => ({ ...c, historyLoaded: true, turns: restoreTurns(messages, c.turns, remote.provider === 'codex' ? 'Codex' : 'StubProvider') }))
+    updateChat(id, c => ({ ...c, historyLoaded: true, turns: restoreTurns(messages, c.turns, remote.provider === 'codex' ? 'Codex' : remote.provider === 'gemini' ? 'Gemini' : remote.provider === 'antigravity' ? 'Antigravity' : 'StubProvider') }))
   } catch (error) {
     if (!controller.signal.aborted && useChats.getState().remote === remote) {
       updateChat(id, c => ({ ...c, historyError: error instanceof Error ? error.message : 'Не удалось загрузить историю.' }))
@@ -549,7 +562,7 @@ async function startRun(id: string, input: string, retry?: { turnId: string; mod
   const serverModel = serverModels.find(m => m.id === c.model)
   if (remote && c.model !== 'default' && !serverModel) return
   const model = remote
-    ? { id: c.model, provider: 'codex' as const, label: serverModel?.name ?? 'Codex' }
+    ? { id: c.model, provider: (remote.provider === 'antigravity' ? 'antigravity' : remote.provider === 'gemini' ? 'gemini' : 'codex') as Provider, label: serverModel?.name ?? (remote.provider === 'antigravity' ? 'Antigravity' : remote.provider === 'gemini' ? 'Gemini' : 'Codex') }
     : models.find(m => m.id === (retry?.modelId ?? c.model))
   if (!model || (retry && (!source || source.state === 'running' || source.model === model.label))) return
   const prompt = source?.prompt ?? input.trim()
@@ -564,7 +577,7 @@ async function startRun(id: string, input: string, retry?: { turnId: string; mod
   runs.set(id, controller)
   updateChat(id, value => ({ ...value, title: !remote && value.title === 'Новый чат' ? prompt : value.title, draft: source ? value.draft : '', model: model.id, target, turns: [...value.turns, turn] }))
   try {
-    for await (const event of transport.stream({ chatId: id, messageId: turn.id, model: { id: model.id, provider: model.provider }, target, prompt, ...(history ? { history } : {}), ...retryFields }, controller.signal)) {
+    for await (const event of transport.stream({ chatId: id, messageId: turn.id, model: { id: model.id, provider: model.provider }, ...(c.reasoning ? { reasoning: c.reasoning } : {}), target, prompt, ...(history ? { history } : {}), ...retryFields }, controller.signal)) {
       if (controller.signal.aborted) break
       if (event.chatId === id && event.messageId === turn.id) {
         updateTurn(id, turn.id, t => applyEvent(t, event))

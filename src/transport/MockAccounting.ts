@@ -56,7 +56,7 @@ export class MockAccounting implements AccountingAdapter {
       if (t.status === 'pending' && t.expiresAt <= time) { t.status = 'expired'; this.transferEvent(t) }
     }
   }
-  private quota(id: string, provider: Provider): AccountEvent {
+  private quota(id: string, provider: MeteredProvider | 'paid_api'): AccountEvent {
     if (provider === 'paid_api') return {
       type: 'quota_update', provider, spentUsd: this.total() / 100, hardLimitUsd: this.ledger.hardLimitCents / 100, nextRunUsd: costCents / 100,
     }
@@ -88,6 +88,7 @@ export class MockAccounting implements AccountingAdapter {
   }
   // The mock debits one accepted invocation before streaming, including runs stopped later.
   charge(provider: Provider, prompt: string): string | undefined {
+    if (provider === 'gemini' || provider === 'antigravity') return undefined
     const id = this.user()
     this.refresh()
     if (provider === 'paid_api') {

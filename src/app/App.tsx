@@ -11,6 +11,7 @@ import { blockReason, useAccountStore } from './accountStore'
 import { demoPrompt, availableDevices, models, providerLabels, checkAccountStatus, logout, newChat, retryAnswer, retryHistory, sendPrompt, stopChat, updateChat, useChats } from './chatStore'
 import type { Chat, Turn } from './chatStore'
 import { ServerModelSelect } from './ServerModelSelect'
+import { defaultReasoningForProvider } from './modelCatalog'
 import { Sidebar } from './Sidebar'
 import { ToolCard } from './ToolCard'
 import { RichText } from './Markdown'
@@ -72,7 +73,7 @@ function Transcript({ turn, chatId, writable, busy, retry, demo }: { turn: Turn;
 
 function Conversation({ chat, share, billing }: { chat: Chat; share: () => void; billing: () => void }) {
   const { workspace: w, remote, connected, serverModels } = useChats()
-  const provider = models.find(m => m.id === chat.model)?.provider ?? (remote ? 'codex' : 'claude')
+  const provider = models.find(m => m.id === chat.model)?.provider ?? (remote ? (remote.provider === 'antigravity' ? 'antigravity' : remote.provider === 'gemini' ? 'gemini' : 'codex') : 'claude')
   const sampleBlocked = useAccountStore(s => !!blockReason(s.quotas.claude))
   const reason = useAccountStore(s => remote ? undefined : blockReason(s.quotas[provider]))
   const devices = availableDevices(w!, chat.id)
@@ -97,18 +98,67 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
       input.current?.focus()
     }
   }
+  const demoProviderModels = models.filter(m => m.provider === provider)
+  const demoModelGroups = Array.from(
+    demoProviderModels.reduce((map, item) => {
+      const key = item.shortLabel
+      const list = map.get(key) ?? []
+      list.push(item)
+      map.set(key, list)
+      return map
+    }, new Map<string, (typeof demoProviderModels)[number][]>()),
+    ([name, variants]) => ({ name, variants }),
+  )
+  const activeDemoGroup = demoModelGroups.find(g => g.variants.some(v => v.id === chat.model)) ?? demoModelGroups[0]
+  const hasDemoVariantReasoning = Boolean(activeDemoGroup?.variants.some(v => 'reasoning' in v && v.reasoning))
+  const demoReasoningOptions = hasDemoVariantReasoning ? [] : defaultReasoningForProvider(provider)
+  const providerEntries = [
+    ['antigravity', providerLabels.antigravity],
+    ['codex', providerLabels.codex],
+    ['claude', providerLabels.claude],
+    ['gemini', providerLabels.gemini],
+    ['paid_api', providerLabels.paid_api],
+  ] as const
+
   return <>
     <header className="chat-heading"><div className="heading-inner"><div className="heading-icon"><Terminal size={21}/></div><div className="heading-text"><h1 title={chat.title}>{chat.title}</h1><div className="heading-meta"><i/>{remote ? 'Сервер' : 'Демо-сессия'}<span>/</span><span>{chat.indexedCodex ? 'История Codex' : chat.access === 'owner' ? 'Личный чат' : 'Общий чат'}</span></div></div>{!chat.indexedCodex && chat.access === 'owner' && <button className="share-action" onClick={share} aria-label="Поделиться"><Share2 size={15}/><span>Поделиться</span></button>}</div><div className="header-controls">
-          {remote ? <span className="server-provider">{remote.provider === 'codex' ? 'Codex' : 'StubProvider'}</span> : <label className="select-wrap catalog-select"><span>Провайдер</span><select aria-label="Провайдер" disabled={locked} value={provider} onChange={e => {
+          {remote ? <label className="select-wrap catalog-select"><span>Провайдер</span><select aria-label="Провайдер" disabled={locked} value={remote.provider} onChange={() => {}}>
+            {remote.provider === 'stub' && <option value="stub">StubProvider</option>}
+            {providerEntries.map(([id, name]) => <option value={id} key={id} disabled={id !== remote.provider}>{name}{id !== remote.provider ? ' (недоступен)' : ''}</option>)}
+          </select><ChevronDown size={12}/></label> : <label className="select-wrap catalog-select"><span>Провайдер</span><select aria-label="Провайдер" disabled={locked} value={provider} onChange={e => {
             const first = models.find(m => m.provider === e.currentTarget.value)
-            if (first) updateChat(chat.id, c => ({ ...c, model: first.id }))
-          }}>{Object.entries(providerLabels).map(([id, name]) => <option value={id} key={id}>{name}</option>)}</select><ChevronDown size={12}/></label>}
-          {chat.indexedCodex ? null : remote ? <ServerModelSelect model={chat.model} unavailable={unavailableModel} disabled={locked}
-            onChange={model => updateChat(chat.id, c => ({ ...c, model }))}/>
-            : <label className="select-wrap catalog-select"><span>Модель</span><select aria-label="Модель" disabled={locked} value={chat.model} onChange={e => {
-              const model = e.currentTarget.value
-              updateChat(chat.id, c => ({ ...c, model }))
-            }}>{models.filter(m => m.provider === provider).map(m => <option value={m.id} key={m.id}>{m.shortLabel}</option>)}</select><ChevronDown size={12}/></label>}
+            if (first) updateChat(chat.id, c => ({ ...c, model: first.id, reasoning: undefined }))
+          }}>{providerEntries.map(([id, name]) => {
+            const available = models.some(m => m.provider === id)
+            return <option value={id} key={id} disabled={!available}>{name}{!available ? ' (недоступен)' : ''}</option>
+          })}</select><ChevronDown size={12}/></label>}
+          {chat.indexedCodex ? null : remote ? <ServerModelSelect model={chat.model} reasoning={chat.reasoning} unavailable={unavailableModel} disabled={locked}
+            onChangeModel={model => updateChat(chat.id, c => ({ ...c, model }))}
+            onChangeReasoning={reasoning => updateChat(chat.id, c => ({ ...c, reasoning: reasoning || undefined }))}/>
+            : <>
+              <label className="select-wrap catalog-select"><span>Модель</span><select aria-label="Модель" disabled={locked} value={activeDemoGroup?.name ?? ''} onChange={e => {
+                const nextGroup = demoModelGroups.find(g => g.name === e.currentTarget.value)
+                if (!nextGroup) return
+                const currentReasoning = activeDemoGroup?.variants.find(v => v.id === chat.model)
+                const currentLevel = currentReasoning && 'reasoning' in currentReasoning ? currentReasoning.reasoning : undefined
+                const matched = currentLevel
+                  ? nextGroup.variants.find(v => 'reasoning' in v && v.reasoning === currentLevel)
+                  : undefined
+                const chosen = matched ?? nextGroup.variants[0]
+                if (chosen) updateChat(chat.id, c => ({ ...c, model: chosen.id }))
+              }}>{demoModelGroups.map(g => <option value={g.name} key={g.name}>{g.name}</option>)}</select><ChevronDown size={12}/></label>
+              <label className="select-wrap catalog-select"><span>Рассуждения</span>{hasDemoVariantReasoning ? (
+                <select aria-label="Рассуждения" disabled={locked || (activeDemoGroup?.variants.length ?? 0) <= 1} value={chat.model} onChange={e => {
+                  const model = e.currentTarget.value
+                  updateChat(chat.id, c => ({ ...c, model }))
+                }}>{activeDemoGroup?.variants.map(v => <option value={v.id} key={v.id}>{'reasoning' in v && v.reasoning ? v.reasoning : v.shortLabel}</option>)}</select>
+              ) : (
+                <select aria-label="Рассуждения" disabled={locked || demoReasoningOptions.length === 0} value={demoReasoningOptions.length ? (chat.reasoning ?? '') : ''} onChange={e => {
+                  const reasoning = e.currentTarget.value || undefined
+                  updateChat(chat.id, c => ({ ...c, reasoning }))
+                }}><option value="">По умолчанию</option>{demoReasoningOptions.map(opt => <option value={opt.value} key={opt.value}>{opt.label}</option>)}</select>
+              )}<ChevronDown size={12}/></label>
+            </>}
           {remote ? <span className="select-wrap"><Terminal size={14}/>Только чат</span> : <div className="select-wrap mode"><Terminal size={14}/><select aria-label="Режим" disabled={locked} value={chat.target.mode} onChange={e => updateChat(chat.id, c => ({ ...c, target: e.target.value === 'chat' ? { mode: 'chat' } : { mode: 'mcp', deviceId: w!.deviceId } }))}><option value="chat">Только чат</option><option value="mcp">Управление ПК (MCP)</option></select><ChevronDown size={12}/></div>}
           {chat.target.mode === 'mcp' && <label className="device-select"><Laptop size={13}/><select aria-label="Целевое устройство" disabled={locked} value={chat.target.deviceId} onChange={e => updateChat(chat.id, c => ({ ...c, target: { mode: 'mcp', deviceId: e.target.value } }))}>{devices.map(d => <option key={d.id} value={d.id} disabled={!d.online}>{d.name} · {d.ownerId !== w!.user.id ? 'ПК владельца · ' : ''}{d.online ? 'онлайн' : 'офлайн'}</option>)}</select><ChevronDown size={12}/></label>}</div></header>
     <div className="history" ref={scroll} onScroll={() => { const el = scroll.current; if (el) follow.current = el.scrollHeight - el.clientHeight - el.scrollTop < 48 }}>

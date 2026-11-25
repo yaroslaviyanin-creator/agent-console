@@ -25,6 +25,7 @@ type runRequest struct {
 	ChatID    string `json:"chatId"`
 	MessageID string `json:"messageId"`
 	Prompt    string `json:"prompt"`
+	Reasoning string `json:"reasoning,omitempty"`
 	Model     struct {
 		Provider string `json:"provider"`
 		ID       string `json:"id"`
@@ -349,15 +350,31 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 		reject("invalid_request", "Send a message in chat mode with a valid model.", false)
 		return
 	}
+	if req.Reasoning != "" {
+		switch strings.ToLower(strings.TrimSpace(req.Reasoning)) {
+		case "default", "minimal", "low", "medium", "high", "xhigh", "thinking":
+		default:
+			reject("invalid_request", "Send a message with a valid reasoning level.", false)
+			return
+		}
+	}
 	// The stub accepts any model family supported by the client protocol.
 	switch req.Model.Provider {
-	case "claude", "codex", "paid_api":
+	case "claude", "codex", "paid_api", "gemini", "antigravity":
 	default:
 		reject("unsupported_model", "Unknown model provider.", false)
 		return
 	}
 	if a.config.Provider == "codex" && req.Model.Provider != "codex" {
 		reject("unsupported_model", "Select a Codex model for this server.", false)
+		return
+	}
+	if a.config.Provider == "gemini" && req.Model.Provider != "gemini" {
+		reject("unsupported_model", "Select a Gemini model for this server.", false)
+		return
+	}
+	if a.config.Provider == "antigravity" && req.Model.Provider != "antigravity" {
+		reject("unsupported_model", "Select an Antigravity model for this server.", false)
 		return
 	}
 	// Resolve the workspace and check write access before revealing whether the chat is busy.
@@ -475,7 +492,7 @@ func (a *API) streamRun(ctx context.Context, userID, ownerID string, req runRequ
 		return failure("storage_error", "Could not load your profile.", err)
 	}
 	started := time.Now()
-	events, err := a.live.backend.Stream(runCtx, provider.Request{UserID: ownerID, Model: req.Model.ID, Prompt: req.Prompt, SessionID: sessionID, SystemInstructions: instructions})
+	events, err := a.live.backend.Stream(runCtx, provider.Request{UserID: ownerID, Model: req.Model.ID, Reasoning: req.Reasoning, Prompt: req.Prompt, SessionID: sessionID, SystemInstructions: instructions})
 	if err != nil {
 		return failure("provider_error", "Could not start the provider.", err)
 	}
