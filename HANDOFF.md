@@ -53,3 +53,14 @@ npm run tauri -- build --debug --bundles app
 
 - «Настройки» → «Профиль и память» сохраняет имя, предпочтения и память через `GET/PATCH /api/profile`. В общие чаты передаётся имя автора сообщения.
 - Фоновое сжатие личных чатов через CLI регулируют `MEMORY_AUTO_UPDATE` (true), `MEMORY_MODEL` (default), `MEMORY_CHECK_INTERVAL` (5m) и `MEMORY_MIN_NEW_MESSAGES` (6). Запуски используют общий лимит потоков и не записываются в квоту клиента.
+
+## Docker
+
+- Локальный запуск (Windows / macOS / Linux): `cp .env.example .env && docker compose up -d --build` (веб-клиент на `http://127.0.0.1:3000`, бэкенд на `http://127.0.0.1:8080`).
+- Одноразовая авторизация Gemini CLI внутри контейнера (данные сохраняются в volume `cli_gemini`): `docker compose exec -it backend gemini`.
+- Горячий бэкап SQLite из volume:
+  ```sh
+  docker compose exec backend sqlite3 /app/data/app.db ".backup /tmp/backup.db"
+  docker compose cp backend:/tmp/backup.db ./backup.db
+  ```
+- Деплой на Linux VPS (Австрия) с автоматическим HTTPS через Caddy: `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build` (предварительно задайте `DOMAIN` и `CORS_ORIGIN` в `.env`).

@@ -1,0 +1,21 @@
+services:
+  backend:
+    ports: !reset []
+    environment:
+      TRUST_PROXY_HEADERS: "true"
+    mem_limit: 2g
+
+  web:
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

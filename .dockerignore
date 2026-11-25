@@ -1,0 +1,9 @@
+.git
+node_modules
+dist
+telegram-demo-site
+src-tauri/target
+server/data
+.env
+server/.env
+*.log

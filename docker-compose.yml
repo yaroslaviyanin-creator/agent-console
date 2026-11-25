@@ -1,0 +1,51 @@
+services:
+  backend:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      SERVER_ADDR: 0.0.0.0:8080
+      DB_PATH: /app/data/app.db
+      PROVIDER: ${PROVIDER:-stub}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+      MAX_CONCURRENT_STREAMS: ${MAX_CONCURRENT_STREAMS:-1}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-true}
+      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - app_data:/app/data
+      - cli_gemini:/home/app/.gemini
+      - cli_codex:/home/app/.codex
+      - cli_claude:/home/app/.claude
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - "ALL"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./deploy/Caddyfile.local:/etc/caddy/Caddyfile:ro
+    ports:
+      - "127.0.0.1:3000:80"
+
+volumes:
+  app_data:
+  cli_gemini:
+  cli_codex:
+  cli_claude:
