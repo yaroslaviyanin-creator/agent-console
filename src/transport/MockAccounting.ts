@@ -88,7 +88,7 @@ export class MockAccounting implements AccountingAdapter {
   }
   // The mock debits one accepted invocation before streaming, including runs stopped later.
   charge(provider: Provider, prompt: string): string | undefined {
-    if (provider === 'gemini' || provider === 'antigravity') return undefined
+    if (provider === 'antigravity') return undefined
     const id = this.user()
     this.refresh()
     if (provider === 'paid_api') {

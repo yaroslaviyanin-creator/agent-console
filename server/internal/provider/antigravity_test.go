@@ -191,3 +191,20 @@ func TestWriteAntigravityInstructionsRemovesStaleGeminiMD(t *testing.T) {
 		t.Fatalf("expected AGENTS.md to contain only chat-only instructions when empty, got: %q", string(gotEmpty))
 	}
 }
+
+func TestAntigravityEnvironmentForwardsProxyVars(t *testing.T) {
+	t.Setenv("AG_LS_PROXY", "http://127.0.0.1:53129")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:8080")
+	t.Setenv("NO_PROXY", "localhost,127.0.0.1")
+
+	env := antigravityEnvironment()
+	for _, want := range []string{
+		"AG_LS_PROXY=http://127.0.0.1:53129",
+		"HTTPS_PROXY=http://127.0.0.1:8080",
+		"NO_PROXY=localhost,127.0.0.1",
+	} {
+		if !slices.Contains(env, want) {
+			t.Fatalf("expected %q in antigravityEnvironment(), got %v", want, env)
+		}
+	}
+}

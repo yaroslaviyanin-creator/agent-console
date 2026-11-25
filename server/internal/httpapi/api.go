@@ -41,8 +41,6 @@ func New(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.L
 	var backend provider.Provider = provider.StubProvider{Delay: 100 * time.Millisecond}
 	if cfg.Provider == "codex" {
 		backend = provider.CodexCliProvider{Bin: cfg.CodexBin, WorkspaceRoot: "./data/workspaces"}
-	} else if cfg.Provider == "gemini" {
-		backend = provider.GeminiCliProvider{Bin: cfg.GeminiBin, DefaultModel: cfg.GeminiDefaultModel, WorkspaceRoot: "./data/workspaces"}
 	} else if cfg.Provider == "antigravity" {
 		backend = provider.AntigravityCliProvider{Bin: cfg.AntigravityBin, DefaultModel: cfg.AntigravityDefaultModel, WorkspaceRoot: "./data/workspaces"}
 	}

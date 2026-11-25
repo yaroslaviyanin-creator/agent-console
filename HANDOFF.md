@@ -6,7 +6,7 @@
 - Go-сервер поддерживает вход с ограничением частоты запросов, REST, WebSocket и восстановление истории. SQLite работает в режиме WAL. `MAX_CONCURRENT_STREAMS` ограничивает число одновременных потоков ответов.
 - В режиме Server работает реальный `codex exec --json`, включая resume и динамический список моделей через `model/list`. Сквозной запрос из Telegram подтверждён.
 - Поддерживается серверный провайдер `PROVIDER=antigravity` через локальный Antigravity CLI (`ANTIGRAVITY_BIN=agy`, модель `ANTIGRAVITY_MODEL=gemini-3.8-flash-high`). Провайдер использует авторизованный аккаунт Antigravity и его квоты, поддерживает сохранение и продолжение сессий (`--conversation`), потоковый вывод `stream-json`, безопасный режим `--mode plan` и каталог моделей через `GET /api/models` (`agy models`).
-- Поддерживается серверный провайдер `PROVIDER=gemini` через локальный Gemini CLI (`GEMINI_BIN=gemini`, модель `GEMINI_MODEL=gemini-3.8-flash`). Поддерживаются сессии (`-r`), потоковый вывод `stream-json`, безопасный режим `--approval-mode plan` и список моделей через `GET /api/models`.
+- Поддерживаемые идентификаторы пользовательских провайдеров в протоколе и БД: `antigravity`, `codex`, `claude`, `paid_api` (плюс `stub` для dev/тестов).
 - Раздел «Чаты Codex» показывает локальные обычные и архивные чаты владельца через Codex App Server. Проверены 46 чатов, включая 2 архивных. Импортированная история доступна для чтения.
 - Для Telegram Mini App сервер доступен по постоянному HTTPS через Tailscale Funnel. [Agent Console Preview](https://t.me/AgentConsolePreview26Bot). Сборка для Sites размещена в отдельном checkout `telegram-demo-site/`.
 - Go-сервер обслуживает режим «Только чат». Демо-учёт провайдеров и перевод квот доступны в MockTransport.
@@ -21,8 +21,6 @@
 (cd server && SERVER_ADDR=127.0.0.1:8080 PROVIDER=antigravity ANTIGRAVITY_BIN=agy ANTIGRAVITY_MODEL=gemini-3.8-flash-high go run ./cmd/server)
 # Для настоящего Codex и собственного индекса вместо StubProvider:
 (cd server && SERVER_ADDR=127.0.0.1:8080 PROVIDER=codex CODEX_HISTORY_USERNAME=demo go run ./cmd/server)
-# Для Gemini CLI:
-(cd server && SERVER_ADDR=127.0.0.1:8080 PROVIDER=gemini GEMINI_BIN=gemini GEMINI_MODEL=gemini-3.8-flash go run ./cmd/server)
 npm ci
 npm run dev
 npm run build
@@ -56,8 +54,11 @@ npm run tauri -- build --debug --bundles app
 
 ## Docker
 
-- Локальный запуск (Windows / macOS / Linux): `cp .env.example .env && docker compose up -d --build` (веб-клиент на `http://127.0.0.1:3000`, бэкенд на `http://127.0.0.1:8080`).
-- Одноразовая авторизация Gemini CLI внутри контейнера (данные сохраняются в volume `cli_gemini`): `docker compose exec -it backend gemini`.
+- Локальный запуск (Windows / macOS / Linux): `cp .env.example .env && docker compose up -d --build` (веб-клиент на `http://127.0.0.1:3000`, бэкенд на `http://127.0.0.1:8080`). На Apple Silicon (ARM64) предварительно раскомментируйте `platform: linux/amd64` в `docker-compose.yml` (бинарник `ag_unlocker` выпускается только для `x86_64`).
+- Встроенный Antigravity Unlocker (`AG_UNLOCKER_ENABLED=true`, по умолчанию включён): при старте контейнера `backend` автоматически патчит `agy` (`ineligible` → `inexigible`, `https_proxy` → `AG_LS_PROXY`), поднимает локальный CONNECT-прокси `ag_unlocker --proxy` на `127.0.0.1:53129` и экспортирует `AG_LS_PROXY`.
+- Код прокси из Telegram (`t.me/nova_txt`): при необходимости задайте `AG_UNLOCKER_CODE=agk1....` в `.env` (не коммитя `.env` в Git) и выполните `docker compose up -d backend`. Настройки анлокера сохраняются в volume `ag_unlocker_data` (`/home/app/.local/share/agunlocker`).
+- При переезде на другой компьютер или сервер: ключ `agk1....` привязан к `machine-id`/UUID хоста; получите новый код для новой машины в Telegram-группе/боте, обновите `AG_UNLOCKER_CODE` в `.env` и перезапустите `docker compose up -d backend`.
+- Одноразовая авторизация Antigravity CLI (`agy`) внутри контейнера (данные сохраняются в volume `agy_auth`): `docker compose exec -it backend agy`.
 - Горячий бэкап SQLite из volume:
   ```sh
   docker compose exec backend sqlite3 /app/data/app.db ".backup /tmp/backup.db"

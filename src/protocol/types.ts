@@ -1,5 +1,5 @@
 // Wire payloads contain only JSON values. Timestamps are Unix milliseconds.
-export type Provider = 'claude' | 'codex' | 'paid_api' | 'gemini' | 'antigravity'
+export type Provider = 'antigravity' | 'codex' | 'claude' | 'paid_api'
 export type ShareAccess = 'read' | 'fork' | 'write'
 export type Target = { mode: 'chat' } | { mode: 'mcp'; deviceId: string }
 
@@ -111,7 +111,7 @@ export interface WorkspaceAdapter {
 
 // REST payloads used by the server transport. Chat provider identifies the server
 // backend, while RunRequest.model.provider identifies the client model family.
-export type ServerProvider = 'stub' | 'codex' | 'gemini' | 'antigravity'
+export type ServerProvider = 'stub' | 'antigravity' | 'codex' | 'claude' | 'paid_api'
 export interface ServerModel {
   id: string
   name: string

@@ -159,10 +159,11 @@ func antigravityArgs(req Request, defaultModel string) ([]string, error) {
 func antigravityEnvironment() []string {
 	var env []string
 	for _, key := range []string{
-		"PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME",
+		"PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
 		"SYSTEMROOT", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
 		"AGY_ACCOUNT", "AGY_LOG", "AGY_API_KEY",
 		"GEMINI_API_KEY", "GOOGLE_API_KEY",
+		"AG_LS_PROXY",
 		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
 		"http_proxy", "https_proxy", "no_proxy", "all_proxy",
 	} {

@@ -360,17 +360,13 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 	}
 	// The stub accepts any model family supported by the client protocol.
 	switch req.Model.Provider {
-	case "claude", "codex", "paid_api", "gemini", "antigravity":
+	case "antigravity", "codex", "claude", "paid_api":
 	default:
 		reject("unsupported_model", "Unknown model provider.", false)
 		return
 	}
 	if a.config.Provider == "codex" && req.Model.Provider != "codex" {
 		reject("unsupported_model", "Select a Codex model for this server.", false)
-		return
-	}
-	if a.config.Provider == "gemini" && req.Model.Provider != "gemini" {
-		reject("unsupported_model", "Select a Gemini model for this server.", false)
 		return
 	}
 	if a.config.Provider == "antigravity" && req.Model.Provider != "antigravity" {

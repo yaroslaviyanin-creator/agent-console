@@ -6,7 +6,7 @@ import { readConnection, saveConnection, setTransport, transport } from './runti
 import type { ConnectionMode } from './runtime'
 import { RemoteError, RemoteTransport, normalizeServerAddress } from '../transport/RemoteTransport'
 
-export const providerLabels = { claude: 'Claude', codex: 'Codex', paid_api: 'Paid API', gemini: 'Gemini', antigravity: 'Antigravity' } satisfies Record<Provider, string>
+export const providerLabels = { antigravity: 'Antigravity', codex: 'Codex', claude: 'Claude', paid_api: 'Paid API' } satisfies Record<Provider, string>
 export const models = [
   { id: 'sonnet', provider: 'claude', label: 'Claude Sonnet', shortLabel: 'Sonnet' },
   { id: 'opus', provider: 'claude', label: 'Claude Opus', shortLabel: 'Opus' },
@@ -270,25 +270,25 @@ function startRemote(remote: RemoteTransport) {
   if (remote.provider === 'codex') {
     void refreshServerModels()
     void refreshCodexIndex()
-  } else if (remote.provider === 'gemini' || remote.provider === 'antigravity') {
+  } else if (remote.provider === 'antigravity') {
     void refreshServerModels()
   }
 }
 
 export async function refreshServerModels() {
   const { remote, modelsLoading } = useChats.getState()
-  if (!remote || (remote.provider !== 'codex' && remote.provider !== 'gemini' && remote.provider !== 'antigravity') || modelsLoading || useChats.getState().workspace?.user.role === 'pending') return
+  if (!remote || (remote.provider !== 'codex' && remote.provider !== 'antigravity') || modelsLoading || useChats.getState().workspace?.user.role === 'pending') return
   useChats.setState({ modelsLoading: true, modelsError: '' })
   try {
     const serverModels = await remote.models()
     if (useChats.getState().remote === remote) {
-      useChats.setState({ serverModels, modelsError: serverModels.length ? '' : (remote.provider === 'antigravity' ? 'Antigravity не вернул доступных моделей.' : remote.provider === 'gemini' ? 'Gemini не вернул доступных моделей.' : 'Codex не вернул доступных моделей.') })
+      useChats.setState({ serverModels, modelsError: serverModels.length ? '' : (remote.provider === 'antigravity' ? 'Antigravity не вернул доступных моделей.' : 'Codex не вернул доступных моделей.') })
     }
   } catch (error) {
     if (useChats.getState().remote === remote) {
       useChats.setState({ modelsError: error instanceof RemoteError && error.status === 404
         ? 'Обновите сервер, чтобы загрузить список моделей.'
-        : (remote.provider === 'antigravity' ? 'Не удалось загрузить список моделей Antigravity.' : remote.provider === 'gemini' ? 'Не удалось загрузить список моделей Gemini.' : 'Не удалось загрузить список моделей Codex.') })
+        : (remote.provider === 'antigravity' ? 'Не удалось загрузить список моделей Antigravity.' : 'Не удалось загрузить список моделей Codex.') })
     }
   } finally {
     if (useChats.getState().remote === remote) useChats.setState({ modelsLoading: false })
@@ -316,7 +316,7 @@ function applyRemoteWorkspace(remote: RemoteTransport, workspace: Workspace, pre
   const accessById = new Map(workspace.chats.map(c => [c.id, c.access]))
   const chats = remote.chats.map(item => {
     const previous = existing.get(item.id)
-    const model = remote.provider === 'stub' || item.model === 'codex' || item.model === 'gemini' || item.model === 'antigravity' ? 'default' : item.model
+    const model = remote.provider === 'stub' || item.model === 'codex' || item.model === 'antigravity' ? 'default' : item.model
     if ('archived' in item && typeof item.archived === 'boolean') {
       return { ...(previous ?? chat(item.id, item.title, 'read')), title: item.title, model, indexedCodex: true, archived: item.archived }
     }
@@ -391,7 +391,7 @@ async function loadRemoteHistory(remote: RemoteTransport, id: string) {
   try {
     const messages = await remote.messages(id, controller.signal)
     if (controller.signal.aborted || useChats.getState().remote !== remote) return
-    updateChat(id, c => ({ ...c, historyLoaded: true, turns: restoreTurns(messages, c.turns, remote.provider === 'codex' ? 'Codex' : remote.provider === 'gemini' ? 'Gemini' : remote.provider === 'antigravity' ? 'Antigravity' : 'StubProvider') }))
+    updateChat(id, c => ({ ...c, historyLoaded: true, turns: restoreTurns(messages, c.turns, remote.provider === 'stub' ? 'StubProvider' : providerLabels[remote.provider]) }))
   } catch (error) {
     if (!controller.signal.aborted && useChats.getState().remote === remote) {
       updateChat(id, c => ({ ...c, historyError: error instanceof Error ? error.message : 'Не удалось загрузить историю.' }))
@@ -561,8 +561,9 @@ async function startRun(id: string, input: string, retry?: { turnId: string; mod
   const source = c.turns[index]
   const serverModel = serverModels.find(m => m.id === c.model)
   if (remote && c.model !== 'default' && !serverModel) return
+  const remoteProvider: Provider = remote?.provider === 'stub' || !remote ? 'codex' : remote.provider
   const model = remote
-    ? { id: c.model, provider: (remote.provider === 'antigravity' ? 'antigravity' : remote.provider === 'gemini' ? 'gemini' : 'codex') as Provider, label: serverModel?.name ?? (remote.provider === 'antigravity' ? 'Antigravity' : remote.provider === 'gemini' ? 'Gemini' : 'Codex') }
+    ? { id: c.model, provider: remoteProvider, label: serverModel?.name ?? providerLabels[remoteProvider] }
     : models.find(m => m.id === (retry?.modelId ?? c.model))
   if (!model || (retry && (!source || source.state === 'running' || source.model === model.label))) return
   const prompt = source?.prompt ?? input.trim()

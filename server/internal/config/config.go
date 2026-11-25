@@ -17,8 +17,6 @@ type Config struct {
 	DBPath                  string
 	Provider                string
 	CodexBin                string
-	GeminiBin               string
-	GeminiDefaultModel      string
 	AntigravityBin          string
 	AntigravityDefaultModel string
 	CORSOrigin              string
@@ -40,15 +38,13 @@ func Load() (Config, error) {
 		DBPath:                  value("DB_PATH", "./data/app.db"),
 		Provider:                value("PROVIDER", "stub"),
 		CodexBin:                value("CODEX_BIN", "codex"),
-		GeminiBin:               value("GEMINI_BIN", "gemini"),
-		GeminiDefaultModel:      value("GEMINI_MODEL", "gemini-3.8-flash"),
 		AntigravityBin:          value("ANTIGRAVITY_BIN", "agy"),
 		AntigravityDefaultModel: value("ANTIGRAVITY_MODEL", "gemini-3.8-flash-high"),
 		CORSOrigin:              strings.TrimSpace(value("CORS_ORIGIN", "*")),
 		CodexHistoryUsername:    strings.TrimSpace(os.Getenv("CODEX_HISTORY_USERNAME")),
 	}
-	if cfg.Provider != "stub" && cfg.Provider != "codex" && cfg.Provider != "gemini" && cfg.Provider != "antigravity" {
-		return Config{}, errors.New("PROVIDER must be stub, codex, gemini or antigravity")
+	if cfg.Provider != "stub" && cfg.Provider != "codex" && cfg.Provider != "antigravity" && cfg.Provider != "claude" && cfg.Provider != "paid_api" {
+		return Config{}, errors.New("PROVIDER must be antigravity, codex, claude, paid_api or stub")
 	}
 	if cfg.CORSOrigin != "*" {
 		for _, origin := range strings.Split(cfg.CORSOrigin, ",") {

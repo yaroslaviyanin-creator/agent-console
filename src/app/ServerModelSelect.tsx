@@ -73,7 +73,7 @@ export function ServerModelSelect({ model, reasoning, unavailable, disabled, onC
       )}
       <ChevronDown size={12}/>
     </label>
-    {(remote?.provider === 'codex' || remote?.provider === 'gemini' || remote?.provider === 'antigravity') && <button className="icon-btn models-refresh" type="button" disabled={modelsLoading}
+    {(remote?.provider === 'codex' || remote?.provider === 'antigravity') && <button className="icon-btn models-refresh" type="button" disabled={modelsLoading}
       onClick={() => void refreshServerModels()} aria-label="Обновить список моделей" title="Обновить список моделей">
       <RefreshCw size={13}/>
     </button>}

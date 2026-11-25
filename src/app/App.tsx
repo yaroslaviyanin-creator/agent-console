@@ -11,6 +11,7 @@ import { blockReason, useAccountStore } from './accountStore'
 import { demoPrompt, availableDevices, models, providerLabels, checkAccountStatus, logout, newChat, retryAnswer, retryHistory, sendPrompt, stopChat, updateChat, useChats } from './chatStore'
 import type { Chat, Turn } from './chatStore'
 import { ServerModelSelect } from './ServerModelSelect'
+import { ProviderSelect, type ProviderOption } from './ProviderSelect'
 import { defaultReasoningForProvider } from './modelCatalog'
 import { Sidebar } from './Sidebar'
 import { ToolCard } from './ToolCard'
@@ -73,7 +74,7 @@ function Transcript({ turn, chatId, writable, busy, retry, demo }: { turn: Turn;
 
 function Conversation({ chat, share, billing }: { chat: Chat; share: () => void; billing: () => void }) {
   const { workspace: w, remote, connected, serverModels } = useChats()
-  const provider = models.find(m => m.id === chat.model)?.provider ?? (remote ? (remote.provider === 'antigravity' ? 'antigravity' : remote.provider === 'gemini' ? 'gemini' : 'codex') : 'claude')
+  const provider = models.find(m => m.id === chat.model)?.provider ?? (remote ? (remote.provider === 'stub' ? 'codex' : remote.provider) : 'claude')
   const sampleBlocked = useAccountStore(s => !!blockReason(s.quotas.claude))
   const reason = useAccountStore(s => remote ? undefined : blockReason(s.quotas[provider]))
   const devices = availableDevices(w!, chat.id)
@@ -116,22 +117,30 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
     ['antigravity', providerLabels.antigravity],
     ['codex', providerLabels.codex],
     ['claude', providerLabels.claude],
-    ['gemini', providerLabels.gemini],
     ['paid_api', providerLabels.paid_api],
   ] as const
+  const providerOptions: ProviderOption[] = remote
+    ? [
+        ...(remote.provider === 'stub' ? [{ id: 'stub', label: 'StubProvider', available: true }] : []),
+        ...providerEntries.map(([id, label]) => ({ id, label, available: id === remote.provider })),
+      ]
+    : providerEntries.map(([id, label]) => ({ id, label, available: models.some(m => m.provider === id) }))
 
   return <>
     <header className="chat-heading"><div className="heading-inner"><div className="heading-icon"><Terminal size={21}/></div><div className="heading-text"><h1 title={chat.title}>{chat.title}</h1><div className="heading-meta"><i/>{remote ? 'Сервер' : 'Демо-сессия'}<span>/</span><span>{chat.indexedCodex ? 'История Codex' : chat.access === 'owner' ? 'Личный чат' : 'Общий чат'}</span></div></div>{!chat.indexedCodex && chat.access === 'owner' && <button className="share-action" onClick={share} aria-label="Поделиться"><Share2 size={15}/><span>Поделиться</span></button>}</div><div className="header-controls">
-          {remote ? <label className="select-wrap catalog-select"><span>Провайдер</span><select aria-label="Провайдер" disabled={locked} value={remote.provider} onChange={() => {}}>
-            {remote.provider === 'stub' && <option value="stub">StubProvider</option>}
-            {providerEntries.map(([id, name]) => <option value={id} key={id} disabled={id !== remote.provider}>{name}{id !== remote.provider ? ' (недоступен)' : ''}</option>)}
-          </select><ChevronDown size={12}/></label> : <label className="select-wrap catalog-select"><span>Провайдер</span><select aria-label="Провайдер" disabled={locked} value={provider} onChange={e => {
-            const first = models.find(m => m.provider === e.currentTarget.value)
-            if (first) updateChat(chat.id, c => ({ ...c, model: first.id, reasoning: undefined }))
-          }}>{providerEntries.map(([id, name]) => {
-            const available = models.some(m => m.provider === id)
-            return <option value={id} key={id} disabled={!available}>{name}{!available ? ' (недоступен)' : ''}</option>
-          })}</select><ChevronDown size={12}/></label>}
+          {remote ? (
+            <ProviderSelect value={remote.provider} options={providerOptions} disabled={locked} onChange={() => {}} />
+          ) : (
+            <ProviderSelect
+              value={provider}
+              options={providerOptions}
+              disabled={locked}
+              onChange={nextProvider => {
+                const first = models.find(m => m.provider === nextProvider)
+                if (first) updateChat(chat.id, c => ({ ...c, model: first.id, reasoning: undefined }))
+              }}
+            />
+          )}
           {chat.indexedCodex ? null : remote ? <ServerModelSelect model={chat.model} reasoning={chat.reasoning} unavailable={unavailableModel} disabled={locked}
             onChangeModel={model => updateChat(chat.id, c => ({ ...c, model }))}
             onChangeReasoning={reasoning => updateChat(chat.id, c => ({ ...c, reasoning: reasoning || undefined }))}/>

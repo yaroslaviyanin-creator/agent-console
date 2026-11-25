@@ -68,7 +68,7 @@ func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 		t.Fatalf("auth after reopening DB failed: %v", err)
 	}
 	var version int
-	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 11 {
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 12 {
 		t.Fatalf("schema version %d: %v", version, err)
 	}
 	if currentDevice.LastSeenAt != device.LastSeenAt {
@@ -509,7 +509,7 @@ func TestProfileMigrationAndMemoryIsolation(t *testing.T) {
 	}
 }
 
-func TestGeminiChatAndMigration(t *testing.T) {
+func TestProviderCheckAndMigration(t *testing.T) {
 	ctx := t.Context()
 	db, err := Open(ctx, ":memory:")
 	if err != nil {
@@ -517,23 +517,17 @@ func TestGeminiChatAndMigration(t *testing.T) {
 	}
 	defer db.Close()
 
-	user, err := db.CreateUserWithRole(ctx, "gemini_user", []byte("hash"), "user")
+	user, err := db.CreateUserWithRole(ctx, "provider_user", []byte("hash"), "user")
 	if err != nil {
 		t.Fatal(err)
 	}
-	chat, err := db.CreateChat(ctx, user.ID, "Gemini Chat", "gemini", "gemini-3.8-flash")
-	if err != nil {
-		t.Fatalf("create gemini chat failed: %v", err)
+	for _, p := range []string{"antigravity", "codex", "claude", "paid_api", "stub"} {
+		if _, err := db.CreateChat(ctx, user.ID, "Chat "+p, p, "default"); err != nil {
+			t.Fatalf("create %s chat failed: %v", p, err)
+		}
 	}
-	if chat.Provider != "gemini" {
-		t.Fatalf("expected provider gemini, got %q", chat.Provider)
-	}
-	_, err = db.BeginRun(ctx, user.ID, chat.ID, "msg1", "Hello Gemini", "gemini", "gemini-3.8-flash")
-	if err != nil {
-		t.Fatalf("begin run failed: %v", err)
-	}
-	if err := db.FinishRun(ctx, user.ID, chat.ID, "msg1", "Hi there!", "", "019abcde-0123-4567-89ab-0123456789ab", 100, nil); err != nil {
-		t.Fatalf("finish run failed: %v", err)
+	if _, err := db.CreateChat(ctx, user.ID, "Legacy Gemini", "gemini", "gemini-3.8-flash"); err == nil {
+		t.Fatalf("expected gemini provider to be rejected by CHECK constraint")
 	}
 }
 

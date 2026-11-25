@@ -1,5 +1,8 @@
 services:
   backend:
+    # Antigravity Unlocker (AG_*_linux.tar.gz) выпускается только под x86_64/amd64.
+    # На Apple Silicon (M1/M2/M3/M4) раскомментируйте строку ниже:
+    # platform: linux/amd64
     build: .
     restart: unless-stopped
     env_file:
@@ -9,17 +12,28 @@ services:
       SERVER_ADDR: 0.0.0.0:8080
       DB_PATH: /app/data/app.db
       PROVIDER: ${PROVIDER:-stub}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+      ANTIGRAVITY_BIN: ${ANTIGRAVITY_BIN:-agy}
+      ANTIGRAVITY_MODEL: ${ANTIGRAVITY_MODEL:-gemini-3.8-flash-high}
+      AG_UNLOCKER_ENABLED: ${AG_UNLOCKER_ENABLED:-true}
+      AG_UNLOCKER_CODE: ${AG_UNLOCKER_CODE:-}
       MAX_CONCURRENT_STREAMS: ${MAX_CONCURRENT_STREAMS:-1}
       TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-true}
       CORS_ORIGIN: ${CORS_ORIGIN:-*}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,backend,web}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
       - app_data:/app/data
-      - cli_gemini:/home/app/.gemini
+      - agy_auth:/home/app/.gemini
+      - ag_unlocker_data:/home/app/.local/share/agunlocker
       - cli_codex:/home/app/.codex
       - cli_claude:/home/app/.claude
+    # Если анлокер или Google API в Docker падают с ошибкой 400 по IPv6,
+    # раскомментируйте отключение IPv6 в контейнере:
+    # sysctls:
+    #   - net.ipv6.conf.all.disable_ipv6=1
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
       interval: 10s
@@ -46,6 +60,7 @@ services:
 
 volumes:
   app_data:
-  cli_gemini:
+  agy_auth:
+  ag_unlocker_data:
   cli_codex:
   cli_claude:

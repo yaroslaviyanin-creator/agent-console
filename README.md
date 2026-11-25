@@ -6,7 +6,7 @@
 
 - **Режим «Демо»**: работает полностью в памяти браузера без сервера (учебные аккаунты `demo`, `alex`, `maria` с паролем `demo`).
 - **Режим «Сервер»**: авторизация, REST API, WebSocket-стриминг с тикетами, профили и память чатов, квоты, управление устройствами и админка.
-- **Провайдеры**: `stub` (локальная заглушка), `gemini` (Gemini CLI), `codex` (Codex CLI + чтение локальных чатов), `antigravity` (Antigravity CLI).
+- **Провайдеры**: `antigravity` (Antigravity CLI `agy`), `codex` (Codex CLI + чтение локальных чатов), `claude`, `paid_api` (и внутренний `stub` для dev/тестов).
 
 ---
 
@@ -38,18 +38,17 @@
 
 В форме входа выберите **«Сервер»**, укажите `http://127.0.0.1:3000` (или `http://127.0.0.1:8080`) и войдите под созданным логином и паролем.
 
-### Подключение Gemini CLI внутри Docker
+### Подключение Antigravity CLI (`agy`) внутри Docker
 
-1. В `.env` задайте `PROVIDER=gemini` (и при необходимости `GEMINI_MODEL=gemini-3.8-flash`).
+1. В `.env` задайте `PROVIDER=antigravity` (и при необходимости `ANTIGRAVITY_MODEL=gemini-3.8-flash-high`).
 2. Перезапустите `backend`:
    ```sh
    docker compose up -d backend
    ```
-3. Выполните одноразовую OAuth-авторизацию (учётные данные сохранятся в named volume `cli_gemini`):
+3. Выполните одноразовую авторизацию (учётные данные сохранятся в named volume `agy_auth`):
    ```sh
-   docker compose exec -it backend gemini
+   docker compose exec -it backend agy
    ```
-   *(Либо укажите `GEMINI_API_KEY` в `.env`.)*
 
 ### Горячий бэкап SQLite из volume
 
