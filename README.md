@@ -12,7 +12,7 @@
 
 ## Быстрый старт в Docker (Windows / macOS / Linux)
 
-Требуется установленный Docker Engine и Docker Compose v2+.
+Требуется установленный Docker Engine и Docker Compose v2+. Docker является основной средой запуска и проверки проекта: после внесения изменений в код необходимо пересобрать и перезапустить обновлённый сервис (`docker compose up -d --build web` для фронтенда, `docker compose up -d --build backend` для бэкенда или `docker compose up -d --build` целиком).
 
 1. Клонируйте репозиторий и создайте `.env` из шаблона:
    ```sh

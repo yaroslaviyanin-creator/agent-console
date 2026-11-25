@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -387,13 +388,22 @@ func (p AntigravityCliProvider) ListModels(ctx context.Context) ([]Model, error)
 		if len(models) > 0 {
 			return models, nil
 		}
+		slog.Warn("agy models returned no models; using fallback catalog", "bin", bin)
+	} else {
+		slog.Warn("agy models failed; using fallback catalog", "bin", bin, "error", err)
 	}
 
+	return fallbackAntigravityModels(defaultModel), nil
+}
+
+func fallbackAntigravityModels(defaultModel string) []Model {
+	if defaultModel == "" {
+		defaultModel = "gemini-3.8-flash-high"
+	}
 	baseModels := []struct {
 		id   string
 		name string
 	}{
-		{defaultModel, defaultModel},
 		{"gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"},
 		{"gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)"},
 		{"gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"},
@@ -405,18 +415,25 @@ func (p AntigravityCliProvider) ListModels(ctx context.Context) ([]Model, error)
 		{"claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"},
 		{"gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"},
 	}
-	var models []Model
-	seen := make(map[string]bool)
+	models := make([]Model, 0, len(baseModels)+1)
+	foundDefault := false
 	for _, bm := range baseModels {
-		if seen[bm.id] {
-			continue
+		isDef := bm.id == defaultModel
+		if isDef {
+			foundDefault = true
 		}
-		seen[bm.id] = true
 		models = append(models, Model{
 			ID:        bm.id,
 			Name:      bm.name,
-			IsDefault: bm.id == defaultModel,
+			IsDefault: isDef,
 		})
 	}
-	return models, nil
+	if !foundDefault {
+		models = append([]Model{{
+			ID:        defaultModel,
+			Name:      defaultModel,
+			IsDefault: true,
+		}}, models...)
+	}
+	return models
 }

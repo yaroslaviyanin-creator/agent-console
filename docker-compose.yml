@@ -22,6 +22,10 @@ services:
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,backend,web}
+      MEMORY_AUTO_UPDATE: ${MEMORY_AUTO_UPDATE:-true}
+      MEMORY_MODEL: ${MEMORY_MODEL:-}
+      MEMORY_CHECK_INTERVAL: ${MEMORY_CHECK_INTERVAL:-5m}
+      MEMORY_MIN_NEW_MESSAGES: ${MEMORY_MIN_NEW_MESSAGES:-6}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -35,7 +39,17 @@ services:
     # sysctls:
     #   - net.ipv6.conf.all.disable_ipv6=1
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS http://127.0.0.1:8080/api/health >/dev/null || exit 1;
+          if [ "$$PROVIDER" = "antigravity" ]; then
+            case "$$(printf '%s' "$${AG_UNLOCKER_ENABLED:-true}" | tr '[:upper:]' '[:lower:]')" in
+              1|true|yes|on)
+                node -e 'const fs=require("fs"),net=require("net"),p=(process.env.XDG_DATA_HOME||process.env.HOME+"/.local/share")+"/agunlocker/proxy_port";let port=53129;try{const v=fs.readFileSync(p,"utf8").trim();if(v)port=Number(v)}catch{};const s=net.connect({host:"127.0.0.1",port});s.setTimeout(1000);s.on("connect",()=>{s.destroy();process.exit(0)});s.on("timeout",()=>{s.destroy();process.exit(1)});s.on("error",()=>process.exit(1))' || exit 1
+                ;;
+            esac;
+          fi
       interval: 10s
       timeout: 5s
       retries: 5

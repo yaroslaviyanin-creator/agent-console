@@ -148,10 +148,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	switch version {
 	case 0:
-		if _, err := tx.ExecContext(ctx, initialSchema); err != nil {
+		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=12;"); err != nil {
 			return err
 		}
-		fallthrough
 	case 1:
 		if _, err := tx.ExecContext(ctx, `ALTER TABLE chat_messages ADD COLUMN run_id TEXT;
 			CREATE UNIQUE INDEX chat_message_runs ON chat_messages (chat_id,role,run_id);

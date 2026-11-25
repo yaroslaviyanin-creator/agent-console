@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime"
@@ -37,14 +38,21 @@ type session struct {
 	Device store.Device `json:"device"`
 }
 
-func New(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.Logger) http.Handler {
-	var backend provider.Provider = provider.StubProvider{Delay: 100 * time.Millisecond}
-	if cfg.Provider == "codex" {
+func New(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.Logger) (http.Handler, error) {
+	var backend provider.Provider
+	switch cfg.Provider {
+	case "stub":
+		backend = provider.StubProvider{Delay: 100 * time.Millisecond}
+	case "codex":
 		backend = provider.CodexCliProvider{Bin: cfg.CodexBin, WorkspaceRoot: "./data/workspaces"}
-	} else if cfg.Provider == "antigravity" {
+	case "antigravity":
 		backend = provider.AntigravityCliProvider{Bin: cfg.AntigravityBin, DefaultModel: cfg.AntigravityDefaultModel, WorkspaceRoot: "./data/workspaces"}
+	case "claude", "paid_api":
+		return nil, fmt.Errorf("provider %q is not implemented yet", cfg.Provider)
+	default:
+		return nil, fmt.Errorf("unsupported provider %q", cfg.Provider)
 	}
-	return newHandler(ctx, db, cfg, logger, backend)
+	return newHandler(ctx, db, cfg, logger, backend), nil
 }
 
 func newHandler(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.Logger, backend provider.Provider) http.Handler {

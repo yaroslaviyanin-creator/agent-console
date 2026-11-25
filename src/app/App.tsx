@@ -5,13 +5,14 @@ import { Incoming, LimitActions, Quotas, ServerQuotas } from './Quotas'
 import { Login } from './Login'
 import { WorkspaceDialog } from './WorkspaceDialog'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ArrowUp, Brain, Check, ChevronDown, ChevronRight, CodeXml, GitFork, Hourglass, Image as ImageIcon, Laptop, Menu, MessageSquare, PanelLeft, Paperclip, Settings2, Share2, Square, Terminal } from 'lucide-react'
+import { ArrowUp, Brain, Check, ChevronRight, CodeXml, GitFork, Hourglass, Image as ImageIcon, Laptop, Menu, MessageSquare, PanelLeft, Paperclip, Settings2, Share2, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
 import { demoPrompt, availableDevices, models, providerLabels, checkAccountStatus, logout, newChat, retryAnswer, retryHistory, sendPrompt, stopChat, updateChat, useChats } from './chatStore'
 import type { Chat, Turn } from './chatStore'
 import { ServerModelSelect } from './ServerModelSelect'
 import { ProviderSelect, type ProviderOption } from './ProviderSelect'
+import { SelectMenu } from './SelectMenu'
 import { defaultReasoningForProvider } from './modelCatalog'
 import { Sidebar } from './Sidebar'
 import { ToolCard } from './ToolCard'
@@ -145,31 +146,62 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
             onChangeModel={model => updateChat(chat.id, c => ({ ...c, model }))}
             onChangeReasoning={reasoning => updateChat(chat.id, c => ({ ...c, reasoning: reasoning || undefined }))}/>
             : <>
-              <label className="select-wrap catalog-select"><span>Модель</span><select aria-label="Модель" disabled={locked} value={activeDemoGroup?.name ?? ''} onChange={e => {
-                const nextGroup = demoModelGroups.find(g => g.name === e.currentTarget.value)
-                if (!nextGroup) return
-                const currentReasoning = activeDemoGroup?.variants.find(v => v.id === chat.model)
-                const currentLevel = currentReasoning && 'reasoning' in currentReasoning ? currentReasoning.reasoning : undefined
-                const matched = currentLevel
-                  ? nextGroup.variants.find(v => 'reasoning' in v && v.reasoning === currentLevel)
-                  : undefined
-                const chosen = matched ?? nextGroup.variants[0]
-                if (chosen) updateChat(chat.id, c => ({ ...c, model: chosen.id }))
-              }}>{demoModelGroups.map(g => <option value={g.name} key={g.name}>{g.name}</option>)}</select><ChevronDown size={12}/></label>
-              <label className="select-wrap catalog-select"><span>Рассуждения</span>{hasDemoVariantReasoning ? (
-                <select aria-label="Рассуждения" disabled={locked || (activeDemoGroup?.variants.length ?? 0) <= 1} value={chat.model} onChange={e => {
-                  const model = e.currentTarget.value
-                  updateChat(chat.id, c => ({ ...c, model }))
-                }}>{activeDemoGroup?.variants.map(v => <option value={v.id} key={v.id}>{'reasoning' in v && v.reasoning ? v.reasoning : v.shortLabel}</option>)}</select>
+              <div className="select-wrap catalog-select"><span>Модель</span><SelectMenu
+                ariaLabel="Модель"
+                disabled={locked}
+                value={activeDemoGroup?.name ?? ''}
+                options={demoModelGroups.map(g => ({ value: g.name, label: g.name }))}
+                onChange={nextName => {
+                  const nextGroup = demoModelGroups.find(g => g.name === nextName)
+                  if (!nextGroup) return
+                  const currentReasoning = activeDemoGroup?.variants.find(v => v.id === chat.model)
+                  const currentLevel = currentReasoning && 'reasoning' in currentReasoning ? currentReasoning.reasoning : undefined
+                  const matched = currentLevel
+                    ? nextGroup.variants.find(v => 'reasoning' in v && v.reasoning === currentLevel)
+                    : undefined
+                  const chosen = matched ?? nextGroup.variants[0]
+                  if (chosen) updateChat(chat.id, c => ({ ...c, model: chosen.id }))
+                }}
+              /></div>
+              <div className="select-wrap catalog-select"><span>Рассуждения</span>{hasDemoVariantReasoning ? (
+                <SelectMenu
+                  ariaLabel="Рассуждения"
+                  disabled={locked || (activeDemoGroup?.variants.length ?? 0) <= 1}
+                  value={chat.model}
+                  options={(activeDemoGroup?.variants ?? []).map(v => ({
+                    value: v.id,
+                    label: 'reasoning' in v && v.reasoning ? v.reasoning : v.shortLabel,
+                  }))}
+                  onChange={model => updateChat(chat.id, c => ({ ...c, model }))}
+                />
               ) : (
-                <select aria-label="Рассуждения" disabled={locked || demoReasoningOptions.length === 0} value={demoReasoningOptions.length ? (chat.reasoning ?? '') : ''} onChange={e => {
-                  const reasoning = e.currentTarget.value || undefined
-                  updateChat(chat.id, c => ({ ...c, reasoning }))
-                }}><option value="">По умолчанию</option>{demoReasoningOptions.map(opt => <option value={opt.value} key={opt.value}>{opt.label}</option>)}</select>
-              )}<ChevronDown size={12}/></label>
+                <SelectMenu
+                  ariaLabel="Рассуждения"
+                  disabled={locked || demoReasoningOptions.length === 0}
+                  value={demoReasoningOptions.length ? (chat.reasoning ?? '') : ''}
+                  options={[{ value: '', label: 'По умолчанию' }, ...demoReasoningOptions]}
+                  onChange={nextReasoning => updateChat(chat.id, c => ({ ...c, reasoning: nextReasoning || undefined }))}
+                />
+              )}</div>
             </>}
-          {remote ? <span className="select-wrap"><Terminal size={14}/>Только чат</span> : <div className="select-wrap mode"><Terminal size={14}/><select aria-label="Режим" disabled={locked} value={chat.target.mode} onChange={e => updateChat(chat.id, c => ({ ...c, target: e.target.value === 'chat' ? { mode: 'chat' } : { mode: 'mcp', deviceId: w!.deviceId } }))}><option value="chat">Только чат</option><option value="mcp">Управление ПК (MCP)</option></select><ChevronDown size={12}/></div>}
-          {chat.target.mode === 'mcp' && <label className="device-select"><Laptop size={13}/><select aria-label="Целевое устройство" disabled={locked} value={chat.target.deviceId} onChange={e => updateChat(chat.id, c => ({ ...c, target: { mode: 'mcp', deviceId: e.target.value } }))}>{devices.map(d => <option key={d.id} value={d.id} disabled={!d.online}>{d.name} · {d.ownerId !== w!.user.id ? 'ПК владельца · ' : ''}{d.online ? 'онлайн' : 'офлайн'}</option>)}</select><ChevronDown size={12}/></label>}</div></header>
+          {remote ? <span className="select-wrap"><Terminal size={14}/>Только чат</span> : <div className="select-wrap mode"><Terminal size={14}/><SelectMenu
+            ariaLabel="Режим"
+            disabled={locked}
+            value={chat.target.mode}
+            options={[{ value: 'chat', label: 'Только чат' }, { value: 'mcp', label: 'Управление ПК (MCP)' }]}
+            onChange={modeValue => updateChat(chat.id, c => ({ ...c, target: modeValue === 'chat' ? { mode: 'chat' } : { mode: 'mcp', deviceId: w!.deviceId } }))}
+          /></div>}
+          {chat.target.mode === 'mcp' && <div className="device-select"><Laptop size={13}/><SelectMenu
+            ariaLabel="Целевое устройство"
+            disabled={locked}
+            value={chat.target.deviceId}
+            options={devices.map(d => ({
+              value: d.id,
+              label: `${d.name} · ${d.ownerId !== w!.user.id ? 'ПК владельца · ' : ''}${d.online ? 'онлайн' : 'офлайн'}`,
+              disabled: !d.online,
+            }))}
+            onChange={deviceId => updateChat(chat.id, c => ({ ...c, target: { mode: 'mcp', deviceId } }))}
+          /></div>}</div></header>
     <div className="history" ref={scroll} onScroll={() => { const el = scroll.current; if (el) follow.current = el.scrollHeight - el.clientHeight - el.scrollTop < 48 }}>
       <div className="thread">
         {chat.historyError && <div className="notice" role="alert">{chat.historyError} <button className="text-action" onClick={retryHistory}>Повторить загрузку</button></div>}
@@ -189,11 +221,18 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
       <div className="composer"><textarea disabled={!!reason} ref={input} rows={2} aria-label="Сообщение агенту" placeholder="Сообщение агенту…" value={chat.draft}
         onChange={e => updateChat(chat.id, c => ({ ...c, draft: e.target.value }))}
         onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit() } }}/>
-        <div className="composer-controls">{chat.target.mode === 'mcp' && <label className="select-wrap mcp-examples"><Terminal size={14}/>
-          <select aria-label="Сценарии MCP" disabled={!!reason || running} value="" onChange={e => {
-            const draft = e.currentTarget.value
-            if (draft) { updateChat(chat.id, c => ({ ...c, draft })); input.current?.focus() }
-          }}><option value="" disabled>Сценарии MCP</option>{mcpExamples.map(([name, prompt]) => <option key={name} value={prompt}>{name}</option>)}</select><ChevronDown size={12}/></label>}
+        <div className="composer-controls">{chat.target.mode === 'mcp' && <div className="select-wrap mcp-examples"><Terminal size={14}/>
+          <SelectMenu
+            ariaLabel="Сценарии MCP"
+            placeholder="Сценарии MCP"
+            placement="top"
+            disabled={!!reason || running}
+            value=""
+            options={mcpExamples.map(([name, prompt]) => ({ value: prompt, label: name }))}
+            onChange={draft => {
+              if (draft) { updateChat(chat.id, c => ({ ...c, draft })); input.current?.focus() }
+            }}
+          /></div>}
           <span className="key-hint"><kbd>Enter</kbd> отправить <span>·</span> <kbd>Shift ↵</kbd> новая строка</span>{running && !remote ? <button className="send stop" title="Остановить ответ" aria-label="Остановить ответ" onClick={() => stopChat(chat.id)}><Square size={14} fill="currentColor"/></button>
             : <button className="send" title="Отправить" aria-label="Отправить" disabled={blocked || running || !chat.draft.trim()} onClick={submit}><ArrowUp size={18}/></button>}</div></div>
       <div className="composer-meta"><span role="status">{pending ? 'Ожидается разрешение' : running ? 'Агент отвечает…' : <><Check size={13}/>{reason ? 'Ввод приостановлен' : remote && !connected ? 'Подключение к серверу…' : remote && !chat.historyLoaded ? 'Ожидание истории' : unavailableModel ? 'Выберите модель' : 'Готов к сообщению'}</>}</span></div>

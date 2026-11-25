@@ -208,3 +208,44 @@ func TestAntigravityEnvironmentForwardsProxyVars(t *testing.T) {
 		}
 	}
 }
+
+
+func TestAntigravityListModelsFallbackPreservesDefaultReadableName(t *testing.T) {
+	t.Setenv("ANTIGRAVITY_MODELS", "")
+	p := AntigravityCliProvider{
+		Bin:          filepath.Join(t.TempDir(), "missing-agy"),
+		DefaultModel: "gemini-3.8-flash-high",
+	}
+	models, err := p.ListModels(t.Context())
+	if err != nil {
+		t.Fatalf("ListModels fallback returned error: %v", err)
+	}
+	var found *Model
+	for i := range models {
+		if models[i].ID == "gemini-3.8-flash-high" {
+			found = &models[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected gemini-3.8-flash-high in fallback models: %+v", models)
+	}
+	if !found.IsDefault {
+		t.Fatalf("expected gemini-3.8-flash-high to be marked IsDefault=true: %+v", *found)
+	}
+	if found.Name != "Gemini 3.8 Flash (High)" {
+		t.Fatalf("expected readable name %q, got %q", "Gemini 3.8 Flash (High)", found.Name)
+	}
+
+	custom := AntigravityCliProvider{
+		Bin:          filepath.Join(t.TempDir(), "missing-agy"),
+		DefaultModel: "custom-model-id",
+	}
+	customModels, err := custom.ListModels(t.Context())
+	if err != nil {
+		t.Fatalf("ListModels custom fallback returned error: %v", err)
+	}
+	if len(customModels) == 0 || customModels[0].ID != "custom-model-id" || customModels[0].Name != "custom-model-id" || !customModels[0].IsDefault {
+		t.Fatalf("expected unknown default model prepended as fallback entry, got %+v", customModels[0])
+	}
+}

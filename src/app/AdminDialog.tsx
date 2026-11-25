@@ -3,6 +3,7 @@ import type { FormEvent } from 'react'
 import { X } from 'lucide-react'
 import type { AdminChat, AdminUser, PlanTier, ServerAdminAdapter, ServerMessage, UserRole } from '../protocol/types'
 import { RichText } from './Markdown'
+import { SelectMenu } from './SelectMenu'
 
 const roleLabel = { pending: 'Ожидает', user: 'Пользователь', admin: 'Администратор' }
 import { dollars, limitDollars, quotaPercent } from './Quotas'
@@ -114,10 +115,10 @@ export function AdminDialog({ admin, userId, close }: { admin: ServerAdminAdapte
           <form className="panel-form" onSubmit={create}>
             <fieldset disabled={busy || loading}>
               <label>Логин<input required minLength={1} maxLength={64} autoCapitalize="none" autoComplete="off" value={form.username} onChange={event => setForm({ ...form, username: event.target.value })}/></label>
-              <label>Роль<select value={form.role} onChange={event => setForm({ ...form, role: event.target.value as UserRole })}>{roles.map(role => <option key={role} value={role}>{roleLabel[role]}</option>)}</select></label>
-              <label>Тариф<select value={form.planTier} onChange={event => setForm({ ...form, planTier: event.target.value as PlanTier })}>
-                {plans.map(plan => <option key={plan} value={plan}>{planLabel[plan]}</option>)}
-              </select></label>
+              <div className="field-group"><span>Роль</span><SelectMenu ariaLabel="Роль" variant="field" disabled={busy || loading} value={form.role} options={roles.map(role => ({ value: role, label: roleLabel[role] }))} onChange={role => setForm({ ...form, role })} /></div>
+              <div className="field-group"><span>Тариф</span><SelectMenu ariaLabel="Тариф" variant="field" disabled={busy || loading} value={form.planTier} options={plans.map(plan => ({ value: plan, label: planLabel[plan] }))} onChange={planTier => setForm({ ...form, planTier })} /></div>
+
+
               <div className="admin-password"><label>Пароль<input required maxLength={72} autoComplete="new-password" spellCheck={false} value={form.password} onChange={event => setForm({ ...form, password: event.target.value })}/></label>
                 <button type="button" className="alt-action" onClick={() => setForm({ ...form, password: generatePassword() })}>Сгенерировать</button></div>
               <button className="alt-action" type="submit">Создать</button>
@@ -150,10 +151,10 @@ export function AdminDialog({ admin, userId, close }: { admin: ServerAdminAdapte
             </div>
             <p className="form-help">Устройств: {user.devicesCount} · {user.subscriptionUntil ? 'Подписка до ' + date.format(user.subscriptionUntil) : user.planTier === 'none' ? 'Подписка не подключена' : 'Бессрочная подписка'}</p>
             <fieldset className="admin-actions" disabled={busy || loading}>
-              <label className="admin-role">Тариф<select aria-label={'Тариф пользователя ' + user.username} value={user.planTier} onChange={event => {
-                const planTier = event.target.value as PlanTier
-                void mutate(() => admin.update(user.id, { planTier }), 'Тариф обновлён.')
-              }}>{plans.map(plan => <option key={plan} value={plan}>{planLabel[plan]}</option>)}</select></label>
+              <div className="admin-role"><span>Тариф</span><SelectMenu ariaLabel={'Тариф пользователя ' + user.username} variant="field" disabled={busy || loading} value={user.planTier} options={plans.map(plan => ({ value: plan, label: planLabel[plan] }))} onChange={planTier => void mutate(() => admin.update(user.id, { planTier }), 'Тариф обновлён.')} /></div>
+
+
+
               <label className="admin-role"><input type="checkbox" checked={user.bypass5hLimit} onChange={event => {
                 const bypass5hLimit = event.target.checked
                 void mutate(() => admin.update(user.id, { bypass5hLimit }), 'Лимит обновлён.')
@@ -170,10 +171,10 @@ export function AdminDialog({ admin, userId, close }: { admin: ServerAdminAdapte
               }), 'Доступ выдан.')}>Одобрить (Pro, 30 дн)</button>}
             </fieldset>
             {user.id !== userId && <fieldset className="admin-actions" disabled={busy || loading}>
-              <label className="admin-role">Роль<select aria-label={'Роль пользователя ' + user.username} value={user.role} onChange={event => {
-                const role = event.target.value as UserRole
-                void mutate(() => admin.update(user.id, { role }), 'Роль обновлена.')
-              }}>{roles.map(role => <option key={role} value={role}>{roleLabel[role]}</option>)}</select></label>
+              <div className="admin-role"><span>Роль</span><SelectMenu ariaLabel={'Роль пользователя ' + user.username} variant="field" disabled={busy || loading} value={user.role} options={roles.map(role => ({ value: role, label: roleLabel[role] }))} onChange={role => void mutate(() => admin.update(user.id, { role }), 'Роль обновлена.')} /></div>
+
+
+
               <button type="button" className="alt-action" onClick={() => { setPassword(''); setAction({ user, type: 'password' }) }}>Сбросить пароль</button>
               <button type="button" className="alt-action" onClick={() => {
                 if (user.isActive) setAction({ user, type: 'block' })

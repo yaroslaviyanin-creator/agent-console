@@ -54,7 +54,11 @@ func TestRESTAcrossRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { db.Close() })
-		return db, httpapi.New(ctx, db, cfg, logger)
+		handler, err := httpapi.New(ctx, db, cfg, logger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return db, handler
 	}
 	db, handler := open()
 	request := func(method, path, token, body string, status int) *httptest.ResponseRecorder {
@@ -175,7 +179,10 @@ func TestCORS(t *testing.T) {
 	}{
 		{origin, origin, 204}, {"*", "https://test.example", 204}, {origin, "https://other.example", 403},
 	} {
-		api := httpapi.New(t.Context(), nil, config.Config{CORSOrigin: tc.allowed}, nil)
+		api, err := httpapi.New(t.Context(), nil, config.Config{Provider: "stub", CORSOrigin: tc.allowed}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 		r := httptest.NewRequest("OPTIONS", "/api/chats", nil)
 		r.Header.Set("Origin", tc.origin)
 		r.Header.Set("Access-Control-Request-Method", "POST")

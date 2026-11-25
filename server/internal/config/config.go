@@ -43,8 +43,12 @@ func Load() (Config, error) {
 		CORSOrigin:              strings.TrimSpace(value("CORS_ORIGIN", "*")),
 		CodexHistoryUsername:    strings.TrimSpace(os.Getenv("CODEX_HISTORY_USERNAME")),
 	}
-	if cfg.Provider != "stub" && cfg.Provider != "codex" && cfg.Provider != "antigravity" && cfg.Provider != "claude" && cfg.Provider != "paid_api" {
-		return Config{}, errors.New("PROVIDER must be antigravity, codex, claude, paid_api or stub")
+	switch cfg.Provider {
+	case "stub", "codex", "antigravity":
+	case "claude", "paid_api":
+		return Config{}, fmt.Errorf("provider %q is not implemented yet", cfg.Provider)
+	default:
+		return Config{}, errors.New("PROVIDER must be antigravity, codex or stub")
 	}
 	if cfg.CORSOrigin != "*" {
 		for _, origin := range strings.Split(cfg.CORSOrigin, ",") {

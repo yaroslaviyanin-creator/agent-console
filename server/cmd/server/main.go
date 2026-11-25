@@ -59,8 +59,12 @@ func run(ctx context.Context, args []string, out io.Writer, logger *slog.Logger)
 	if err != nil {
 		return err
 	}
+	handler, err := httpapi.New(ctx, db, cfg, logger)
+	if err != nil {
+		return err
+	}
 	server := &http.Server{
-		Handler:           httpapi.New(ctx, db, cfg, logger),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,

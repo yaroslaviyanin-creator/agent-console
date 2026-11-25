@@ -5,6 +5,12 @@ AG_UNLOCKER_BIN="${AG_UNLOCKER_BIN:-/usr/local/bin/ag_unlocker}"
 AG_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/agunlocker"
 AGY_PATH="${ANTIGRAVITY_BIN:-/home/app/.local/bin/agy}"
 
+case "${1:-}" in
+  create-user|set-role|-h|--help)
+    exec /app/agent-server "$@"
+    ;;
+esac
+
 is_unlocker_enabled() {
   local raw="${AG_UNLOCKER_ENABLED:-}"
   if [ -z "$raw" ]; then
@@ -15,6 +21,10 @@ is_unlocker_enabled() {
     1|true|yes|on) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+is_antigravity_provider() {
+  [ "${PROVIDER:-}" = "antigravity" ]
 }
 
 resolve_agy_bin() {
@@ -32,27 +42,37 @@ resolve_agy_bin() {
 }
 
 patch_agy_binary() {
+  local strict="$1"
   local target
   if ! target="$(resolve_agy_bin)"; then
+    if [ "$strict" = "1" ]; then
+      echo "[entrypoint] ERROR: agy binary not found ($AGY_PATH)" >&2
+      return 1
+    fi
     echo "[entrypoint] WARN: agy binary not found ($AGY_PATH), skipping patch" >&2
     return 0
   fi
   if [ ! -w "$target" ]; then
+    if [ "$strict" = "1" ]; then
+      echo "[entrypoint] ERROR: agy binary is not writable ($target)" >&2
+      return 1
+    fi
     echo "[entrypoint] WARN: agy binary is not writable ($target), skipping patch" >&2
     return 0
   fi
 
-  node - "$target" <<'EOF'
+  node - "$target" "$strict" <<'EOF'
 const fs = require('fs');
 const path = require('path');
 
 const target = process.argv[2];
+const strict = process.argv[3] === '1';
 const buf = fs.readFileSync(target);
 
 // Only patch ELF binaries, not shell wrappers.
 if (buf.length < 4 || buf[0] !== 0x7f || buf[1] !== 0x45 || buf[2] !== 0x4c || buf[3] !== 0x46) {
-  console.error(`[entrypoint] skip patch: ${target} is not an ELF binary`);
-  process.exit(0);
+  console.error(`[entrypoint] ${strict ? 'ERROR' : 'skip patch'}: ${target} is not an ELF binary`);
+  process.exit(strict ? 1 : 0);
 }
 
 function replaceAllInPlace(buffer, fromStr, toStr) {
@@ -76,7 +96,11 @@ const r2 = replaceAllInPlace(buf, 'https_proxy', 'AG_LS_PROXY');
 
 if (r1 === 0 && r2 === 0) {
   const hasPatched = buf.includes(Buffer.from('inexigible')) || buf.includes(Buffer.from('AG_LS_PROXY'));
-  console.error(`[entrypoint] agy ${hasPatched ? 'already patched' : 'signature not found'}: ${target}`);
+  if (!hasPatched) {
+    console.error(`[entrypoint] ${strict ? 'ERROR' : 'WARN'}: agy patch signatures not found in ${target}`);
+    process.exit(strict ? 1 : 0);
+  }
+  console.error(`[entrypoint] agy already patched: ${target}`);
   process.exit(0);
 }
 
@@ -138,27 +162,66 @@ s.on('error', () => { process.exit(1); });
 EOF
 }
 
+UNLOCKER_SUPERVISOR_PID=""
+
+run_unlocker_supervisor() {
+  local child_pid=""
+  local stopping=0
+  stop_child() {
+    local sig="$1"
+    stopping=1
+    if [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null; then
+      kill "-$sig" "$child_pid" 2>/dev/null || true
+    fi
+  }
+  trap 'stop_child TERM' TERM
+  trap 'stop_child INT' INT
+
+  while [ "$stopping" -eq 0 ]; do
+    "$AG_UNLOCKER_BIN" --proxy >&2 &
+    child_pid=$!
+    local rc=0
+    while true; do
+      local wait_rc=0
+      wait "$child_pid" || wait_rc=$?
+      if [ "$stopping" -eq 1 ] && kill -0 "$child_pid" 2>/dev/null; then
+        continue
+      fi
+      rc=$wait_rc
+      break
+    done
+    child_pid=""
+    if [ "$stopping" -eq 1 ]; then
+      break
+    fi
+    echo "[entrypoint] WARN: ag_unlocker --proxy exited (code=$rc), restarting in 2s..." >&2
+    sleep 2
+  done
+}
+
 start_unlocker_proxy() {
+  local strict="$1"
   if [ ! -x "$AG_UNLOCKER_BIN" ]; then
     echo "[entrypoint] ERROR: ag_unlocker binary not found at $AG_UNLOCKER_BIN" >&2
     return 1
   fi
 
   configure_unlocker_settings
-  patch_agy_binary
+  patch_agy_binary "$strict"
 
   # Remove stale proxy_port file before launch so we observe the fresh port.
   rm -f "$AG_DATA_DIR/proxy_port"
 
-  "$AG_UNLOCKER_BIN" --proxy >&2 &
-  local proxy_pid=$!
+  run_unlocker_supervisor &
+  UNLOCKER_SUPERVISOR_PID=$!
 
   local port="53129"
   local ready=false
   local i
   for i in $(seq 1 40); do
-    if ! kill -0 "$proxy_pid" 2>/dev/null; then
-      echo "[entrypoint] ERROR: ag_unlocker --proxy exited unexpectedly" >&2
+    if ! kill -0 "$UNLOCKER_SUPERVISOR_PID" 2>/dev/null; then
+      echo "[entrypoint] ERROR: ag_unlocker supervisor exited unexpectedly" >&2
+      UNLOCKER_SUPERVISOR_PID=""
       return 1
     fi
     if [ -f "$AG_DATA_DIR/proxy_port" ]; then
@@ -177,15 +240,63 @@ start_unlocker_proxy() {
 
   if [ "$ready" != "true" ]; then
     echo "[entrypoint] ERROR: ag_unlocker proxy did not listen on 127.0.0.1:$port within 10s" >&2
+    kill -TERM "$UNLOCKER_SUPERVISOR_PID" 2>/dev/null || true
+    wait "$UNLOCKER_SUPERVISOR_PID" 2>/dev/null || true
+    UNLOCKER_SUPERVISOR_PID=""
     return 1
   fi
 
   export AG_LS_PROXY="http://127.0.0.1:${port}"
-  echo "[entrypoint] ag_unlocker proxy listening on $AG_LS_PROXY (pid=$proxy_pid)" >&2
+  echo "[entrypoint] ag_unlocker proxy listening on $AG_LS_PROXY (supervisor_pid=$UNLOCKER_SUPERVISOR_PID)" >&2
 }
 
 if is_unlocker_enabled; then
-  start_unlocker_proxy || echo "[entrypoint] WARN: continuing without active ag_unlocker proxy" >&2
+  if is_antigravity_provider; then
+    if ! start_unlocker_proxy 1; then
+      echo "[entrypoint] FATAL: ag_unlocker is required for PROVIDER=antigravity when AG_UNLOCKER_ENABLED=true" >&2
+      exit 1
+    fi
+  else
+    start_unlocker_proxy 0 || echo "[entrypoint] WARN: continuing without active ag_unlocker proxy (PROVIDER=${PROVIDER:-})" >&2
+  fi
 fi
 
-exec /app/agent-server "$@"
+if [ -z "$UNLOCKER_SUPERVISOR_PID" ]; then
+  exec /app/agent-server "$@"
+fi
+
+server_pid=""
+shutting_down=0
+on_signal() {
+  local sig="$1"
+  shutting_down=1
+  if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
+    kill "-$sig" "$server_pid" 2>/dev/null || true
+  fi
+  if [ -n "$UNLOCKER_SUPERVISOR_PID" ] && kill -0 "$UNLOCKER_SUPERVISOR_PID" 2>/dev/null; then
+    kill "-$sig" "$UNLOCKER_SUPERVISOR_PID" 2>/dev/null || true
+  fi
+}
+trap 'on_signal TERM' TERM
+trap 'on_signal INT' INT
+
+/app/agent-server "$@" &
+server_pid=$!
+
+server_status=0
+while true; do
+  wait_rc=0
+  wait "$server_pid" || wait_rc=$?
+  if [ "$shutting_down" -eq 1 ] && kill -0 "$server_pid" 2>/dev/null; then
+    continue
+  fi
+  server_status=$wait_rc
+  break
+done
+
+if [ -n "$UNLOCKER_SUPERVISOR_PID" ] && kill -0 "$UNLOCKER_SUPERVISOR_PID" 2>/dev/null; then
+  kill -TERM "$UNLOCKER_SUPERVISOR_PID" 2>/dev/null || true
+  wait "$UNLOCKER_SUPERVISOR_PID" 2>/dev/null || true
+fi
+
+exit "$server_status"

@@ -4,6 +4,7 @@ import type { ShareAccess, UserProfile, UserProfilePatch, Workspace } from '../p
 import { changeServerAddress, logout, refreshServerDevices, revokeDevice, setConnectionMode, setShare, useChats } from './chatStore'
 import { ConnectionMode } from './ConnectionMode'
 import type { RemoteTransport } from '../transport/RemoteTransport'
+import { SelectMenu } from './SelectMenu'
 
 export const rights = { read: 'Чтение', fork: 'Разветвление (Fork)', write: 'Полный доступ' }
 function ShareForm({ w, chatId }: { w: Workspace; chatId: string }) {
@@ -40,21 +41,21 @@ function ShareForm({ w, chatId }: { w: Workspace; chatId: string }) {
   return <form className="panel-form" onSubmit={e => { e.preventDefault(); void save() }}>
     {others.length === 0 && <p className="form-help">На сервере пока нет других пользователей</p>}
     {(others.length > 0 || existing) && <>
-      <label>Пользователь сервера<select disabled={saving} value={user} onChange={e => choose(e.target.value)}>
-        {!eligible && <option value={user}>Недоступный пользователь ({user})</option>}
-        {others.map(u => <option key={u.id} value={u.id}>{mode === 'server' ? u.name : `${u.name} (@${u.id})`}</option>)}
-      </select></label>
-      <label>Права в чате<select disabled={!eligible || saving} value={access} onChange={e => {
-        setSelected(user)
-        setDraft({ access: e.target.value as ShareAccess, trusted: false })
-        setStatus('')
-      }}>{Object.entries(rights).map(([k,v]) => <option value={k} key={k}>{v}</option>)}</select></label>
+      <div className="field-group"><span>Пользователь сервера</span><SelectMenu ariaLabel="Пользователь сервера" variant="field" disabled={saving} value={user} options={[...(!eligible ? [{ value: user, label: `Недоступный пользователь (${user})` }] : []), ...others.map(u => ({ value: u.id, label: mode === 'server' ? u.name : `${u.name} (@${u.id})` }))]} onChange={choose} /></div>
+
+
+
+      <div className="field-group"><span>Права в чате</span><SelectMenu ariaLabel="Права в чате" variant="field" disabled={!eligible || saving} value={access} options={Object.entries(rights).map(([k, v]) => ({ value: k as ShareAccess, label: v }))} onChange={nextAccess => { setSelected(user); setDraft({ access: nextAccess, trusted: false }); setStatus('') }} /></div>
+
+
+
+
       {mode === 'demo' && <>
-        <label className="trust-check"><input type="checkbox" disabled={access !== 'write' || saving} checked={trusted} onChange={e => {
-          setSelected(user)
-          setDraft({ access, trusted: e.target.checked })
-          setStatus('')
-        }}/>Доверенный режим для команд на моём ПК</label>
+        <label className="trust-check"><input type="checkbox" disabled={access !== 'write' || saving} checked={trusted} onChange={e => { setSelected(user); setDraft({ access, trusted: e.target.checked }); setStatus('') }}/>Доверенный режим для команд на моём ПК</label>
+  
+
+  
+
         <p className="form-help">При полном доступе участник сможет запускать демо-команды на этом устройстве без отдельного подтверждения.</p>
       </>}
       <div className="form-actions">{eligible && <button disabled={saving} className="primary-action">Сохранить доступ</button>}{existing && <button type="button" disabled={saving} className="alt-action" onClick={() => void save(true)}>Отозвать доступ</button>}</div>

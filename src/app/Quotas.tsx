@@ -3,6 +3,7 @@ import { Activity, ArrowLeftRight } from 'lucide-react'
 import type { MeteredProvider, Provider, Transfer, Workspace } from '../protocol/types'
 import { useAccountStore, blockReason } from './accountStore'
 import { transport } from './runtime'
+import { SelectMenu } from './SelectMenu'
 
 const label: Record<Provider, string> = { antigravity: 'Antigravity', codex: 'Codex', claude: 'Claude', paid_api: 'API' }
 const transferState = { pending: 'ожидает ответа', accepted: 'одобрен', declined: 'отклонён', expired: 'истёк' }
@@ -88,7 +89,7 @@ function RequestForm({ w, provider }: { w: Workspace; provider: MeteredProvider 
     e.preventDefault()
     try { await transport.accounting.requestTransfer(to,provider,Number(percent)); setMessage('') }
     catch (e) { setMessage(e instanceof Error ? e.message : 'Ошибка отправки.') }
-  }}><label>У кого<select value={to} onChange={e => { setTo(e.target.value); setMessage('') }}>{others.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}</select></label>
+  }}><div className="field-group"><span>У кого</span><SelectMenu ariaLabel="У кого" variant="field" value={to} options={others.map(u => ({ value: u.id, label: u.name }))} onChange={val => { setTo(val); setMessage('') }} /></div>
     <label>Процент<input type="number" min="1" max="50" step="1" required value={percent} onChange={e => setPercent(e.target.value)}/></label>
     <button disabled={!!pending}>Отправить запрос</button><small role="status">{pending ? 'Запрос отправлен. Ожидается ответ.' : message || 'До конца текущего окна 5 ч'}</small></form></details>
 }

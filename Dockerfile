@@ -27,29 +27,36 @@ RUN useradd -m -d /home/app -s /bin/bash app \
     && mkdir -p /app/data /home/app/.local/bin /home/app/.local/share/agunlocker /home/app/.gemini /home/app/.codex /home/app/.claude \
     && chown -R app:app /app /home/app
 
+ARG INSTALL_AG_UNLOCKER=true
+ARG AG_UNLOCKER_VERSION=v2.35.0
+
 # Install Linux x86_64 Antigravity Unlocker binary (amd64 only).
-RUN ARCH="$(uname -m)" \
-    && case "$ARCH" in \
-        x86_64|amd64) ;; \
-        *) echo "Unsupported architecture for ag_unlocker: $ARCH (only linux/amd64 is supported)" >&2; exit 1 ;; \
-    esac \
-    && TAG="$(curl -fsSLo /dev/null -w '%{url_effective}' 'https://github.com/confeden/Antigravity/releases/latest')" \
-    && TAG="${TAG##*/}" \
-    && VER="${TAG#v}" \
-    && ALT="$(echo "$VER" | sed -E 's/\.([0-9]+)$/_\1/')" \
-    && TMP_DIR="$(mktemp -d)" \
-    && DOWNLOADED="" \
-    && for cand in "$VER" "$ALT"; do \
-        URL="https://github.com/confeden/Antigravity/releases/download/${TAG}/AG_${cand}_linux.tar.gz"; \
-        if curl -fsSL "$URL" -o "$TMP_DIR/ag.tar.gz" 2>/dev/null; then \
-            tar -xzf "$TMP_DIR/ag.tar.gz" -C "$TMP_DIR"; \
-            install -m 0755 "$TMP_DIR/AG_${cand}_linux/ag_unlocker" /usr/local/bin/ag_unlocker; \
-            DOWNLOADED="1"; \
-            break; \
-        fi; \
-    done \
-    && rm -rf "$TMP_DIR" \
-    && test -n "$DOWNLOADED"
+RUN if [ "$INSTALL_AG_UNLOCKER" = "true" ]; then \
+        ARCH="$(uname -m)" \
+        && case "$ARCH" in \
+            x86_64|amd64) ;; \
+            *) echo "Unsupported architecture for ag_unlocker: $ARCH (only linux/amd64 is supported). Rebuild with --platform=linux/amd64 or --build-arg INSTALL_AG_UNLOCKER=false." >&2; exit 1 ;; \
+        esac \
+        && TAG="${AG_UNLOCKER_VERSION}" \
+        && case "$TAG" in v*) ;; *) TAG="v${TAG}" ;; esac \
+        && VER="${TAG#v}" \
+        && ALT="$(echo "$VER" | sed -E 's/\.([0-9]+)$/_\1/')" \
+        && TMP_DIR="$(mktemp -d)" \
+        && DOWNLOADED="" \
+        && for cand in "$VER" "$ALT"; do \
+            URL="https://github.com/confeden/Antigravity/releases/download/${TAG}/AG_${cand}_linux.tar.gz"; \
+            if curl -fsSL "$URL" -o "$TMP_DIR/ag.tar.gz" 2>/dev/null; then \
+                tar -xzf "$TMP_DIR/ag.tar.gz" -C "$TMP_DIR"; \
+                install -m 0755 "$TMP_DIR/AG_${cand}_linux/ag_unlocker" /usr/local/bin/ag_unlocker; \
+                DOWNLOADED="1"; \
+                break; \
+            fi; \
+        done \
+        && rm -rf "$TMP_DIR" \
+        && test -n "$DOWNLOADED"; \
+    else \
+        echo "Skipping ag_unlocker installation (INSTALL_AG_UNLOCKER=$INSTALL_AG_UNLOCKER)" >&2; \
+    fi
 
 COPY --from=go-builder --chown=app:app /out/agent-server /app/agent-server
 COPY --chown=app:app --chmod=0755 deploy/entrypoint.sh /app/entrypoint.sh

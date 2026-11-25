@@ -3,6 +3,9 @@ services:
     ports: !reset []
     environment:
       TRUST_PROXY_HEADERS: "true"
+      CORS_ORIGIN: https://${DOMAIN}
+      AG_UNLOCKER_ENABLED: ${AG_UNLOCKER_ENABLED:-true}
+      AG_UNLOCKER_CODE: ${AG_UNLOCKER_CODE:-}
     mem_limit: 2g
 
   web:

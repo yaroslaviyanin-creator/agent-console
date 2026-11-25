@@ -1,6 +1,7 @@
-import { ChevronDown, RefreshCw } from 'lucide-react'
+import { RefreshCw } from 'lucide-react'
 import { refreshServerModels, useChats } from './chatStore'
 import { defaultReasoningForProvider, groupServerModels, pickVariantForGroup } from './modelCatalog'
+import { SelectMenu } from './SelectMenu'
 
 export function ServerModelSelect({ model, reasoning, unavailable, disabled, onChangeModel, onChangeReasoning }: {
   model: string
@@ -29,50 +30,53 @@ export function ServerModelSelect({ model, reasoning, unavailable, disabled, onC
       ? activeGroup.key
       : model
 
+  const modelOptions = [
+    { value: 'default', label: 'По умолчанию' },
+    ...(unavailable ? [{ value: model, label: model, disabled: true }] : []),
+    ...groups.map(group => ({ value: group.key, label: group.name })),
+  ]
+
   return <div className="server-model-select">
-    <label className="select-wrap catalog-select">
+    <div className="select-wrap catalog-select">
       <span>Модель</span>
-      <select aria-label="Модель" value={modelValue} disabled={disabled} onChange={e => {
-        const nextKey = e.currentTarget.value
-        if (nextKey === 'default') {
-          onChangeModel('default')
-          return
-        }
-        const nextGroup = groups.find(g => g.key === nextKey)
-        if (!nextGroup) return
-        const chosen = pickVariantForGroup(nextGroup, currentVariant?.reasoning || reasoning)
-        if (chosen) onChangeModel(chosen.id)
-      }}>
-        <option value="default">По умолчанию</option>
-        {unavailable && <option value={model} disabled>{model} · {modelsLoading ? 'загрузка' : 'недоступна'}</option>}
-        {groups.map(group => <option key={group.key} value={group.key}>{group.name}</option>)}
-      </select>
-      <ChevronDown size={12}/>
-    </label>
-    <label className="select-wrap catalog-select">
+      <SelectMenu
+        ariaLabel="Модель"
+        className={unavailable ? 'model-unavailable' : ''}
+        value={modelValue}
+        disabled={disabled}
+        options={modelOptions}
+        onChange={nextKey => {
+          if (nextKey === 'default') {
+            onChangeModel('default')
+            return
+          }
+          const nextGroup = groups.find(g => g.key === nextKey)
+          if (!nextGroup) return
+          const chosen = pickVariantForGroup(nextGroup, currentVariant?.reasoning || reasoning)
+          if (chosen) onChangeModel(chosen.id)
+        }}
+      />
+    </div>
+    <div className="select-wrap catalog-select">
       <span>Рассуждения</span>
       {activeGroup?.hasVariantReasoning ? (
-        <select
-          aria-label="Рассуждения"
+        <SelectMenu
+          ariaLabel="Рассуждения"
           value={model}
           disabled={disabled || unavailable || activeGroup.variants.length <= 1}
-          onChange={e => onChangeModel(e.currentTarget.value)}
-        >
-          {activeGroup.variants.map(v => <option key={v.id} value={v.id}>{v.reasoning}</option>)}
-        </select>
+          options={activeGroup.variants.map(v => ({ value: v.id, label: v.reasoning }))}
+          onChange={onChangeModel}
+        />
       ) : (
-        <select
-          aria-label="Рассуждения"
+        <SelectMenu
+          ariaLabel="Рассуждения"
           value={nonVariantEfforts.length ? (reasoning ?? '') : ''}
           disabled={disabled || unavailable || nonVariantEfforts.length === 0}
-          onChange={e => onChangeReasoning(e.currentTarget.value)}
-        >
-          <option value="">По умолчанию</option>
-          {nonVariantEfforts.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
-        </select>
+          options={[{ value: '', label: 'По умолчанию' }, ...nonVariantEfforts]}
+          onChange={onChangeReasoning}
+        />
       )}
-      <ChevronDown size={12}/>
-    </label>
+    </div>
     {(remote?.provider === 'codex' || remote?.provider === 'antigravity') && <button className="icon-btn models-refresh" type="button" disabled={modelsLoading}
       onClick={() => void refreshServerModels()} aria-label="Обновить список моделей" title="Обновить список моделей">
       <RefreshCw size={13}/>

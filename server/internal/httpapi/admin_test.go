@@ -33,7 +33,10 @@ func TestAdminUsersLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	api := New(ctx, db, config.Config{Provider: "stub", CORSOrigin: "*"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	api, err := New(ctx, db, config.Config{Provider: "stub", CORSOrigin: "*"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	request := func(method, path, token, body string, want int, dst any) {
 		t.Helper()
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -235,7 +238,11 @@ func TestAdminUsersLifecycle(t *testing.T) {
 
 func TestLoginRateLimit(t *testing.T) {
 	newAPI := func(t *testing.T, trust bool) http.Handler {
-		return New(t.Context(), nil, config.Config{Provider: "stub", CORSOrigin: "*", TrustProxyHeaders: trust}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		api, err := New(t.Context(), nil, config.Config{Provider: "stub", CORSOrigin: "*", TrustProxyHeaders: trust}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return api
 	}
 	request := func(t *testing.T, api http.Handler, ip, username, forwarded, realIP string, want int) {
 		t.Helper()
@@ -296,7 +303,10 @@ func TestPendingRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	api := New(ctx, db, config.Config{Provider: "stub", CORSOrigin: "*"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	api, err := New(ctx, db, config.Config{Provider: "stub", CORSOrigin: "*"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	call := func(method, path, token, body string, status int, code string) []byte {
 		t.Helper()
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -366,7 +376,10 @@ func TestProfileEndpoints(t *testing.T) {
 		return token
 	}
 	user, admin, pending := tokenFor("user", "user"), tokenFor("admin", "admin"), tokenFor("pending", "pending")
-	handler := New(ctx, db, config.Config{Provider: "stub", CORSOrigin: "*"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler, err := New(ctx, db, config.Config{Provider: "stub", CORSOrigin: "*"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	request := func(method, token, body string, status int) store.UserProfile {
 		t.Helper()
 		r := httptest.NewRequest(method, "/api/profile", strings.NewReader(body))
@@ -413,5 +426,25 @@ func TestProfileEndpoints(t *testing.T) {
 	}
 	if got := request("PATCH", user, `{"memoryMd":""}`, 200); got.MemoryMD != "" || got.ProfileMD != profile.ProfileMD || got.MemoryEnabled {
 		t.Fatalf("clear changed other settings")
+	}
+}
+
+
+func TestNewRejectsUnimplementedProviders(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, valid := range []string{"stub", "codex", "antigravity"} {
+		if _, err := New(t.Context(), nil, config.Config{Provider: valid, CORSOrigin: "*"}, logger); err != nil {
+			t.Fatalf("New(%q) unexpected error: %v", valid, err)
+		}
+	}
+	for _, bad := range []string{"claude", "paid_api"} {
+		if _, err := New(t.Context(), nil, config.Config{Provider: bad, CORSOrigin: "*"}, logger); err == nil || !strings.Contains(err.Error(), "not implemented") {
+			t.Fatalf("New(%q) expected not implemented error, got: %v", bad, err)
+		}
+	}
+	for _, unsupported := range []string{"", "unknown"} {
+		if _, err := New(t.Context(), nil, config.Config{Provider: unsupported, CORSOrigin: "*"}, logger); err == nil {
+			t.Fatalf("New(%q) expected error, got nil", unsupported)
+		}
 	}
 }
