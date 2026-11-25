@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,6 +22,8 @@ type CodexCliProvider struct {
 }
 
 var (
+	// Keep the context file stable for the lifetime of each CLI subprocess.
+	workspaceLocks sync.Map
 	userIDPattern  = regexp.MustCompile(`^[a-f0-9]{32}$`)
 	sessionPattern = regexp.MustCompile(`^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$`)
 )
@@ -33,8 +36,27 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 	if err != nil {
 		return nil, err
 	}
-	root := filepath.Join(p.WorkspaceRoot, req.UserID)
+	root, err := filepath.Abs(filepath.Join(p.WorkspaceRoot, req.UserID))
+	if err != nil {
+		return nil, err
+	}
+	lock, _ := workspaceLocks.LoadOrStore(root, make(chan struct{}, 1))
+	slot := lock.(chan struct{})
+	select {
+	case slot <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	started := false
+	defer func() {
+		if !started {
+			<-slot
+		}
+	}()
 	if err := os.MkdirAll(root, 0700); err != nil {
+		return nil, err
+	}
+	if err := writeUserContext(root, req.SystemInstructions); err != nil {
 		return nil, err
 	}
 	bin := p.Bin
@@ -58,6 +80,7 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 	if err := cmd.Start(); err != nil {
 		return nil, stderr.wrap("start codex exec", err)
 	}
+	started = true
 	out := make(chan Event)
 	go func() {
 		defer close(out)
@@ -69,6 +92,7 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 			_ = cmd.Process.Kill()
 		}
 		waitErr := cmd.Wait()
+		<-slot
 		switch {
 		case ctx.Err() != nil:
 			return
@@ -82,6 +106,28 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 		send(ctx, out, terminal)
 	}()
 	return out, nil
+}
+
+// Replace the file atomically with a new private inode, including when
+// upgrading a workspace that already has a file with broader permissions.
+func writeUserContext(root, instructions string) error {
+	path := filepath.Join(root, "USER_CONTEXT.md")
+	if instructions == "" {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	file, err := os.CreateTemp(root, ".user-context-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	_, writeErr := file.WriteString(instructions)
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), path)
 }
 
 // os/exec writes stderr from one goroutine. Read the tail after Wait.
@@ -118,6 +164,18 @@ func codexArgs(req Request) ([]string, error) {
 		"-c", `web_search="disabled"`, "--disable", "shell_tool",
 		"--disable", "plugins", "--disable", "multi_agent", "--disable", "multi_agent_v2",
 	}
+	// Codex CLI accepts developer_instructions with --ignore-user-config.
+	// Supply it as a config string so the original prompt stays on stdin.
+	if req.SystemInstructions != "" {
+		instructions, err := json.Marshal(req.SystemInstructions)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "-c", "developer_instructions="+string(instructions))
+	}
+	if req.Ephemeral {
+		args = append(args, "--ephemeral")
+	}
 	if model := req.Model; model != "" && model != "codex" && model != "default" {
 		args = append(args, "--model="+model)
 	}
@@ -144,6 +202,7 @@ func cliEnvironment() []string {
 }
 
 type codexLine struct {
+	Usage     *Usage `json:"usage"`
 	Type      string `json:"type"`
 	ThreadID  string `json:"thread_id"`
 	SessionID string `json:"session_id"`
@@ -159,6 +218,7 @@ func parseJSONL(input io.Reader, emit func(Event) bool) (Event, error) {
 	scanner.Buffer(make([]byte, 32<<10), 2<<20)
 	var sessionID string
 	var completed bool
+	var usage *Usage
 	reasoning := make(map[string]string)
 	delivered := make(map[string]bool)
 	for scanner.Scan() {
@@ -200,6 +260,9 @@ func parseJSONL(input io.Reader, emit func(Event) bool) (Event, error) {
 			}
 		case "turn.completed":
 			completed = true
+			if line.Usage != nil {
+				usage = line.Usage
+			}
 		case "turn.failed", "error":
 			return Event{Type: Error, Err: errors.New("Codex reported a failed turn")}, nil
 		}
@@ -210,5 +273,5 @@ func parseJSONL(input io.Reader, emit func(Event) bool) (Event, error) {
 	if !completed || len(delivered) == 0 || sessionID == "" {
 		return Event{}, errors.New("Codex stream ended before a complete response")
 	}
-	return Event{Type: Done, SessionID: sessionID}, nil
+	return Event{Type: Done, SessionID: sessionID, Usage: usage}, nil
 }

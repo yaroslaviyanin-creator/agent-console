@@ -1,14 +1,14 @@
 import { useTelegramBack } from '../platform/telegram'
 import { RetryActions } from './RetryActions'
 import { Billing } from './Billing'
-import { Incoming, LimitActions, Quotas } from './Quotas'
+import { Incoming, LimitActions, Quotas, ServerQuotas } from './Quotas'
 import { Login } from './Login'
 import { WorkspaceDialog } from './WorkspaceDialog'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ArrowUp, Brain, Check, ChevronDown, ChevronRight, CodeXml, GitFork, Image as ImageIcon, Laptop, Menu, MessageSquare, PanelLeft, Paperclip, Settings2, Share2, Square, Terminal } from 'lucide-react'
+import { ArrowUp, Brain, Check, ChevronDown, ChevronRight, CodeXml, GitFork, Hourglass, Image as ImageIcon, Laptop, Menu, MessageSquare, PanelLeft, Paperclip, Settings2, Share2, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
-import { demoPrompt, availableDevices, models, providerLabels, newChat, retryAnswer, retryHistory, sendPrompt, stopChat, updateChat, useChats } from './chatStore'
+import { demoPrompt, availableDevices, models, providerLabels, checkAccountStatus, logout, newChat, retryAnswer, retryHistory, sendPrompt, stopChat, updateChat, useChats } from './chatStore'
 import type { Chat, Turn } from './chatStore'
 import { ServerModelSelect } from './ServerModelSelect'
 import { Sidebar } from './Sidebar'
@@ -98,7 +98,7 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
     }
   }
   return <>
-    <header className="chat-heading"><div className="heading-inner"><div className="heading-icon"><Terminal size={21}/></div><div className="heading-text"><h1 title={chat.title}>{chat.title}</h1><div className="heading-meta"><i/>{remote ? 'Сервер' : 'Демо-сессия'}<span>/</span><span>{chat.indexedCodex ? 'История Codex' : chat.access === 'owner' ? 'Личный чат' : 'Общий чат'}</span></div></div>{!remote && chat.access === 'owner' && <button className="share-action" onClick={share} aria-label="Поделиться"><Share2 size={15}/><span>Поделиться</span></button>}</div><div className="header-controls">
+    <header className="chat-heading"><div className="heading-inner"><div className="heading-icon"><Terminal size={21}/></div><div className="heading-text"><h1 title={chat.title}>{chat.title}</h1><div className="heading-meta"><i/>{remote ? 'Сервер' : 'Демо-сессия'}<span>/</span><span>{chat.indexedCodex ? 'История Codex' : chat.access === 'owner' ? 'Личный чат' : 'Общий чат'}</span></div></div>{!chat.indexedCodex && chat.access === 'owner' && <button className="share-action" onClick={share} aria-label="Поделиться"><Share2 size={15}/><span>Поделиться</span></button>}</div><div className="header-controls">
           {remote ? <span className="server-provider">{remote.provider === 'codex' ? 'Codex' : 'StubProvider'}</span> : <label className="select-wrap catalog-select"><span>Провайдер</span><select aria-label="Провайдер" disabled={locked} value={provider} onChange={e => {
             const first = models.find(m => m.provider === e.currentTarget.value)
             if (first) updateChat(chat.id, c => ({ ...c, model: first.id }))
@@ -119,7 +119,7 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
         follow.current = true
         void retryAnswer(chat.id, turn.id, modelId)
       }}/>) :
-        <div className="empty"><MessageSquare size={23}/><h2>{chat.indexedCodex ? 'В этом чате нет сообщений' : 'Начните разговор'}</h2>{remote ? !chat.indexedCodex && <p>Отправьте первое сообщение.</p> : editable && <><p>Отправьте сообщение или попробуйте демо-сценарий.</p><div>{['Предложи изменение settings.ts', 'Запусти тесты'].map(prompt => <button key={prompt} disabled={!!reason} onClick={() => { updateChat(chat.id, c => ({ ...c, target: { mode: 'mcp', deviceId: w!.deviceId } })); void sendPrompt(chat.id, prompt) }}>{prompt}<ChevronRight size={13}/></button>)}<button disabled={sampleBlocked} onClick={() => {
+        <div className="empty"><MessageSquare size={23}/><h2>{chat.indexedCodex ? 'В этом чате нет сообщений' : 'Начните разговор'}</h2>{remote ? editable && <p>Отправьте первое сообщение.</p> : editable && <><p>Отправьте сообщение или попробуйте демо-сценарий.</p><div>{['Предложи изменение settings.ts', 'Запусти тесты'].map(prompt => <button key={prompt} disabled={!!reason} onClick={() => { updateChat(chat.id, c => ({ ...c, target: { mode: 'mcp', deviceId: w!.deviceId } })); void sendPrompt(chat.id, prompt) }}>{prompt}<ChevronRight size={13}/></button>)}<button disabled={sampleBlocked} onClick={() => {
           updateChat(chat.id, c => ({ ...c, model: provider === 'claude' ? c.model : 'sonnet', target: { mode: 'chat' } }))
           void sendPrompt(chat.id, 'Объясни на примере, что такое тайм-аут подключения.')
         }}>Пример отказа модели<ChevronRight size={13}/></button></div></>}</div>}
@@ -143,7 +143,37 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
 }
 export function App() {
   const workspace = useChats(s => s.workspace)
-  return workspace ? <Connected key={workspace.user.id}/> : <Login/>
+  if (!workspace) return <Login/>
+  return workspace.user.role === 'pending' ? <PendingAccount/> : <Connected key={workspace.user.id}/>
+}
+function PendingAccount() {
+  const [busy, setBusy] = useState(false)
+  const [feedback, setFeedback] = useState('')
+  const [failed, setFailed] = useState(false)
+  async function check() {
+    setBusy(true)
+    setFeedback('')
+    setFailed(false)
+    try {
+      await checkAccountStatus()
+      if (useChats.getState().workspace?.user.role === 'pending') setFeedback('Доступ ещё не выдан.')
+    } catch (error) {
+      setFailed(true)
+      setFeedback(error instanceof Error ? error.message : 'Не удалось проверить статус.')
+    } finally {
+      setBusy(false)
+    }
+  }
+  return <main className="login-screen"><section className="login-card pending-account">
+    <div className="auth-brand"><span className="brand-logo"><Hourglass size={20}/></span>Agent Console</div>
+    <h1>Ожидание активации</h1>
+    <p className="form-help">Аккаунт создан и ожидает выдачи доступа администратором.</p>
+    {feedback && <p className={failed ? 'notice' : 'form-help'} role={failed ? 'alert' : 'status'}>{feedback}</p>}
+    <div className="form-actions">
+      <button type="button" className="primary-action" disabled={busy} onClick={() => void check()}>{busy ? 'Проверяю…' : 'Проверить статус'}</button>
+      <button type="button" className="alt-action" onClick={logout}>Выйти</button>
+    </div>
+  </section></main>
 }
 function Connected() {
   const w = useChats(s => s.workspace)!
@@ -151,7 +181,7 @@ function Connected() {
   const incoming = useAccountStore(s => s.requests.find(r => r.to.id === w.user.id && r.status === 'pending'))
   const [panel, setPanel] = useState<'share' | 'devices' | 'admin' | null>(null)
   const { chats, activeId, remote, connectionError } = useChats()
-  const isAdmin = w.user.role === 'admin'
+  const isAdmin = remote != null && w.user.role === 'admin'
   const chat = chats.find(c => c.id === activeId)!
   const drawer = useRef<HTMLDialogElement>(null)
   const quotaMenu = useRef<HTMLDetailsElement>(null)
@@ -177,13 +207,13 @@ function Connected() {
     <aside className="desktop-side"><Sidebar openBilling={() => setView('billing')} close={() => setView('chat')}/></aside>
     <dialog ref={drawer} onClose={() => setDrawerOpen(false)} className="drawer" aria-label="Список чатов" onClick={e => { if (e.target === drawer.current) drawer.current.close() }}><Sidebar openBilling={() => { drawer.current?.close(); setView('billing') }} close={() => { drawer.current?.close(); setView('chat') }}/></dialog>
     <main className="main"><div className="topbar"><button className="icon-btn desk-toggle" aria-label="Переключить боковую панель" onClick={() => setCollapsed(!collapsed)}><PanelLeft size={17}/></button><button className="icon-btn mobile" aria-label="Открыть список чатов" onClick={() => { drawer.current?.showModal(); setDrawerOpen(true) }}><Menu size={18}/></button>
-      <span className="crumb">Рабочее пространство</span><ChevronRight className="crumb-arrow" size={13}/><span>{view === 'billing' ? 'Биллинг API' : chat?.indexedCodex ? 'Чаты Codex' : (!chat || chat.access === 'owner') ? 'Мои чаты' : 'Доступные мне'}</span>{!remote && <Quotas userId={w.user.id} menuRef={quotaMenu} onOpenChange={setQuotasOpen}/>}
+      <span className="crumb">Рабочее пространство</span><ChevronRight className="crumb-arrow" size={13}/><span>{view === 'billing' ? 'Биллинг API' : chat?.indexedCodex ? 'Чаты Codex' : (!chat || chat.access === 'owner') ? 'Мои чаты' : 'Доступные мне'}</span>{remote ? <ServerQuotas menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> : <Quotas userId={w.user.id} menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> }
       {isAdmin && <button className="alt-action admin-entry" onClick={() => setPanel('admin')}>Админка</button>}
       <button className="account-button" title="Настройки и устройства" aria-label="Настройки и устройства" onClick={() => setPanel('devices')}><Settings2 size={15}/><span>{'@' + (remote ? w.user.name : w.user.id)}</span></button></div>
       {connectionError && <p className="notice connection-error" role="alert">{connectionError}</p>}
       {!remote && incoming && <Incoming key={incoming.requestId} request={incoming}/>}
       {view === 'billing' ? <Billing back={() => setView('chat')}/> : chat ? <Conversation key={chat.id} chat={chat} billing={() => setView('billing')} share={() => setPanel('share')}/> : <div className="empty thread"><h2>Пока нет чатов</h2><button onClick={() => void newChat()}>Создать чат</button></div>}
-      {panel === 'admin' && isAdmin && <AdminDialog admin={transport.admin} userId={w.user.id} close={() => setPanel(null)}/>}
+      {panel === 'admin' && isAdmin && <AdminDialog admin={remote.admin} userId={w.user.id} close={() => setPanel(null)}/>}
       {panel && panel !== 'admin' && <WorkspaceDialog kind={panel} w={w} chatId={activeId} close={() => setPanel(null)}/>}
     </main></div>
 }

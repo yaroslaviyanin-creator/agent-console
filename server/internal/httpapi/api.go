@@ -47,24 +47,39 @@ func New(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.L
 
 func newHandler(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.Logger, backend provider.Provider) http.Handler {
 	api := &API{db: db, config: cfg, logger: logger, live: newLiveRuns(ctx, backend, max(1, cfg.MaxConcurrentStreams))}
+	api.live.db = db
+	api.live.logger = logger
+	if db != nil && cfg.MemoryAutoUpdate && cfg.MemoryCheckInterval > 0 {
+		go api.runMemoryWorker(ctx)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", api.health)
 	mux.HandleFunc("POST /api/auth/login", api.login)
-	mux.HandleFunc("GET /api/auth/me", api.withAuth(api.me))
-	mux.HandleFunc("POST /api/auth/logout", api.withAuth(api.logout))
-	mux.HandleFunc("GET /api/devices", api.withAuth(api.devices))
-	mux.HandleFunc("DELETE /api/devices/{id}", api.withAuth(api.deleteDevice))
+	mux.HandleFunc("POST /api/auth/register", api.register)
+	mux.HandleFunc("GET /api/auth/me", api.withPendingAuth(api.me))
+	mux.HandleFunc("POST /api/auth/logout", api.withPendingAuth(api.logout))
+	mux.HandleFunc("GET /api/devices", api.withPendingAuth(api.devices))
+	mux.HandleFunc("DELETE /api/devices/{id}", api.withPendingAuth(api.deleteDevice))
 	mux.HandleFunc("POST /api/ws/ticket", api.withAuth(api.issueWSTicket))
+	mux.HandleFunc("GET /api/admin/users/{id}/chats", api.RequireAdmin(api.adminUserChats))
+	mux.HandleFunc("GET /api/admin/users/{id}/chats/{chatId}/messages", api.RequireAdmin(api.adminChatMessages))
 	mux.HandleFunc("GET /api/admin/users", api.RequireAdmin(api.adminUsers))
 	mux.HandleFunc("POST /api/admin/users", api.RequireAdmin(api.adminCreateUser))
 	mux.HandleFunc("PATCH /api/admin/users/{id}", api.RequireAdmin(api.adminUpdateUser))
 	mux.HandleFunc("DELETE /api/admin/users/{id}/devices", api.RequireAdmin(api.adminRevokeDevices))
 	mux.HandleFunc("GET /api/codex/chats", api.withAuth(api.indexedChats))
 	mux.HandleFunc("GET /api/codex/chats/{id}/messages", api.withAuth(api.indexedMessages))
+	mux.HandleFunc("GET /api/quotas/current", api.withAuth(api.currentQuota))
+	mux.HandleFunc("GET /api/profile", api.withAuth(api.getProfile))
+	mux.HandleFunc("PATCH /api/profile", api.withAuth(api.patchProfile))
 	mux.HandleFunc("GET /api/models", api.withAuth(api.models))
+	mux.HandleFunc("GET /api/users", api.withAuth(api.directoryUsers))
 	mux.HandleFunc("GET /api/chats", api.withAuth(api.chats))
 	mux.HandleFunc("POST /api/chats", api.withAuth(api.createChat))
 	mux.HandleFunc("GET /api/chats/{id}/messages", api.withAuth(api.messages))
+	mux.HandleFunc("PUT /api/chats/{id}/shares/{userId}", api.withAuth(api.putChatShare))
+	mux.HandleFunc("DELETE /api/chats/{id}/shares/{userId}", api.withAuth(api.deleteChatShare))
+	mux.HandleFunc("POST /api/chats/{id}/fork", api.withAuth(api.forkChat))
 	mux.HandleFunc("GET /ws", api.websocket)
 	return api.cors(mux)
 }
@@ -84,7 +99,7 @@ func (a *API) cors(next http.Handler) http.Handler {
 			}
 			w.Header().Set("Access-Control-Allow-Origin", allowed)
 			if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -168,16 +183,18 @@ func (a *API) clientIP(r *http.Request) string {
 	return ip
 }
 
+type loginRequest struct {
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	DeviceName string `json:"deviceName"`
+}
+
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	if !a.logins.allow("ip:"+a.clientIP(r), 10) {
 		loginRateLimited(w)
 		return
 	}
-	var req struct {
-		Username   string `json:"username"`
-		Password   string `json:"password"`
-		DeviceName string `json:"deviceName"`
-	}
+	var req loginRequest
 	if !decode(w, r, &req) {
 		return
 	}
@@ -220,7 +237,42 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		a.internal(w, r, err)
 		return
 	}
-	reply(w, http.StatusOK, struct {
+	replySession(w, http.StatusOK, user, device, token)
+}
+
+func (a *API) register(w http.ResponseWriter, r *http.Request) {
+	if !a.logins.allow("register:"+a.clientIP(r), 5) {
+		loginRateLimited(w)
+		return
+	}
+	var req loginRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	req.Username = strings.TrimSpace(req.Username)
+	req.DeviceName = strings.TrimSpace(req.DeviceName)
+	if !identity.ValidUsername(req.Username) || !identity.ValidPassword(req.Password) || !identity.ValidName(req.DeviceName, 80) {
+		fail(w, http.StatusBadRequest, "invalid_registration", "Provide a valid username, password and device name.")
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		a.internal(w, r, err)
+		return
+	}
+	user, device, token, err := a.db.Register(r.Context(), req.Username, hash, req.DeviceName)
+	switch {
+	case errors.Is(err, store.ErrUsernameTaken):
+		fail(w, http.StatusConflict, "username_taken", "Username is already taken.")
+	case err != nil:
+		a.internal(w, r, err)
+	default:
+		replySession(w, http.StatusCreated, user, device, token)
+	}
+}
+
+func replySession(w http.ResponseWriter, status int, user store.User, device store.Device, token string) {
+	reply(w, status, struct {
 		session
 		Token string `json:"token"`
 	}{session{user, device}, token})
@@ -238,7 +290,26 @@ func bearerToken(r *http.Request) string {
 	return strings.TrimSpace(token)
 }
 
+func (a *API) currentQuota(w http.ResponseWriter, r *http.Request, session session) {
+	quota, err := a.db.CurrentQuota(r.Context(), session.User)
+	if err != nil {
+		a.internal(w, r, err)
+		return
+	}
+	reply(w, http.StatusOK, quota)
+}
+
 func (a *API) withAuth(next func(http.ResponseWriter, *http.Request, session)) http.HandlerFunc {
+	return a.withPendingAuth(func(w http.ResponseWriter, r *http.Request, s session) {
+		if s.User.Role == "pending" {
+			pendingAccount(w)
+			return
+		}
+		next(w, r, s)
+	})
+}
+
+func (a *API) withPendingAuth(next func(http.ResponseWriter, *http.Request, session)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		s, err := a.authenticate(r.Context(), bearerToken(r))
 		switch {
@@ -268,6 +339,10 @@ func (a *API) authenticate(ctx context.Context, token string) (session, error) {
 func unauthorized(w http.ResponseWriter) {
 	w.Header().Set("WWW-Authenticate", "Bearer")
 	fail(w, http.StatusUnauthorized, "unauthorized", "A valid device token is required.")
+}
+
+func pendingAccount(w http.ResponseWriter) {
+	fail(w, http.StatusForbidden, "account_pending", "Account is awaiting approval.")
 }
 
 func inactive(w http.ResponseWriter) {
@@ -314,6 +389,62 @@ func (a *API) deleteDevice(w http.ResponseWriter, r *http.Request, s session) {
 	default:
 		a.live.disconnectDevice(s.User.ID, deviceID)
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (a *API) directoryUsers(w http.ResponseWriter, r *http.Request, _ session) {
+	users, err := a.db.DirectoryUsers(r.Context())
+	if err != nil {
+		a.internal(w, r, err)
+		return
+	}
+	reply(w, http.StatusOK, users)
+}
+
+func (a *API) putChatShare(w http.ResponseWriter, r *http.Request, s session) {
+	var req struct {
+		Access string `json:"access"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if !store.ValidShareAccess(req.Access) {
+		fail(w, http.StatusBadRequest, "invalid_share", "Выберите права доступа к чату.")
+		return
+	}
+	a.changeChatShare(w, r, s, req.Access)
+}
+
+func (a *API) deleteChatShare(w http.ResponseWriter, r *http.Request, s session) {
+	a.changeChatShare(w, r, s, "")
+}
+
+func (a *API) changeChatShare(w http.ResponseWriter, r *http.Request, s session, access string) {
+	chatID, targetID := r.PathValue("id"), r.PathValue("userId")
+	err := a.live.changeShare(r.Context(), s.User.ID, chatID, targetID, access)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		fail(w, http.StatusNotFound, "chat_not_found", "Chat not found.")
+	case errors.Is(err, errShareDuringRun):
+		fail(w, http.StatusConflict, "chat_busy", "Дождитесь окончания ответа, чтобы открыть доступ к чату.")
+	case errors.Is(err, store.ErrInvalidShare):
+		fail(w, http.StatusBadRequest, "invalid_share", "Выберите другого активного пользователя.")
+	case err != nil:
+		a.internal(w, r, err)
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (a *API) forkChat(w http.ResponseWriter, r *http.Request, s session) {
+	chat, err := a.db.ForkChat(r.Context(), s.User.ID, r.PathValue("id"))
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		fail(w, http.StatusNotFound, "chat_not_found", "Chat not found.")
+	case err != nil:
+		a.internal(w, r, err)
+	default:
+		reply(w, http.StatusCreated, chat)
 	}
 }
 
@@ -367,12 +498,16 @@ func (a *API) messages(w http.ResponseWriter, r *http.Request, s session) {
 }
 
 func decode[T any](w http.ResponseWriter, r *http.Request, dst *T) bool {
+	return decodeLimit(w, r, dst, 8<<10)
+}
+
+func decodeLimit[T any](w http.ResponseWriter, r *http.Request, dst *T, limit int64) bool {
 	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if mediaType != "application/json" {
 		fail(w, http.StatusUnsupportedMediaType, "invalid_content_type", "Expected application/json.")
 		return false
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	var value *T

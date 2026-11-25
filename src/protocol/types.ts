@@ -25,6 +25,7 @@ export type ToolCall =
 export type PermissionDecision = 'allow' | 'allow_folder' | 'deny'
 
 type RunPayload =
+  | { type: 'started'; prompt: string; model: string; createdAt: number }
   | { type: 'thinking_delta' | 'text_delta'; delta: string }
   | { type: 'tool_use'; callId: string; tool: ToolCall }
   | { type: 'permission_request'; requestId: string; callId: string; folder: string; deviceId: string; tool: ToolCall }
@@ -113,28 +114,59 @@ export type ServerProvider = 'stub' | 'codex'
 export interface ServerModel { id: string; name: string; isDefault: boolean }
 export interface ServerHealth { status: 'ok'; provider: ServerProvider }
 export interface ServerLoginRequest { username: string; password: string; deviceName: string }
-export type UserRole = 'user' | 'admin'
-export interface ServerUser { id: string; username: string; role?: UserRole; isActive?: boolean }
+export type UserRole = 'pending' | 'user' | 'admin'
+export type PlanTier = 'none' | 'pro' | '2x_pro' | 'unlimited'
+export interface Subscription {
+  planTier: PlanTier
+  bypass5hLimit: boolean
+  subscriptionUntil: number
+}
+export interface ServerQuotaWindow extends QuotaWindow {
+  usedCents: number
+  limitCents: number
+}
+export interface ServerQuota extends Subscription {
+  fiveHour: ServerQuotaWindow
+  sevenDay: ServerQuotaWindow
+}
+export interface ServerDirectoryUser { id: string; username: string }
+export interface ServerUser extends ServerDirectoryUser, Partial<Subscription> { role?: UserRole; isActive?: boolean }
 export interface AdminUser extends ServerUser {
   role: UserRole
   isActive: boolean
   devicesCount: number
   chatsCount: number
   createdAt: number
+  planTier: PlanTier
+  bypass5hLimit: boolean
+  subscriptionUntil: number
+  usage5h: number
+  usage7d: number
+  limit5h: number
+  limit7d: number
+  resetsAt5h: number
+  resetsAt7d: number
 }
-export interface CreateAdminUser { username: string; password: string; role: UserRole }
-export interface UpdateAdminUser { role?: UserRole; isActive?: boolean; newPassword?: string }
+export interface CreateAdminUser extends Partial<Subscription> { username: string; password: string; role: UserRole }
+export interface UpdateAdminUser extends Partial<Subscription> { role?: UserRole; isActive?: boolean; newPassword?: string }
 export interface AdminAdapter {
   list(signal?: AbortSignal): Promise<AdminUser[]>
   create(user: CreateAdminUser): Promise<AdminUser>
   update(id: string, changes: UpdateAdminUser): Promise<void>
   revokeDevices(id: string): Promise<void>
 }
+export interface ServerAdminAdapter extends AdminAdapter {
+  chats(userId: string, signal?: AbortSignal): Promise<AdminChat[]>
+  messages(userId: string, chatId: string, signal?: AbortSignal): Promise<ServerMessage[]>
+}
 export interface ServerDevice { id: string; userId: string; name: string; lastSeenAt: number; createdAt: number; isCurrent?: boolean }
 export interface ServerSession { user: ServerUser; device: ServerDevice }
 export interface ServerLoginResponse extends ServerSession { token: string }
 export interface ServerCreateChatRequest { title?: string; model?: string }
 export interface ServerChat {
+  ownerId?: string
+  access?: ChatAccess['access']
+  grants?: Grant[]
   id: string
   title: string
   provider: ServerProvider
@@ -142,6 +174,7 @@ export interface ServerChat {
   createdAt: number
   updatedAt: number
 }
+export interface AdminChat extends ServerChat { messagesCount: number }
 export interface IndexedCodexChat extends ServerChat { archived: boolean }
 export interface MessageAttachment {
   kind: 'file' | 'image'
@@ -161,3 +194,13 @@ export interface ServerMessage {
   createdAt: number
 }
 export interface ServerError { code: string; message: string }
+
+export interface UserProfile {
+  displayName: string
+  profileMd: string
+  memoryMd: string
+  memoryEnabled: boolean
+  memoryUpdatedAt: number
+}
+
+export type UserProfilePatch = Partial<Omit<UserProfile, 'memoryUpdatedAt'>>

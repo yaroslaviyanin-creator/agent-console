@@ -35,12 +35,13 @@ func (a *API) adminCreateUser(w http.ResponseWriter, r *http.Request, _ session)
 		Username string `json:"username"`
 		Password string `json:"password"`
 		Role     string `json:"role"`
+		store.SubscriptionUpdate
 	}
 	if !decode(w, r, &req) {
 		return
 	}
 	req.Username = strings.TrimSpace(req.Username)
-	if !identity.ValidUsername(req.Username) || !identity.ValidPassword(req.Password) || !store.ValidRole(req.Role) {
+	if !identity.ValidUsername(req.Username) || !identity.ValidPassword(req.Password) || !store.ValidRole(req.Role) || !req.SubscriptionUpdate.Valid() {
 		fail(w, http.StatusBadRequest, "invalid_user", "Provide a valid username, password and role.")
 		return
 	}
@@ -49,7 +50,17 @@ func (a *API) adminCreateUser(w http.ResponseWriter, r *http.Request, _ session)
 		a.internal(w, r, err)
 		return
 	}
-	user, err := a.db.CreateUserWithRole(r.Context(), req.Username, hash, req.Role)
+	subscription := store.Subscription{PlanTier: "none"}
+	if req.PlanTier != nil {
+		subscription.PlanTier = *req.PlanTier
+	}
+	if req.Bypass5hLimit != nil {
+		subscription.Bypass5hLimit = *req.Bypass5hLimit
+	}
+	if req.SubscriptionUntil != nil {
+		subscription.SubscriptionUntil = *req.SubscriptionUntil
+	}
+	user, err := a.db.CreateUserWithRole(r.Context(), req.Username, hash, req.Role, subscription)
 	switch {
 	case errors.Is(err, store.ErrUsernameTaken):
 		fail(w, http.StatusConflict, "username_taken", "Username is already taken.")
@@ -65,6 +76,7 @@ func (a *API) adminUpdateUser(w http.ResponseWriter, r *http.Request, s session)
 		Role        *string `json:"role"`
 		IsActive    *bool   `json:"isActive"`
 		NewPassword *string `json:"newPassword"`
+		store.SubscriptionUpdate
 	}
 	if !decode(w, r, &req) {
 		return
@@ -75,7 +87,8 @@ func (a *API) adminUpdateUser(w http.ResponseWriter, r *http.Request, s session)
 		fail(w, http.StatusBadRequest, "self_edit_forbidden", "You cannot change your own role or deactivate your account.")
 		return
 	}
-	if (req.Role == nil && req.IsActive == nil && req.NewPassword == nil) ||
+	if (req.Role == nil && req.IsActive == nil && req.NewPassword == nil && req.SubscriptionUpdate == (store.SubscriptionUpdate{})) ||
+		!req.SubscriptionUpdate.Valid() ||
 		(req.Role != nil && !store.ValidRole(*req.Role)) ||
 		(req.NewPassword != nil && !identity.ValidPassword(*req.NewPassword)) {
 		fail(w, http.StatusBadRequest, "invalid_user_update", "Provide a valid role, active status or new password.")
@@ -90,11 +103,11 @@ func (a *API) adminUpdateUser(w http.ResponseWriter, r *http.Request, s session)
 			return
 		}
 	}
-	if err := a.db.UpdateAdminUser(r.Context(), id, req.Role, req.IsActive, hash); err != nil {
+	if err := a.db.UpdateAdminUser(r.Context(), id, req.Role, req.IsActive, hash, req.SubscriptionUpdate); err != nil {
 		a.adminUserError(w, r, err)
 		return
 	}
-	if block || hash != nil {
+	if block || hash != nil || (req.Role != nil && *req.Role == "pending") {
 		a.live.disconnectUser(id)
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -116,4 +129,25 @@ func (a *API) adminUserError(w http.ResponseWriter, r *http.Request, err error) 
 		return
 	}
 	a.internal(w, r, err)
+}
+
+func (a *API) adminUserChats(w http.ResponseWriter, r *http.Request, _ session) {
+	chats, err := a.db.AdminUserChats(r.Context(), r.PathValue("id"))
+	if err != nil {
+		a.adminUserError(w, r, err)
+		return
+	}
+	reply(w, http.StatusOK, chats)
+}
+
+func (a *API) adminChatMessages(w http.ResponseWriter, r *http.Request, _ session) {
+	messages, err := a.db.AdminChatMessages(r.Context(), r.PathValue("id"), r.PathValue("chatId"))
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		fail(w, http.StatusNotFound, "chat_not_found", "Chat not found.")
+	case err != nil:
+		a.internal(w, r, err)
+	default:
+		reply(w, http.StatusOK, messages)
+	}
 }

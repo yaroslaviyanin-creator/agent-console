@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
@@ -39,6 +40,9 @@ type runEvent struct {
 	MessageID  string `json:"messageId"`
 	Seq        int    `json:"seq"`
 	Type       string `json:"type"`
+	Prompt     string `json:"prompt,omitempty"`
+	Model      string `json:"model,omitempty"`
+	CreatedAt  int64  `json:"createdAt,omitempty"`
 	Delta      string `json:"delta,omitempty"`
 	Reason     string `json:"reason,omitempty"`
 	DurationMs *int64 `json:"durationMs,omitempty"`
@@ -58,6 +62,8 @@ var modelID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$`)
 type liveRuns struct {
 	ctx               context.Context
 	backend           provider.Provider
+	db                *store.Store
+	logger            *slog.Logger
 	mu                sync.Mutex
 	clients           map[string]map[*socket]bool
 	chats             map[string]activeRun
@@ -124,10 +130,17 @@ func (r *liveRuns) takeTicket(key string) (wsTicket, bool) {
 func (a *API) websocket(w http.ResponseWriter, r *http.Request) {
 	ticket, ok := a.live.takeTicket(r.URL.Query().Get("ticket"))
 	if !ok {
+		// Pending sessions cannot mint tickets. Recognize a bearer credential if supplied.
+		if token := bearerToken(r); token != "" {
+			if s, err := a.authenticate(r.Context(), token); err == nil && s.User.Role == "pending" {
+				pendingAccount(w)
+				return
+			}
+		}
 		unauthorized(w)
 		return
 	}
-	_, _, err := a.db.AuthenticateDevice(r.Context(), ticket.userID, ticket.deviceID)
+	user, _, err := a.db.AuthenticateDevice(r.Context(), ticket.userID, ticket.deviceID)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		unauthorized(w)
@@ -137,6 +150,11 @@ func (a *API) websocket(w http.ResponseWriter, r *http.Request) {
 		return
 	case err != nil:
 		a.internal(w, r, err)
+		return
+	}
+
+	if user.Role == "pending" {
+		pendingAccount(w)
 		return
 	}
 
@@ -155,7 +173,7 @@ func (a *API) websocket(w http.ResponseWriter, r *http.Request) {
 	a.live.add(ticket.userID, client)
 	defer a.live.remove(ticket.userID, client)
 	// A revocation between the handshake and registration must still take effect.
-	if _, _, err := a.db.AuthenticateDevice(r.Context(), ticket.userID, ticket.deviceID); err != nil {
+	if user, _, err := a.db.AuthenticateDevice(r.Context(), ticket.userID, ticket.deviceID); err != nil || user.Role == "pending" {
 		return
 	}
 	go client.write(a.live.ctx)
@@ -249,12 +267,56 @@ func enqueue(c *socket, event runEvent) {
 	}
 }
 
-func (r *liveRuns) publish(userID string, event runEvent) {
+func (r *liveRuns) sendLocked(userID string, event runEvent) {
+	for client := range r.clients[userID] {
+		if !client.revoked {
+			enqueue(client, event)
+		}
+	}
+}
+
+func (r *liveRuns) publish(event runEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for client := range r.clients[userID] {
-		enqueue(client, event)
+	r.publishLocked(event)
+}
+
+func (r *liveRuns) publishLocked(event runEvent) {
+	members, err := r.db.ChatMembers(r.ctx, event.ChatID)
+	if err != nil {
+		r.logger.Error("load chat members", "chatId", event.ChatID, "error", err)
+		return
 	}
+	for _, userID := range members {
+		r.sendLocked(userID, event)
+	}
+}
+
+var errShareDuringRun = errors.New("cannot share private chat during a response")
+
+func (r *liveRuns) changeShare(ctx context.Context, ownerID, chatID, targetID, access string) error {
+	// Serialize changes with broadcasts so a revoked user is excluded from new frames.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, busy := r.chats[chatID]; busy && access != "" {
+		if err := r.db.CheckChat(ctx, ownerID, chatID); err != nil {
+			return err
+		}
+		shared, err := r.db.IsChatShared(ctx, chatID)
+		if err != nil {
+			return err
+		}
+		if !shared {
+			return errShareDuringRun
+		}
+	}
+	if err := r.db.SetChatShare(ctx, ownerID, chatID, targetID, access); err != nil {
+		return err
+	}
+	event := runEvent{Type: "workspace_changed", ChatID: chatID}
+	r.sendLocked(ownerID, event)
+	r.sendLocked(targetID, event)
+	return nil
 }
 
 func (r *liveRuns) acquire(userID, chatID string, client *socket, cancel context.CancelFunc) (func(*runEvent), string) {
@@ -272,9 +334,7 @@ func (r *liveRuns) acquire(userID, chatID string, client *socket, cancel context
 		defer r.mu.Unlock()
 		delete(r.chats, chatID)
 		if terminal != nil {
-			for client := range r.clients[userID] {
-				enqueue(client, *terminal)
-			}
+			r.publishLocked(*terminal)
 		}
 	}, ""
 }
@@ -300,8 +360,9 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 		reject("unsupported_model", "Select a Codex model for this server.", false)
 		return
 	}
-	// Check ownership before taking a chat lock so chat_busy does not reveal another user's chat.
-	if err := a.db.CheckChat(a.live.ctx, userID, req.ChatID); err != nil {
+	// Resolve the workspace and check write access before revealing whether the chat is busy.
+	ownerID, err := a.db.ChatOwner(a.live.ctx, userID, req.ChatID)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			reject("chat_not_found", "Chat not found.", false)
 		} else {
@@ -319,10 +380,15 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 		reject(code, "Another response is running. Try again later.", true)
 		return
 	}
-	if err := a.startRun(ctx, cancel, userID, req, release); err != nil {
+	if err := a.startRun(ctx, cancel, userID, client.deviceID, ownerID, req, release); err != nil {
 		cancel()
 		release(nil)
+		var denied store.RunDenied
 		switch {
+		case errors.As(err, &denied):
+			reject(string(denied), runDeniedMessages[denied], false)
+		case errors.Is(err, sql.ErrNoRows):
+			reject("chat_not_found", "Chat not found.", false)
 		case errors.Is(err, store.ErrDuplicateRun):
 			reject("duplicate_run", "This message ID has already been used.", false)
 		default:
@@ -332,21 +398,34 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 	}
 }
 
-func (a *API) startRun(ctx context.Context, cancel context.CancelFunc, userID string, req runRequest, release func(*runEvent)) error {
-	sessionID, err := a.db.BeginRun(ctx, userID, req.ChatID, req.MessageID, req.Prompt, a.config.Provider, req.Model.ID)
+var runDeniedMessages = map[store.RunDenied]string{
+	"session_revoked":         "Сессия завершена. Войдите снова.",
+	"account_pending":         "Аккаунт ожидает подтверждения администратора.",
+	"subscription_expired":    "Срок подписки истёк.",
+	"no_active_plan":          "Для аккаунта не подключён тариф.",
+	"weekly_limit_reached":    "Достигнут лимит расхода за 7 дней.",
+	"five_hour_limit_reached": "Достигнут лимит расхода за 5 часов.",
+}
+
+func (a *API) startRun(ctx context.Context, cancel context.CancelFunc, userID, deviceID, ownerID string, req runRequest, release func(*runEvent)) error {
+	_, err := a.db.BeginRunForDevice(ctx, userID, deviceID, req.ChatID, req.MessageID, req.Prompt, a.config.Provider, req.Model.ID)
 	if err != nil {
 		return err
 	}
+	a.live.publish(runEvent{
+		ChatID: req.ChatID, MessageID: req.MessageID, Seq: 1, Type: "started",
+		Prompt: req.Prompt, Model: req.Model.ID, CreatedAt: time.Now().UnixMilli(),
+	})
 	go func() {
 		defer cancel()
-		terminal := a.streamRun(ctx, userID, sessionID, req)
+		terminal := a.streamRun(ctx, userID, ownerID, req)
 		release(&terminal)
 	}()
 	return nil
 }
 
-func (a *API) streamRun(ctx context.Context, userID, sessionID string, req runRequest) runEvent {
-	seq := 0
+func (a *API) streamRun(ctx context.Context, userID, ownerID string, req runRequest) runEvent {
+	seq := 1
 	failure := func(code, message string, err error) runEvent {
 		a.logger.Error("stream response", "chatId", req.ChatID, "code", code, "error", err)
 		return req.failure(seq+1, code, message, true)
@@ -374,8 +453,29 @@ func (a *API) streamRun(ctx context.Context, userID, sessionID string, req runRe
 	}
 	runCtx, runCancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer runCancel()
+	sessionID, shared, err := a.db.ChatRunContext(runCtx, req.ChatID)
+	if err != nil {
+		return failure("storage_error", "Could not open the chat.", err)
+	}
+	// A queued collaborator can lose access before a slot opens. Never
+	// apply their private profile to somebody else's chat.
+	if userID != ownerID {
+		if !shared {
+			return req.failure(seq+1, "chat_not_found", "Chat not found.", false)
+		}
+		if err := a.db.CheckChatWrite(runCtx, userID, req.ChatID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return req.failure(seq+1, "chat_not_found", "Chat not found.", false)
+			}
+			return failure("storage_error", "Could not open the chat.", err)
+		}
+	}
+	instructions, err := a.userInstructions(runCtx, userID, shared)
+	if err != nil {
+		return failure("storage_error", "Could not load your profile.", err)
+	}
 	started := time.Now()
-	events, err := a.live.backend.Stream(runCtx, provider.Request{UserID: userID, Model: req.Model.ID, Prompt: req.Prompt, SessionID: sessionID})
+	events, err := a.live.backend.Stream(runCtx, provider.Request{UserID: ownerID, Model: req.Model.ID, Prompt: req.Prompt, SessionID: sessionID, SystemInstructions: instructions})
 	if err != nil {
 		return failure("provider_error", "Could not start the provider.", err)
 	}
@@ -408,7 +508,7 @@ func (a *API) streamRun(ctx context.Context, userID, sessionID string, req runRe
 				wire.Delta = event.Delta
 			case provider.Done:
 				durationMs := time.Since(started).Milliseconds()
-				if err := a.db.FinishRun(runCtx, req.ChatID, req.MessageID, text.String(), thinking.String(), event.SessionID, durationMs); err != nil {
+				if err := a.finishStream(runCtx, userID, req, text.String(), thinking.String(), event, durationMs, shared); err != nil {
 					return failure("storage_error", "Could not save the response.", err)
 				}
 				wire.Reason = "completed"
@@ -422,9 +522,24 @@ func (a *API) streamRun(ctx context.Context, userID, sessionID string, req runRe
 			if event.Type == provider.Done {
 				return wire
 			}
-			a.live.publish(userID, wire)
+			a.live.publish(wire)
 		}
 	}
+}
+
+func (a *API) finishStream(ctx context.Context, userID string, req runRequest, text, thinking string, event provider.Event, durationMs int64, shared bool) error {
+	// Access revocation can make a running shared chat private. Do not
+	// restore a session that the sharing transition already invalidated.
+	a.live.mu.Lock()
+	defer a.live.mu.Unlock()
+	currentlyShared, err := a.db.IsChatShared(ctx, req.ChatID)
+	if err != nil {
+		return err
+	}
+	if shared != currentlyShared {
+		event.SessionID = ""
+	}
+	return a.db.FinishRun(ctx, userID, req.ChatID, req.MessageID, text, thinking, event.SessionID, durationMs, event.Usage)
 }
 
 func (req runRequest) failure(seq int, code, message string, retryable bool) runEvent {

@@ -147,7 +147,15 @@ test('remote sessions connect with a ticket and manage server devices', async t 
   const current = { id: 'current', userId: 'u', name: 'Test', lastSeenAt: 0, createdAt: 0, isCurrent: true }
   const session = { user: { id: 'u', username: 'demo' }, device: current, token: 'device-token' }
   const old = { ...current, id: 'old', name: 'Old device', lastSeenAt: 1_700_000_000_000, isCurrent: false }
+  let usedCents = 120
+  const quota = () => ({
+    planTier: 'pro', bypass5hLimit: false, subscriptionUntil: 0,
+    fiveHour: { usedCents, limitCents: 1500, usedPercent: usedCents / 15, resetsAt: 123 },
+    sevenDay: { usedCents, limitCents: 15000, usedPercent: usedCents / 150, resetsAt: 456 },
+  })
   let devices = [current, old]
+  const originalProfile = { displayName: '', profileMd: '', memoryMd: '', memoryEnabled: true, memoryUpdatedAt: 0 }
+  let profile = originalProfile
   let loginLimited = true
   let ticketStatus = 200
   let tickets = 0
@@ -180,7 +188,17 @@ test('remote sessions connect with a ticket and manage server devices', async t 
         return loginLimited ? Response.json({ code: 'rate_limited' }, { status: 429 }) : Response.json(session)
       case 'GET /api/health': return Response.json({ status: 'ok', provider: 'stub' })
       case 'GET /api/chats': return Response.json([])
+      case 'GET /api/users': return Response.json([])
       case 'GET /api/devices': return Response.json(devices)
+      case 'GET /api/profile': return Response.json(profile)
+      case 'PATCH /api/profile': {
+        assert.equal(new Headers(init.headers).get('Content-Type'), 'application/json')
+        const patch = JSON.parse(String(init.body))
+        assert.deepEqual(patch, { displayName: 'Ярослав', memoryEnabled: false })
+        profile = { ...profile, ...patch, memoryUpdatedAt: 123 }
+        return Response.json(profile)
+      }
+      case 'GET /api/quotas/current': return Response.json(quota())
       case 'POST /api/ws/ticket':
         tickets++
         return ticketStatus === 200 ? Response.json({ ticket: 'single-use' }) :
@@ -206,6 +224,13 @@ test('remote sessions connect with a ticket and manage server devices', async t 
   })
   loginLimited = false
   const workspace = await remote.workspace.login(login)
+  assert.deepEqual(remote.sessionQuota, quota())
+  assert.deepEqual(await remote.getProfile(), originalProfile)
+  assert.deepEqual(await remote.updateProfile({ displayName: 'Ярослав', memoryEnabled: false }), {
+    ...originalProfile, displayName: 'Ярослав', memoryEnabled: false, memoryUpdatedAt: 123,
+  })
+  usedCents = 121
+  assert.deepEqual(await remote.quota(), quota())
   assert.deepEqual(workspace.devices.map(d => d.id), ['current', 'old'])
   assert.equal(workspace.devices.find(d => d.id === old.id)?.lastSeenAt, old.lastSeenAt)
   await Promise.all([remote.connect(), remote.connect()])
@@ -238,4 +263,107 @@ test('remote sessions connect with a ticket and manage server devices', async t 
   assert.equal(await expired.workspace.revokeDevice('current'), null)
   assert.equal(expired.sessionToken, '')
   assert.equal(logouts, 1)
+})
+
+test('registration and session restore stay offline until the account is approved', async t => {
+  const device = { id: 'current', userId: 'u', name: 'Browser', lastSeenAt: 0, createdAt: 0 }
+  const user = { id: 'u', username: 'alice', role: 'pending', planTier: 'none', isActive: true }
+  const requests: string[] = []
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    assert.ok(init)
+    const route = init.method + ' ' + new URL(String(input)).pathname
+    requests.push(route)
+    const authorization = new Headers(init.headers).get('Authorization')
+    if (route === 'POST /api/auth/register') {
+      assert.equal(authorization, null)
+      assert.deepEqual(JSON.parse(String(init.body)), { username: 'alice', password: 'a-password', deviceName: 'Browser' })
+      return Response.json({ user, device, token: 'registered-token' }, { status: 201 })
+    }
+    assert.equal(authorization, 'Bearer registered-token')
+    switch (route) {
+      case 'GET /api/auth/me': return Response.json({ user, device })
+      case 'GET /api/health': return Response.json({ status: 'ok', provider: 'stub' })
+      case 'GET /api/devices': return Response.json([device])
+      case 'GET /api/quotas/current': return Response.json({
+        planTier: 'pro', bypass5hLimit: true, subscriptionUntil: 0,
+        fiveHour: { usedCents: 0, limitCents: 1500, usedPercent: 0, resetsAt: 0 },
+        sevenDay: { usedCents: 0, limitCents: 15000, usedPercent: 0, resetsAt: 0 },
+      })
+      case 'GET /api/chats': return Response.json([])
+      case 'GET /api/users': return Response.json([])
+      default: assert.fail(route)
+    }
+  })
+  const remote = new RemoteTransport('https://example.test')
+  const restored = new RemoteTransport(remote.address)
+  t.after(() => { remote.close(); restored.close() })
+  const workspace = await remote.register({ connection: remote.address, login: 'alice', password: 'a-password', deviceName: 'Browser' })
+  assert.equal(workspace.user.role, 'pending')
+  assert.equal(remote.sessionToken, 'registered-token')
+  assert.equal((await restored.restore(remote.sessionToken)).user.role, 'pending')
+  await remote.connect()
+  await restored.connect()
+  const pendingQuota = restored.sessionQuota
+  assert.equal(pendingQuota, null)
+  assert.deepEqual(requests.splice(0), ['POST /api/auth/register', 'GET /api/auth/me'])
+  user.role = 'user'
+  user.planTier = 'pro'
+  assert.equal((await restored.checkStatus()).user.role, 'user')
+  assert.equal(restored.sessionQuota?.bypass5hLimit, true)
+  assert.deepEqual(requests.sort(), ['GET /api/auth/me', 'GET /api/chats', 'GET /api/devices', 'GET /api/health', 'GET /api/quotas/current', 'GET /api/users'])
+})
+
+test('remote workspace lists members, updates grants and forks shared chats', async t => {
+  const alice = { id: 'alice', username: 'Алиса' }
+  const bob = { id: 'bob', username: 'Боб' }
+  const device = { id: 'browser', userId: alice.id, name: 'Browser', lastSeenAt: 0, createdAt: 0 }
+  const owner = { id: 'mine', ownerId: alice.id, access: 'owner', title: 'Mine', provider: 'stub', model: 'default', createdAt: 0, updatedAt: 0 }
+  const shared = { ...owner, id: 'shared/thread', ownerId: bob.id, access: 'fork' }
+  const fork = { ...owner, id: 'copy', title: 'Shared · копия' }
+  let grant: { userId: string; access: string }[] = []
+  let directoryLoads = 0
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    assert.ok(init)
+    const route = init.method + ' ' + new URL(String(input)).pathname
+    switch (route) {
+      case 'POST /api/auth/login': return Response.json({ user: alice, device, token: 'token' })
+      case 'GET /api/health': return Response.json({ status: 'ok', provider: 'stub' })
+      case 'GET /api/devices': return Response.json([device])
+      case 'GET /api/quotas/current': return Response.json({
+        planTier: 'pro', bypass5hLimit: true, subscriptionUntil: 0,
+        fiveHour: { usedCents: 0, limitCents: 1500, usedPercent: 0, resetsAt: 0 },
+        sevenDay: { usedCents: 0, limitCents: 15000, usedPercent: 0, resetsAt: 0 },
+      })
+      case 'GET /api/users':
+        directoryLoads++
+        return Response.json([alice, bob])
+      case 'GET /api/chats': return Response.json([{ ...owner, grants: grant }, shared])
+      case 'PUT /api/chats/mine/shares/bob':
+        assert.deepEqual(JSON.parse(String(init.body)), { access: 'write' })
+        grant = [{ userId: bob.id, access: 'write' }]
+        return new Response(null, { status: 204 })
+      case 'DELETE /api/chats/mine/shares/bob':
+        assert.equal(init.body, null)
+        grant = []
+        return new Response(null, { status: 204 })
+      case 'POST /api/chats/shared%2Fthread/fork': return Response.json(fork, { status: 201 })
+      default: assert.fail(route)
+    }
+  })
+  const remote = new RemoteTransport('https://example.test')
+  t.after(() => remote.close())
+  const workspace = await remote.workspace.login({
+    connection: remote.address, login: alice.username, password: 'password', deviceName: 'Browser',
+  })
+  assert.deepEqual(workspace.users.map(user => [user.id, user.name]), [[alice.id, alice.username], [bob.id, bob.username]])
+  assert.deepEqual(workspace.chats[1], { id: shared.id, ownerId: bob.id, access: 'fork', grants: [] })
+  const granted = await remote.workspace.setShare(owner.id, bob.id, 'write', true)
+  assert.deepEqual(granted.chats[0]?.grants, grant)
+  const revoked = await remote.workspace.setShare(owner.id, bob.id, null, false)
+  assert.deepEqual(revoked.chats[0]?.grants, [])
+  await remote.refreshChats()
+  assert.equal(directoryLoads, 4)
+  const copy = await remote.workspace.createChat(shared.id)
+  assert.equal(copy.id, fork.id)
+  assert.deepEqual(copy.workspace.chats[0], { id: fork.id, ownerId: alice.id, access: 'owner', grants: [] })
 })

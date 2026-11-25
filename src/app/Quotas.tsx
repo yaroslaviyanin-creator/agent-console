@@ -7,6 +7,9 @@ import { transport } from './runtime'
 const label = { claude: 'Claude', codex: 'Codex', paid_api: 'API' }
 const transferState = { pending: 'ожидает ответа', accepted: 'одобрен', declined: 'отклонён', expired: 'истёк' }
 export const dollars = (cents: number) => '$' + (cents / 100).toFixed(2)
+export const limitDollars = (cents: number) => cents % 100 === 0 ? '$' + cents / 100 : dollars(cents)
+const percent = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2, style: 'percent' })
+export const quotaPercent = (value: number) => percent.format(value / 100)
 function remaining(end: number, now: number) {
   const mins = Math.max(0, Math.ceil((end - now) / 60_000))
   const hours = Math.floor(mins / 60)
@@ -37,6 +40,32 @@ export function Quotas({ userId, menuRef, onOpenChange }: { userId: string; menu
     <section><ProviderQuotas/>
     {requests.length > 0 && <div className="transfer-log"><h3>Обмен лимитами</h3>{requests.slice(-5).reverse().map(r => <p key={r.requestId}>{r.from.id === userId ? 'Запрос к ' + r.to.name : 'Запрос от ' + r.from.name} · {r.percent}% {label[r.provider]} · {transferState[r.status]}</p>)}</div>}
     </section></details>
+}
+
+export function ServerQuotas({ menuRef, onOpenChange }: { menuRef: Ref<HTMLDetailsElement>; onOpenChange: (open: boolean) => void }) {
+  const quota = useAccountStore(s => s.serverQuota)
+  const [now, setNow] = useState(Date.now)
+  useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 10_000); return () => clearInterval(timer) }, [])
+  const windows = quota ? [
+    { name: '5ч', window: quota.fiveHour, bypass: quota.bypass5hLimit },
+    { name: '7д', window: quota.sevenDay, bypass: false },
+  ] : []
+  return <details className="quota-menu server-quotas" ref={menuRef} onToggle={e => onOpenChange(e.currentTarget.open)}>
+    <summary aria-label="Лимиты за 5 часов и 7 дней">
+      <Activity size={14} aria-hidden="true"/>
+      {windows.length ? windows.map(({ name, window, bypass }) =>
+        <span key={name}>{name} <b>{bypass ? 'Отключён' : quota?.planTier === 'unlimited' ? '∞' : quotaPercent(window.usedPercent)}</b></span>
+      ) : 'Лимиты'}
+    </summary>
+    <section aria-label="Расход по тарифу">
+      {!quota && <p>Данные о лимитах пока недоступны.</p>}
+      {windows.map(({ name, window, bypass }) => <div className="server-quota-window" key={name}>
+        <strong>{name}</strong><span>{dollars(window.usedCents)}{window.limitCents > 0 && ' / ' + limitDollars(window.limitCents)}</span>
+        {window.limitCents > 0 && !bypass && <progress aria-label={'Расход за ' + name} value={window.usedPercent} max={100}/>}
+        <small>{bypass ? 'Лимит отключён' : quota?.planTier === 'unlimited' ? 'Без ограничений' : quota?.planTier === 'none' ? 'Без тарифа' : window.resetsAt > now ? 'Ближайшее снижение расхода через ' + remaining(window.resetsAt, now) : ''}</small>
+      </div>)}
+    </section>
+  </details>
 }
 
 export function Incoming({ request }: { request: Transfer }) {

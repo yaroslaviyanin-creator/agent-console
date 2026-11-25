@@ -145,7 +145,7 @@ export function changeServerAddress(value: string) {
   saveConnection({ mode: 'server', address })
 }
 
-export async function login(request: LoginRequest) {
+export async function login(request: LoginRequest, register = false) {
   const { mode } = useChats.getState()
   if (mode === 'demo') {
     loadWorkspace(await transport.workspace.login(request))
@@ -156,7 +156,7 @@ export async function login(request: LoginRequest) {
   saveConnection({ mode, address })
   const remote = new RemoteTransport(address)
   try {
-    attachRemote(remote, await remote.workspace.login(request))
+    attachRemote(remote, await (register ? remote.register(request) : remote.workspace.login(request)))
   } catch (error) {
     void remote.workspace.logout()
     throw error
@@ -186,6 +186,7 @@ export function logout() {
 }
 
 function clearSession() {
+  useAccountStore.setState({ serverQuota: null })
   const { remote, mode, address } = useChats.getState()
   for (const id of runs.keys()) stopChat(id)
   if (remote) {
@@ -201,16 +202,36 @@ function attachRemote(remote: RemoteTransport, workspace: Workspace) {
   setTransport(remote)
   saveConnection({ mode: 'server', address: remote.address, token: remote.sessionToken })
   useChats.setState({ remote, address: remote.address, connected: false, connectionError: '' })
+  useAccountStore.setState({ serverQuota: remote.sessionQuota })
   applyRemoteWorkspace(remote, workspace)
   remote.subscribe(change => {
     if (useChats.getState().remote !== remote) return
     switch (change.type) {
       case 'connection':
         useChats.setState({ connected: change.connected })
-        if (change.connected) void refreshRemote(remote)
+        if (change.connected) {
+          void refreshRemote(remote)
+          void refreshQuota(remote)
+        } else for (const c of useChats.getState().chats) {
+          if (!runs.has(c.id) && c.turns.some(t => t.state === 'running')) stopChat(c.id)
+        }
+        break
+      case 'run':
+        receiveRemoteRun(remote, change.event)
+        break
+      case 'workspace_changed':
+        void refreshRemote(remote)
         break
       case 'settled':
+        void refreshQuota(remote)
         void refreshRemote(remote, change.chatId)
+        break
+      case 'pending':
+        void checkAccountStatus().catch(error => {
+          if (useChats.getState().remote === remote) {
+            useChats.setState({ connectionError: error instanceof Error ? error.message : 'Не удалось проверить статус.' })
+          }
+        })
         break
       case 'expired':
         remote.close()
@@ -218,6 +239,22 @@ function attachRemote(remote: RemoteTransport, workspace: Workspace) {
         useChats.setState({ connectionError: 'Сессия закончилась. Войдите снова.' })
     }
   })
+  if (workspace.user.role !== 'pending') startRemote(remote)
+}
+
+export async function checkAccountStatus() {
+  const { remote } = useChats.getState()
+  if (!remote) return
+  const workspace = await remote.checkStatus()
+  if (useChats.getState().remote !== remote) return
+  useAccountStore.setState({ serverQuota: remote.sessionQuota })
+  applyRemoteWorkspace(remote, workspace)
+  useChats.setState({ connectionError: '' })
+  if (workspace.user.role !== 'pending') startRemote(remote)
+  else useChats.setState({ connected: false, serverModels: [], codexIndex: 'hidden' })
+}
+
+function startRemote(remote: RemoteTransport) {
   void remote.connect()
   if (remote.provider === 'codex') {
     void refreshServerModels()
@@ -227,7 +264,7 @@ function attachRemote(remote: RemoteTransport, workspace: Workspace) {
 
 export async function refreshServerModels() {
   const { remote, modelsLoading } = useChats.getState()
-  if (!remote || remote.provider !== 'codex' || modelsLoading) return
+  if (!remote || remote.provider !== 'codex' || modelsLoading || useChats.getState().workspace?.user.role === 'pending') return
   useChats.setState({ modelsLoading: true, modelsError: '' })
   try {
     const serverModels = await remote.models()
@@ -247,7 +284,7 @@ export async function refreshServerModels() {
 
 export async function refreshCodexIndex() {
   const { remote, codexIndex } = useChats.getState()
-  if (remote?.provider !== 'codex' || codexIndex === 'loading') return
+  if (remote?.provider !== 'codex' || codexIndex === 'loading' || useChats.getState().workspace?.user.role === 'pending') return
   useChats.setState({ codexIndex: 'loading' })
   try {
     const workspace = await remote.refreshCodexIndex()
@@ -263,18 +300,53 @@ function applyRemoteWorkspace(remote: RemoteTransport, workspace: Workspace, pre
   const state = useChats.getState()
   if (state.remote !== remote) return
   const existing = new Map(state.chats.map(item => [item.id, item]))
+  const accessById = new Map(workspace.chats.map(c => [c.id, c.access]))
   const chats = remote.chats.map(item => {
     const previous = existing.get(item.id)
     const model = remote.provider === 'stub' || item.model === 'codex' ? 'default' : item.model
     if ('archived' in item && typeof item.archived === 'boolean') {
       return { ...(previous ?? chat(item.id, item.title, 'read')), title: item.title, model, indexedCodex: true, archived: item.archived }
     }
-    return previous ? { ...previous, title: item.title } : { ...chat(item.id, item.title), model }
+    const access = accessById.get(item.id) ?? 'read'
+    return previous ? { ...previous, title: item.title, access } : { ...chat(item.id, item.title, access), model }
   })
+  for (const id of runs.keys()) if (!accessById.has(id)) stopChat(id)
   const selected = preferred ?? state.activeId
   const activeId = chats.some(c => c.id === selected) ? selected : chats[0]?.id ?? ''
   useChats.setState({ workspace, chats, activeId })
   if (activeId !== state.activeId && activeId) void loadRemoteHistory(remote, activeId)
+}
+
+function receiveRemoteRun(remote: RemoteTransport, event: RunEvent) {
+  if (event.type !== 'started') {
+    updateTurn(event.chatId, event.messageId, turn => applyEvent(turn, event))
+    return
+  }
+  updateChat(event.chatId, c => {
+    const previous = c.turns.find(t => t.id === event.messageId)
+    if (previous && (previous.seq > 0 || previous.state === 'completed')) return c
+    const label = useChats.getState().serverModels.find(m => m.id === event.model)?.name
+    const turn: Turn = {
+      id: event.messageId, prompt: event.prompt, time: event.createdAt, parts: [], seq: event.seq,
+      model: remote.provider === 'stub' ? 'StubProvider' : label ?? 'Codex', state: 'running',
+    }
+    const turns = previous ? c.turns.map(t => t.id === turn.id ? turn : t) : [...c.turns, turn]
+    return { ...c, turns }
+  })
+}
+
+const quotaRequests = new WeakMap<RemoteTransport, AbortController>()
+async function refreshQuota(remote: RemoteTransport) {
+  quotaRequests.get(remote)?.abort()
+  const controller = new AbortController()
+  quotaRequests.set(remote, controller)
+  try {
+    const serverQuota = await remote.quota(controller.signal)
+    const { remote: active, workspace } = useChats.getState()
+    if (!controller.signal.aborted && active === remote && workspace?.user.role !== 'pending') {
+      useAccountStore.setState({ serverQuota })
+    }
+  } catch { /* A later refresh can retry while the last successful reading stays visible. */ }
 }
 
 async function refreshRemote(remote: RemoteTransport, changedId?: string) {
@@ -377,7 +449,10 @@ export async function revokeDevice(id: string) {
   loadWorkspace(workspace)
 }
 export async function setShare(chatId: string, userId: string, access: ShareAccess | null, trust: boolean) {
-  loadWorkspace(await transport.workspace.setShare(chatId, userId, access, trust))
+  const { remote } = useChats.getState()
+  const workspace = await transport.workspace.setShare(chatId, userId, access, trust)
+  if (remote) applyRemoteWorkspace(remote, workspace)
+  else loadWorkspace(workspace)
 }
 
 export function updateChat(id: string, transform: (value: Chat) => Chat) {

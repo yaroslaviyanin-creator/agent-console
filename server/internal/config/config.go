@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -20,6 +21,10 @@ type Config struct {
 	TrustProxyHeaders    bool
 	MaxConcurrentStreams int
 	CodexHistoryUsername string
+	MemoryAutoUpdate     bool
+	MemoryModel          string
+	MemoryCheckInterval  time.Duration
+	MemoryMinNewMessages int
 }
 
 func Load() (Config, error) {
@@ -57,6 +62,19 @@ func Load() (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("parse TRUST_PROXY_HEADERS: %w", err)
 		}
+	}
+	cfg.MemoryAutoUpdate, err = strconv.ParseBool(value("MEMORY_AUTO_UPDATE", "true"))
+	if err != nil {
+		return Config{}, fmt.Errorf("parse MEMORY_AUTO_UPDATE: %w", err)
+	}
+	cfg.MemoryModel = strings.TrimSpace(os.Getenv("MEMORY_MODEL"))
+	cfg.MemoryCheckInterval, err = time.ParseDuration(value("MEMORY_CHECK_INTERVAL", "5m"))
+	if err != nil || cfg.MemoryCheckInterval <= 0 {
+		return Config{}, errors.New("MEMORY_CHECK_INTERVAL must be a positive duration")
+	}
+	cfg.MemoryMinNewMessages, err = strconv.Atoi(value("MEMORY_MIN_NEW_MESSAGES", "6"))
+	if err != nil || cfg.MemoryMinNewMessages < 2 {
+		return Config{}, errors.New("MEMORY_MIN_NEW_MESSAGES must be an integer >= 2")
 	}
 	return cfg, nil
 }

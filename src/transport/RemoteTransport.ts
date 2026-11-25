@@ -1,15 +1,18 @@
 import type {
-  AccountingAdapter, AdminAdapter, AdminUser, IndexedCodexChat, LoginRequest, RunEvent, RunRequest, ServerChat, ServerError, ServerHealth,
-  ServerDevice, ServerLoginResponse, ServerMessage, ServerModel, ServerSession, TransportAdapter, Workspace, WorkspaceAdapter,
+  AccountingAdapter, AdminChat, AdminUser, ChatAccess, ServerAdminAdapter, IndexedCodexChat, LoginRequest, RunEvent, RunRequest, ServerChat, ServerError, ServerHealth,
+  ServerDevice, ServerDirectoryUser, ServerLoginResponse, ServerMessage, ServerModel, ServerQuota, ServerSession, TransportAdapter, UserProfile, UserProfilePatch, Workspace, WorkspaceAdapter,
 } from '../protocol/types'
 
 type Change =
   | { type: 'connection'; connected: boolean }
   | { type: 'settled'; chatId: string }
+  | { type: 'run'; event: RunEvent }
+  | { type: 'workspace_changed' }
   | { type: 'expired' }
+  | { type: 'pending' }
 
 export class RemoteError extends Error {
-  constructor(readonly status: number, message: string, code?: string) {
+  constructor(readonly status: number, message: string, readonly code?: string) {
     super(message)
     this.sessionExpired = status === 401 || code === 'account_inactive'
   }
@@ -26,14 +29,22 @@ export function normalizeServerAddress(address: string) {
 }
 
 function unavailable(): never { throw Error('Эта функция доступна в демо-режиме.') }
-const access = (chat: ServerChat, ownerId: string) => ({ id: chat.id, ownerId, access: 'owner' as const, grants: [] })
+const chatAccess = (chat: ServerChat, userId: string): ChatAccess => ({
+  id: chat.id,
+  ownerId: chat.ownerId ?? userId,
+  access: chat.access ?? 'owner',
+  grants: chat.access === 'owner' ? chat.grants ?? [] : [],
+})
 
-function readEvent(data: unknown): RunEvent | undefined {
+function readEvent(data: unknown): RunEvent | { type: 'workspace_changed' } | undefined {
   if (typeof data !== 'string') return
   let e
   try { e = JSON.parse(data) } catch { return }
+  if (e?.type === 'workspace_changed') return { type: 'workspace_changed' }
   if (!e || typeof e.chatId !== 'string' || typeof e.messageId !== 'string' || !Number.isSafeInteger(e.seq) || e.seq < 1) return
   switch (e.type) {
+    case 'started':
+      return typeof e.prompt === 'string' && typeof e.model === 'string' && Number.isSafeInteger(e.createdAt) ? e : undefined
     case 'text_delta':
     case 'thinking_delta':
       return typeof e.delta === 'string' ? e : undefined
@@ -47,6 +58,7 @@ function readEvent(data: unknown): RunEvent | undefined {
 export class RemoteTransport implements TransportAdapter {
   private token = ''
   private session: ServerSession | undefined
+  private initialQuota: ServerQuota | null = null
   private socket: WebSocket | undefined
   private connecting = false
   private logoutRequest?: Promise<void>
@@ -56,6 +68,7 @@ export class RemoteTransport implements TransportAdapter {
   private readonly responses = new Map<string, ReadableStreamDefaultController<RunEvent>>()
   private readonly lifetime = new AbortController()
   private devices: ServerDevice[] = []
+  private users: ServerDirectoryUser[] = []
   private chatList: ServerChat[] = []
   private indexedChats: IndexedCodexChat[] = []
   private refreshQueue: Promise<unknown> = Promise.resolve()
@@ -66,6 +79,7 @@ export class RemoteTransport implements TransportAdapter {
     this.address = normalizeServerAddress(address)
   }
 
+  get sessionQuota() { return this.initialQuota }
   get sessionToken() { return this.token }
   get connected() { return this.socket?.readyState === WebSocket.OPEN }
   get chats() { return [...this.chatList, ...this.indexedChats] }
@@ -79,16 +93,11 @@ export class RemoteTransport implements TransportAdapter {
   }
 
   readonly workspace: WorkspaceAdapter = {
-    login: async (request: LoginRequest) => {
-      const session = await this.request<ServerLoginResponse>('/api/auth/login', {
-        username: request.login, password: request.password, deviceName: request.deviceName,
-      })
-      return this.openSession(session, session.token)
-    },
+    login: request => this.authenticate(request, 'login'),
     logout: () => this.logoutRequest ??= this.logout(),
     createChat: (sourceId) => this.updateWorkspace(async () => {
-      if (sourceId) unavailable()
-      const chat = await this.request<ServerChat>('/api/chats', {})
+      const path = sourceId ? '/api/chats/' + encodeURIComponent(sourceId) + '/fork' : '/api/chats'
+      const chat = await this.request<ServerChat>(path, sourceId ? undefined : {}, undefined, 'POST')
       this.chatList = [chat, ...this.chatList]
       return { id: chat.id, workspace: this.snapshot() }
     }),
@@ -101,14 +110,29 @@ export class RemoteTransport implements TransportAdapter {
       }
       return this.loadDevices()
     }),
-    async setShare() { return unavailable() },
+    setShare: (chatId, userId, access, _trust) => this.updateWorkspace(async () => {
+      const path = '/api/chats/' + encodeURIComponent(chatId) + '/shares/' + encodeURIComponent(userId)
+      await this.request(path, access ? { access } : undefined, undefined, access ? 'PUT' : 'DELETE')
+      await this.loadChatsAndUsers()
+      return this.snapshot()
+    }),
   }
 
-  readonly admin: AdminAdapter = {
+  readonly admin: ServerAdminAdapter = {
     list: signal => this.request<AdminUser[]>('/api/admin/users', undefined, signal),
     create: user => this.request<AdminUser>('/api/admin/users', user),
     update: async (id, changes) => { await this.request('/api/admin/users/' + encodeURIComponent(id), changes, undefined, 'PATCH') },
+    chats: (id, signal) => this.request<AdminChat[]>('/api/admin/users/' + encodeURIComponent(id) + '/chats', undefined, signal),
+    messages: (id, chatId, signal) => this.request<ServerMessage[]>('/api/admin/users/' + encodeURIComponent(id) + '/chats/' + encodeURIComponent(chatId) + '/messages', undefined, signal),
     revokeDevices: async id => { await this.request('/api/admin/users/' + encodeURIComponent(id) + '/devices', undefined, undefined, 'DELETE') },
+  }
+
+  getProfile() {
+    return this.request<UserProfile>('/api/profile')
+  }
+
+  updateProfile(patch: UserProfilePatch) {
+    return this.request<UserProfile>('/api/profile', patch, undefined, 'PATCH')
   }
 
   subscribeAccount() { return () => {} }
@@ -134,6 +158,8 @@ export class RemoteTransport implements TransportAdapter {
         ? 'Неверный логин или пароль.'
         : response.status === 429 || detail.code === 'rate_limited' ? 'Слишком много попыток входа. Попробуйте позже.'
         : response.status === 401 ? 'Сессия закончилась. Войдите снова.'
+        : detail.code === 'account_pending' ? 'Аккаунт ожидает выдачи доступа.'
+        : detail.code === 'invalid_registration' ? 'Проверьте логин, пароль и название устройства.'
         : detail.code === 'account_inactive' ? 'Аккаунт заблокирован.'
         : detail.code === 'admin_required' ? 'Требуются права администратора.'
         : detail.code === 'username_taken' ? 'Этот логин уже занят.'
@@ -145,20 +171,50 @@ export class RemoteTransport implements TransportAdapter {
     return (response.status === 204 ? undefined : await response.json()) as T
   }
 
+  register(request: LoginRequest) {
+    return this.authenticate(request, 'register')
+  }
+
+  private async authenticate(request: LoginRequest, action: 'login' | 'register') {
+    const session = await this.request<ServerLoginResponse>('/api/auth/' + action, {
+      username: request.login, password: request.password, deviceName: request.deviceName,
+    })
+    return this.openSession(session, session.token)
+  }
+
   restore(token: string) {
     this.token = token
     return this.request<ServerSession>('/api/auth/me').then(session => this.openSession(session, token))
   }
 
+  async checkStatus() {
+    const session = await this.request<ServerSession>('/api/auth/me')
+    return this.openSession(session, this.token)
+  }
+
+  quota(signal?: AbortSignal) {
+    return this.request<ServerQuota>('/api/quotas/current', undefined, signal)
+  }
+
   private async openSession(session: ServerSession, token: string) {
     this.token = token
-    const [health, chats, devices] = await Promise.all([
+    if (session.user.role === 'pending') {
+      this.initialQuota = null
+      this.session = session
+      this.chatList = []
+      this.indexedChats = []
+      this.devices = [session.device]
+      this.users = []
+      return this.snapshot()
+    }
+    const [health, devices, quota] = await Promise.all([
       this.request<ServerHealth>('/api/health'),
-      this.request<ServerChat[]>('/api/chats'),
       this.request<ServerDevice[]>('/api/devices'),
+      this.quota().catch(() => null),
+      this.loadChatsAndUsers(),
     ])
+    this.initialQuota = quota
     this.provider = health.provider
-    this.chatList = chats
     this.devices = devices
     this.session = session
     return this.snapshot()
@@ -172,9 +228,18 @@ export class RemoteTransport implements TransportAdapter {
 
   refreshChats() {
     return this.updateWorkspace(async () => {
-      this.chatList = await this.request<ServerChat[]>('/api/chats')
+      await this.loadChatsAndUsers()
       return this.snapshot()
     })
+  }
+
+  private async loadChatsAndUsers() {
+    const [chats, users] = await Promise.all([
+      this.request<ServerChat[]>('/api/chats'),
+      this.request<ServerDirectoryUser[]>('/api/users'),
+    ])
+    this.chatList = chats
+    this.users = users
   }
 
   refreshDevices() {
@@ -211,12 +276,12 @@ export class RemoteTransport implements TransportAdapter {
     const deviceId = this.devices.find(entry => entry.isCurrent)?.id ?? device.id
     const member = { id: user.id, name: user.username, role: user.role ?? 'user', isActive: user.isActive ?? true }
     return {
-      user: member, deviceId, users: [member],
+      user: member, deviceId, users: [member, ...this.users.filter(u => u.id !== user.id).map(u => ({ id: u.id, name: u.username }))],
       devices: this.devices.map(entry => ({
         id: entry.id, ownerId: entry.userId, name: entry.name, online: entry.id === deviceId, lastSeenAt: entry.lastSeenAt,
       })),
-      chats: [...this.chatList.map(chat => access(chat, user.id)),
-        ...this.indexedChats.map(chat => ({ ...access(chat, user.id), access: 'read' as const }))],
+      chats: [...this.chatList.map(chat => chatAccess(chat, user.id)),
+        ...this.indexedChats.map(chat => ({ id: chat.id, ownerId: user.id, access: 'read' as const, grants: [] }))],
     }
   }
 
@@ -230,7 +295,7 @@ export class RemoteTransport implements TransportAdapter {
   }
 
   async connect() {
-    if (!this.session || this.socket || this.connecting || this.logoutRequest || this.lifetime.signal.aborted) return
+    if (!this.session || this.session.user.role === 'pending' || this.socket || this.connecting || this.logoutRequest || this.lifetime.signal.aborted) return
     clearTimeout(this.reconnectTimer)
     this.connecting = true
     let ticket: string
@@ -238,7 +303,8 @@ export class RemoteTransport implements TransportAdapter {
       ({ ticket } = await this.request<{ ticket: string }>('/api/ws/ticket', undefined, undefined, 'POST'))
       if (typeof ticket !== 'string' || !ticket) throw Error('Сервер не выдал тикет WebSocket.')
     } catch (error) {
-      if (!(error instanceof RemoteError && error.sessionExpired)) this.scheduleReconnect()
+      if (error instanceof RemoteError && error.code === 'account_pending') this.emit({ type: 'pending' })
+      else if (!(error instanceof RemoteError && error.sessionExpired)) this.scheduleReconnect()
       return
     } finally {
       this.connecting = false
@@ -262,15 +328,20 @@ export class RemoteTransport implements TransportAdapter {
       if (socket !== this.socket) return
       const event = readEvent(data)
       if (!event) return
+      if (event.type === 'workspace_changed') {
+        this.emit(event)
+        return
+      }
       const key = event.chatId + '/' + event.messageId
       const pending = this.responses.get(key)
-      pending?.enqueue(event)
+      if (pending) pending.enqueue(event)
+      else this.emit({ type: 'run', event })
       if (event.type === 'done' || event.type === 'error') {
         if (pending) {
           this.responses.delete(key)
           pending.close()
         }
-        if (event.type === 'done' || pending) this.emit({ type: 'settled', chatId: event.chatId })
+        if (event.type === 'done' || pending || event.seq > 1) this.emit({ type: 'settled', chatId: event.chatId })
       }
     }
     socket.onclose = () => {
@@ -312,6 +383,7 @@ export class RemoteTransport implements TransportAdapter {
     this.token = ''
     this.session = undefined
     this.devices = []
+    this.users = []
     this.chatList = []
     this.indexedChats = []
     this.failStreams(new DOMException('Сессия закрыта.', 'AbortError'))

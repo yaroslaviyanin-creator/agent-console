@@ -34,8 +34,8 @@ func TestParseCodexJSONL(t *testing.T) {
 			if err != nil || result.Type != tc.terminal || !reflect.DeepEqual(events, tc.events) {
 				t.Fatalf("events=%#v terminal=%#v error=%v", events, result, err)
 			}
-			if tc.terminal == Done && result.SessionID != testSessionID {
-				t.Fatal("missing resume ID")
+			if tc.terminal == Done && (result.SessionID != testSessionID || result.Usage == nil || *result.Usage != (Usage{InputTokens: 10, CachedInputTokens: 4, OutputTokens: 3})) {
+				t.Fatalf("resume ID or usage missing: %+v", result)
 			}
 			if tc.terminal == Error && result.Err == nil {
 				t.Fatal("missing provider error")

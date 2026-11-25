@@ -1,16 +1,18 @@
 import { create } from 'zustand'
-import type { AccountEvent, Provider } from '../protocol/types'
+import type { AccountEvent, Provider, ServerQuota } from '../protocol/types'
 
 type Quota = Extract<AccountEvent, { type: 'quota_update' }>
 type TransferRequest = Extract<AccountEvent, { type: 'quota_transfer_request' }>
 
 interface AccountState {
+  serverQuota: ServerQuota | null
   quotas: Partial<Record<Provider, Quota>>
   requests: TransferRequest[]
   receive: (event: AccountEvent) => void
 }
 
 export const useAccountStore = create<AccountState>(set => ({
+  serverQuota: null,
   quotas: {},
   requests: [],
   receive: event => set(state => event.type === 'quota_update'
