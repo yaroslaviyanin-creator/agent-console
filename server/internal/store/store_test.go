@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -17,7 +18,11 @@ import (
 
 func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "nested", "test db?.db")
+	fileName := "test db?.db"
+	if runtime.GOOS == "windows" {
+		fileName = "test db%3F.db"
+	}
+	path := filepath.Join(t.TempDir(), "nested", fileName)
 	db, err := Open(ctx, path)
 	if err != nil {
 		t.Fatal(err)

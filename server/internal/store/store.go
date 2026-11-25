@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -95,7 +96,11 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		if err != nil {
 			return nil, err
 		}
-		dsn = (&url.URL{Scheme: "file", Path: filepath.ToSlash(absolute)}).String()
+		p := filepath.ToSlash(absolute)
+		if !strings.HasPrefix(p, "/") {
+			p = "/" + p
+		}
+		dsn = (&url.URL{Scheme: "file", Path: p}).String()
 	}
 	dsn += "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 	if path != ":memory:" {
