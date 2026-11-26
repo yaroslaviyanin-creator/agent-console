@@ -63,21 +63,31 @@ func checkRunAccess(ctx context.Context, tx *sql.Tx, userID, deviceID string, no
 
 // BeginRun verifies write access and reserves the client message ID durably before calling the provider.
 func (s *Store) BeginRun(ctx context.Context, userID, chatID, messageID, prompt, backend, model string) (string, error) {
-	return s.beginRun(ctx, userID, "", chatID, messageID, prompt, backend, model)
+	sessionID, _, err := s.beginRun(ctx, userID, "", chatID, messageID, prompt, backend, model, nil)
+	return sessionID, err
 }
 
 // BeginRunForDevice checks current access and the available quota in one transaction.
 func (s *Store) BeginRunForDevice(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string) (string, error) {
-	return s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model)
+	sessionID, _, err := s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, nil)
+	return sessionID, err
 }
 
-func (s *Store) beginRun(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string) (string, error) {
+// BeginRunForDeviceWithAttachments checks access, quota, and atomically binds uploaded attachments to the user message.
+func (s *Store) BeginRunForDeviceWithAttachments(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string, attachmentIDs []string) (string, []Attachment, error) {
+	return s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, attachmentIDs)
+}
+
+func (s *Store) beginRun(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string, attachmentIDs []string) (string, []Attachment, error) {
 	if !isRunnableProvider(backend) {
-		return "", ErrProviderUnavailable
+		return "", nil, ErrProviderUnavailable
+	}
+	if len(attachmentIDs) > 5 {
+		return "", nil, ErrInvalidAttachments
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer tx.Rollback()
 
@@ -85,48 +95,92 @@ func (s *Store) beginRun(ctx context.Context, userID, deviceID, chatID, messageI
 	var session sql.NullString
 	if err := tx.QueryRowContext(ctx, `SELECT provider, CASE WHEN session_provider='' THEN provider ELSE session_provider END, provider_session_id FROM chats c WHERE `+chatWriteAccess,
 		chatID, userID).Scan(&previousBackend, &sessionProvider, &session); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	now := time.Now()
 	if deviceID != "" {
 		if err := checkRunAccess(ctx, tx, userID, deviceID, now); err != nil {
-			return "", err
+			return "", nil, err
 		}
 	}
+
+	var attached []Attachment
+	if len(attachmentIDs) > 0 {
+		seen := make(map[string]bool, len(attachmentIDs))
+		for _, attID := range attachmentIDs {
+			if attID == "" || seen[attID] {
+				return "", nil, ErrInvalidAttachments
+			}
+			seen[attID] = true
+			var att Attachment
+			var extracted sql.NullString
+			err := tx.QueryRowContext(ctx, `SELECT id,chat_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,created_at
+				FROM chat_attachments WHERE id=? AND chat_id=? AND user_id=? AND message_id IS NULL`,
+				attID, chatID, userID).
+				Scan(&att.ID, &att.ChatID, &att.UserID, &att.OriginalName, &att.MIMEType, &att.Kind, &att.SizeBytes, &att.SHA256, &att.StorageKey, &extracted, &att.CreatedAt)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return "", nil, ErrInvalidAttachments
+				}
+				return "", nil, err
+			}
+			att.ExtractedText = extracted.String
+			att.URL = "/api/attachments/" + att.ID
+			attached = append(attached, att)
+		}
+	}
+
+	userMsgID := randomHex(16)
 	result, err := tx.ExecContext(ctx, `INSERT INTO chat_messages (id,chat_id,role,content,created_at,run_id,run_user_id,memory_private)
 		VALUES (?,?,'user',?,?,?,?,NOT EXISTS(SELECT 1 FROM chat_shares WHERE chat_id=?)) ON CONFLICT(chat_id,role,run_id) DO NOTHING`,
-		randomHex(16), chatID, prompt, now.UnixMilli(), messageID, userID, chatID)
+		userMsgID, chatID, prompt, now.UnixMilli(), messageID, userID, chatID)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	count, err := result.RowsAffected()
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if count == 0 {
-		return "", ErrDuplicateRun
+		return "", nil, ErrDuplicateRun
+	}
+	for i := range attached {
+		res, err := tx.ExecContext(ctx, `UPDATE chat_attachments SET message_id=? WHERE id=? AND chat_id=? AND user_id=? AND message_id IS NULL`,
+			userMsgID, attached[i].ID, chatID, userID)
+		if err != nil {
+			return "", nil, err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return "", nil, ErrInvalidAttachments
+		}
+		attached[i].MessageID = userMsgID
+	}
+
+	titleSeed := prompt
+	if titleSeed == "" && len(attached) > 0 {
+		titleSeed = attached[0].OriginalName
 	}
 	if backend == previousBackend {
 		if _, err := tx.ExecContext(ctx, `UPDATE chats SET model=?,updated_at=MAX(updated_at,?),
 			title=CASE WHEN title='Новый чат' THEN substr(?,1,80) ELSE title END WHERE id=?`,
-			model, now.UnixMilli(), prompt, chatID); err != nil {
-			return "", err
+			model, now.UnixMilli(), titleSeed, chatID); err != nil {
+			return "", nil, err
 		}
 	} else {
 		if _, err := tx.ExecContext(ctx, `UPDATE chats SET updated_at=MAX(updated_at,?),
 			title=CASE WHEN title='Новый чат' THEN substr(?,1,80) ELSE title END WHERE id=?`,
-			now.UnixMilli(), prompt, chatID); err != nil {
-			return "", err
+			now.UnixMilli(), titleSeed, chatID); err != nil {
+			return "", nil, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if backend != sessionProvider {
-		return "", nil
+		return "", attached, nil
 	}
-	return session.String, nil
+	return session.String, attached, nil
 }
 
 // FinishRun publishes a durable reply and resume session in a single transaction.

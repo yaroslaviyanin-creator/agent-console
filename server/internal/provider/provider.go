@@ -2,8 +2,18 @@ package provider
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 )
+
+var ErrUnsupportedImageAttachments = errors.New("provider does not support image attachments in safe chat mode")
+
+type ImageAttachment struct {
+	Name     string
+	MIMEType string
+	Data     []byte
+}
 
 type Request struct {
 	UserID             string
@@ -13,6 +23,7 @@ type Request struct {
 	SessionID          string
 	SystemInstructions string
 	Ephemeral          bool
+	Images             []ImageAttachment
 }
 
 type Usage struct {
@@ -61,10 +72,14 @@ func (p StubProvider) Stream(ctx context.Context, req Request) (<-chan Event, er
 			send(ctx, out, Event{Type: Done})
 			return
 		}
+		imageNote := ""
+		if len(req.Images) > 0 {
+			imageNote = fmt.Sprintf(" [изображений: %d]", len(req.Images))
+		}
 		for _, event := range []Event{
 			{Type: Thinking, Delta: "Готовлю демо-ответ."},
 			{Type: Text, Delta: "Получен запрос: "},
-			{Type: Text, Delta: req.Prompt},
+			{Type: Text, Delta: req.Prompt + imageNote},
 			{Type: Text, Delta: "\n\nОтвет от StubProvider."},
 			{Type: Done, Usage: &Usage{InputTokens: max(1, int64(len(req.Prompt)/4)), OutputTokens: 40}},
 		} {

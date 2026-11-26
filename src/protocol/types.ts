@@ -14,6 +14,8 @@ export interface RunRequest {
   reasoning?: string
   target: Target
   prompt: string
+  attachmentIds?: string[]
+  attachments?: MessageAttachment[]
 }
 
 export type DiffLine = { kind: 'context' | 'remove' | 'add'; text: string }
@@ -27,7 +29,7 @@ export type ToolCall =
 export type PermissionDecision = 'allow' | 'allow_folder' | 'deny'
 
 type RunPayload =
-  | { type: 'started'; prompt: string; model: string; createdAt: number }
+  | { type: 'started'; prompt: string; attachments?: MessageAttachment[]; model: string; createdAt: number }
   | { type: 'thinking_delta' | 'text_delta'; delta: string }
   | { type: 'tool_use'; callId: string; tool: ToolCall }
   | { type: 'permission_request'; requestId: string; callId: string; folder: string; deviceId: string; tool: ToolCall }
@@ -190,8 +192,12 @@ export interface ServerChat {
 export interface AdminChat extends ServerChat { messagesCount: number }
 export interface IndexedCodexChat extends ServerChat { archived: boolean }
 export interface MessageAttachment {
-  kind: 'file' | 'image'
+  id?: string
+  kind: 'file' | 'image' | 'text' | 'pdf' | 'archive'
   name: string
+  mimeType?: string
+  sizeBytes?: number
+  url?: string
   path?: string
 }
 export interface ServerMessage {

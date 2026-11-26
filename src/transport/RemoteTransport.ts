@@ -1,5 +1,5 @@
 import type {
-  AccountingAdapter, AdminChat, AdminUser, ChatAccess, ServerAdminAdapter, IndexedCodexChat, LoginRequest, RunEvent, RunRequest, ServerChat, ServerCreateChatRequest, ServerError, ServerHealth,
+  AccountingAdapter, AdminChat, AdminUser, ChatAccess, ServerAdminAdapter, IndexedCodexChat, LoginRequest, MessageAttachment, RunEvent, RunRequest, ServerChat, ServerCreateChatRequest, ServerError, ServerHealth,
   ServerDevice, ServerDirectoryUser, ServerLoginResponse, ServerMessage, ServerModel, ServerProvider, ServerProviderInfo, ServerProvidersResponse, ServerQuota, ServerSession, TransportAdapter, UserProfile, UserProfilePatch, Workspace, WorkspaceAdapter,
 } from '../protocol/types'
 
@@ -57,7 +57,9 @@ function readEvent(data: unknown): RunEvent | { type: 'workspace_changed' } | un
   if (!e || typeof e.chatId !== 'string' || typeof e.messageId !== 'string' || !Number.isSafeInteger(e.seq) || e.seq < 1) return
   switch (e.type) {
     case 'started':
-      return typeof e.prompt === 'string' && typeof e.model === 'string' && Number.isSafeInteger(e.createdAt) ? e : undefined
+      return typeof e.prompt === 'string' && typeof e.model === 'string' && Number.isSafeInteger(e.createdAt)
+        ? { ...e, ...(Array.isArray(e.attachments) ? { attachments: e.attachments } : {}) }
+        : undefined
     case 'text_delta':
     case 'thinking_delta':
       return typeof e.delta === 'string' ? e : undefined
@@ -162,6 +164,79 @@ export class RemoteTransport implements TransportAdapter {
 
   subscribeAccount() { return () => {} }
   respondToPermission() { return false }
+
+  async uploadAttachments(chatId: string, files: File[], signal?: AbortSignal): Promise<MessageAttachment[]> {
+    const form = new FormData()
+    for (const file of files) {
+      form.append('files', file, file.name)
+    }
+    const headers = new Headers()
+    if (this.token) headers.set('Authorization', 'Bearer ' + this.token)
+    let response: Response
+    try {
+      response = await fetch(this.address + '/api/chats/' + encodeURIComponent(chatId) + '/attachments', {
+        method: 'POST',
+        headers,
+        body: form,
+        signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]),
+        cache: 'no-store',
+        redirect: 'error',
+      })
+    } catch {
+      throw Error('Нет связи с сервером при загрузке файла.')
+    }
+    if (!response.ok) {
+      const detail: Partial<ServerError> = await response.json().catch(() => ({})) ?? {}
+      const message = response.status === 429 || detail.code === 'rate_limited'
+        ? 'Слишком много загрузок. Попробуйте позже.'
+        : response.status === 413
+          ? 'Размер загрузки превышает допустимый лимит (12 МБ).'
+          : response.status === 401
+            ? 'Сессия закончилась. Войдите снова.'
+            : detail.message ?? 'Не удалось загрузить файл.'
+      const error = new RemoteError(response.status, message, detail.code)
+      if (error.sessionExpired && this.session) this.emit({ type: 'expired' })
+      throw error
+    }
+    const body = await response.json() as { attachments?: MessageAttachment[] }
+    return body.attachments ?? []
+  }
+
+  deleteAttachment(attachmentId: string) {
+    return this.request<void>('/api/attachments/' + encodeURIComponent(attachmentId), undefined, undefined, 'DELETE')
+  }
+
+  async fetchAttachmentBlobUrl(urlPath: string, signal?: AbortSignal): Promise<string> {
+    const headers = new Headers()
+    if (this.token) headers.set('Authorization', 'Bearer ' + this.token)
+    const response = await fetch(this.address + urlPath, {
+      headers,
+      signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(20_000), ...(signal ? [signal] : [])]),
+      cache: 'no-store',
+      redirect: 'error',
+    })
+    if (!response.ok) {
+      throw new RemoteError(response.status, 'Не удалось загрузить вложение.')
+    }
+    const blob = await response.blob()
+    return URL.createObjectURL(blob)
+  }
+
+  async downloadAttachment(att: MessageAttachment): Promise<void> {
+    if (!att.url) return
+    const sep = att.url.includes('?') ? '&' : '?'
+    const blobUrl = await this.fetchAttachmentBlobUrl(att.url + sep + 'download=1')
+    try {
+      const a = document.createElement('a')
+      a.href = blobUrl
+      a.download = att.name || 'attachment'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 1000)
+    }
+  }
 
   private async request<T>(path: string, body?: object, signal?: AbortSignal, method = body ? 'POST' : 'GET') {
     const headers = new Headers()
@@ -474,7 +549,7 @@ export class RemoteTransport implements TransportAdapter {
         this.responses.set(key, controller)
         try {
           // SQLite history is authoritative in server mode.
-          const { chatId, messageId, provider, model, target, prompt, reasoning } = request
+          const { chatId, messageId, provider, model, target, prompt, reasoning, attachmentIds } = request
           socket.send(JSON.stringify({
             chatId,
             messageId,
@@ -482,6 +557,7 @@ export class RemoteTransport implements TransportAdapter {
             model,
             target,
             prompt,
+            ...(attachmentIds?.length ? { attachmentIds } : {}),
             ...(reasoning ? { reasoning } : {}),
           }))
         } catch (error) {

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"agent-console/server/internal/provider"
+	"agent-console/server/internal/uploads"
 )
 
 func TestMigrationsAndHashedDeviceToken(t *testing.T) {
@@ -68,7 +70,7 @@ func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 		t.Fatalf("auth after reopening DB failed: %v", err)
 	}
 	var version int
-	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 15 {
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 16 {
 		t.Fatalf("schema version %d: %v", version, err)
 	}
 	if currentDevice.LastSeenAt != device.LastSeenAt {
@@ -720,5 +722,89 @@ func TestMigrationV14SanitizesStoredAvatars(t *testing.T) {
 	p2, err := reopened.UserProfile(ctx, u2.ID)
 	if err != nil || (!strings.HasPrefix(p2.AvatarData, "data:image/jpeg;base64,") && !strings.HasPrefix(p2.AvatarData, "data:image/png;base64,")) {
 		t.Fatalf("expected legacy webp avatar to be re-encoded on v15 migration, got %q (%v)", p2.AvatarData, err)
+	}
+}
+
+func TestAttachmentStoreLifecycleAndCleanup(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "att.db")
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	owner, err := db.CreateUserWithRole(ctx, "owner", []byte("h"), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger, err := db.CreateUserWithRole(ctx, "stranger", []byte("h"), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat, err := db.CreateChat(ctx, owner.ID, "Files", "codex", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	att, err := db.CreateAttachment(ctx, chat.ID, owner.ID, uploads.ValidatedAttachment{
+		Filename:      "index.html",
+		MIMEType:      "text/plain; charset=utf-8",
+		Kind:          uploads.KindText,
+		Size:          12,
+		Data:          []byte("<h1>Hi</h1>\n"),
+		ExtractedText: "<h1>Hi</h1>\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskPath := filepath.Join(db.UploadsDir(), att.StorageKey)
+	if info, err := os.Stat(diskPath); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("unexpected file permissions/stat on %s: %v", diskPath, err)
+	}
+
+	if _, err := db.GetAttachment(ctx, stranger.ID, att.ID); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("expected ErrForbidden for stranger, got %v", err)
+	}
+	if err := db.DeleteUnattachedAttachment(ctx, stranger.ID, att.ID); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("expected ErrForbidden deleting stranger upload, got %v", err)
+	}
+
+	// Binding attachment to a message protects it from DeleteUnattachedAttachment.
+	if _, attached, err := db.BeginRunForDeviceWithAttachments(ctx, owner.ID, "", chat.ID, "run-1", "Check file", "codex", "default", []string{att.ID}); err != nil || len(attached) != 1 {
+		t.Fatalf("BeginRunForDeviceWithAttachments failed: %v (%d)", err, len(attached))
+	}
+	if err := db.DeleteUnattachedAttachment(ctx, owner.ID, att.ID); !errors.Is(err, ErrAttachmentInUse) {
+		t.Fatalf("expected ErrAttachmentInUse, got %v", err)
+	}
+	msgs, err := db.Messages(ctx, owner.ID, chat.ID)
+	if err != nil || len(msgs) != 1 || len(msgs[0].Attachments) != 1 || msgs[0].Attachments[0].Name != "index.html" {
+		t.Fatalf("unexpected message attachments: %+v (%v)", msgs, err)
+	}
+
+	// Orphan cleanup removes unattached uploads older than maxAge.
+	orphan, err := db.CreateAttachment(ctx, chat.ID, owner.ID, uploads.ValidatedAttachment{
+		Filename: "old.txt", MIMEType: "text/plain; charset=utf-8", Kind: uploads.KindText, Size: 3, Data: []byte("old"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, "UPDATE chat_attachments SET created_at=? WHERE id=?", time.Now().Add(-3*time.Hour).UnixMilli(), orphan.ID); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := db.CleanupOrphanAttachments(ctx, 2*time.Hour)
+	if err != nil || removed != 1 {
+		t.Fatalf("CleanupOrphanAttachments removed=%d err=%v", removed, err)
+	}
+	if _, err := os.Stat(filepath.Join(db.UploadsDir(), orphan.StorageKey)); !os.IsNotExist(err) {
+		t.Fatalf("expected orphan disk file removed, got %v", err)
+	}
+
+	// Deleting chat removes remaining bound files from disk.
+	if err := db.DeleteChat(ctx, owner.ID, chat.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(diskPath); !os.IsNotExist(err) {
+		t.Fatalf("expected bound attachment file removed on DeleteChat, got %v", err)
 	}
 }

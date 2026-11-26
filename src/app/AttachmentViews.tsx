@@ -1,0 +1,214 @@
+import { useEffect, useRef, useState } from 'react'
+import { Download, FileArchive, FileCode, FileText, Image as ImageIcon, LoaderCircle, Paperclip, X } from 'lucide-react'
+import type { MessageAttachment } from '../protocol/types'
+import type { RemoteTransport } from '../transport/RemoteTransport'
+import { type DraftAttachment, formatAttachmentSize, isRenderableImageAttachment } from './attachments'
+
+function attachmentFileIcon(att: Pick<MessageAttachment, 'kind' | 'name'>) {
+  if (att.kind === 'archive' || att.name.toLowerCase().endsWith('.zip')) return FileArchive
+  if (att.kind === 'pdf' || att.name.toLowerCase().endsWith('.pdf')) return FileText
+  if (att.kind === 'text') return FileCode
+  return Paperclip
+}
+
+function AuthenticatedImage({
+  att,
+  remote,
+  onPreview,
+}: {
+  att: MessageAttachment
+  remote: RemoteTransport | null
+  onPreview: (src: string, name: string) => void
+}) {
+  const [blobUrl, setBlobUrl] = useState<string>('')
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    if (!remote || !att.url) return
+    const controller = new AbortController()
+    let objectUrl = ''
+    void remote.fetchAttachmentBlobUrl(att.url, controller.signal).then(url => {
+      objectUrl = url
+      setBlobUrl(url)
+    }).catch(() => {
+      if (!controller.signal.aborted) setFailed(true)
+    })
+    return () => {
+      controller.abort()
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [remote, att.url])
+
+  if (failed || !att.url || !remote) {
+    return (
+      <span className="att-image-fallback" title={att.name}>
+        <ImageIcon size={14} aria-hidden="true" />
+        <span>{att.name}</span>
+      </span>
+    )
+  }
+  if (!blobUrl) {
+    return (
+      <span className="att-image-loading" aria-label={`Загрузка ${att.name}`}>
+        <LoaderCircle size={15} className="att-spin" aria-hidden="true" />
+      </span>
+    )
+  }
+  return (
+    <button
+      type="button"
+      className="att-image-thumb-btn"
+      onClick={() => onPreview(blobUrl, att.name)}
+      title={`Открыть ${att.name}`}
+    >
+      <img src={blobUrl} alt={att.name} className="att-image-thumb" />
+    </button>
+  )
+}
+
+export function TurnAttachments({
+  attachments,
+  remote,
+}: {
+  attachments: MessageAttachment[]
+  remote: RemoteTransport | null
+}) {
+  const [lightbox, setLightbox] = useState<{ src: string; name: string } | null>(null)
+  const dialogRef = useRef<HTMLDialogElement>(null)
+
+  useEffect(() => {
+    const dialog = dialogRef.current
+    if (!dialog) return
+    if (lightbox && !dialog.open) dialog.showModal()
+    if (!lightbox && dialog.open) dialog.close()
+  }, [lightbox])
+
+  const images = attachments.filter(att => isRenderableImageAttachment(att) && !!att.url)
+  const files = attachments.filter(att => !(isRenderableImageAttachment(att) && !!att.url))
+
+  return (
+    <>
+      {images.length > 0 && (
+        <div className="message-image-grid" aria-label="Прикреплённые изображения">
+          {images.map((att, index) => (
+            <AuthenticatedImage
+              key={att.id ?? `${att.name}-${index}`}
+              att={att}
+              remote={remote}
+              onPreview={(src, name) => setLightbox({ src, name })}
+            />
+          ))}
+        </div>
+      )}
+      {files.length > 0 && (
+        <ul className="message-attachments" aria-label="Вложения">
+          {files.map((att, index) => {
+            const Icon = att.kind === 'image' ? ImageIcon : attachmentFileIcon(att)
+            const sizeLabel = formatAttachmentSize(att.sizeBytes)
+            return (
+              <li key={att.id ?? `${att.name}-${index}`} title={att.name}>
+                <Icon size={14} aria-hidden="true" />
+                <span className="att-file-name">{att.name}</span>
+                {sizeLabel && <small className="att-file-size">{sizeLabel}</small>}
+                {att.url && remote && (
+                  <button
+                    type="button"
+                    className="att-download-btn"
+                    aria-label={`Скачать ${att.name}`}
+                    title={`Скачать ${att.name}`}
+                    onClick={() => { void remote.downloadAttachment(att) }}
+                  >
+                    <Download size={13} aria-hidden="true" />
+                  </button>
+                )}
+              </li>
+            )
+          })}
+        </ul>
+      )}
+      <dialog
+        ref={dialogRef}
+        className="att-lightbox"
+        aria-label={lightbox?.name ?? 'Просмотр изображения'}
+        onCancel={() => setLightbox(null)}
+        onClick={e => { if (e.target === dialogRef.current) setLightbox(null) }}
+      >
+        {lightbox && (
+          <div className="att-lightbox-inner">
+            <div className="att-lightbox-head">
+              <span>{lightbox.name}</span>
+              <button type="button" className="icon-btn" aria-label="Закрыть" onClick={() => setLightbox(null)}>
+                <X size={18} />
+              </button>
+            </div>
+            <img src={lightbox.src} alt={lightbox.name} className="att-lightbox-img" />
+          </div>
+        )}
+      </dialog>
+    </>
+  )
+}
+
+export function DraftAttachmentsBar({
+  attachments,
+  error,
+  disabled,
+  onRemove,
+  onDismissError,
+}: {
+  attachments: DraftAttachment[]
+  error?: string | undefined
+  disabled: boolean
+  onRemove: (localId: string) => void
+  onDismissError: () => void
+}) {
+  if (attachments.length === 0 && !error) return null
+  return (
+    <div className="composer-attachments-wrap">
+      {error && (
+        <div className="composer-attachment-error" role="alert">
+          <span>{error}</span>
+          <button type="button" className="icon-btn" aria-label="Скрыть ошибку" onClick={onDismissError}>
+            <X size={13} />
+          </button>
+        </div>
+      )}
+      {attachments.length > 0 && (
+        <ul className="composer-attachments" aria-label="Прикреплённые файлы">
+          {attachments.map(att => {
+            const Icon = attachmentFileIcon(att)
+            const sizeLabel = formatAttachmentSize(att.sizeBytes)
+            return (
+              <li key={att.localId} className={`composer-att-chip is-${att.status}`}>
+                {att.kind === 'image' && att.previewUrl ? (
+                  <img src={att.previewUrl} alt={att.name} className="composer-att-thumb" />
+                ) : (
+                  <span className="composer-att-icon">
+                    {att.status === 'uploading'
+                      ? <LoaderCircle size={14} className="att-spin" aria-hidden="true" />
+                      : <Icon size={14} aria-hidden="true" />}
+                  </span>
+                )}
+                <span className="composer-att-meta">
+                  <strong title={att.name}>{att.name}</strong>
+                  <small>
+                    {att.status === 'uploading' ? 'Загрузка…' : sizeLabel}
+                  </small>
+                </span>
+                <button
+                  type="button"
+                  className="composer-att-remove"
+                  disabled={disabled}
+                  aria-label={`Убрать ${att.name}`}
+                  onClick={() => onRemove(att.localId)}
+                >
+                  <X size={13} />
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </div>
+  )
+}

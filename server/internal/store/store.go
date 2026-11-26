@@ -22,7 +22,11 @@ import (
 //go:embed schema.sql
 var initialSchema string
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db            *sql.DB
+	uploadsDir    string
+	ownUploadsDir bool
+}
 
 type User struct {
 	ID          string `json:"id"`
@@ -61,15 +65,16 @@ type Chat struct {
 }
 
 type Message struct {
-	Progress   string `json:"progress,omitempty"`
-	DurationMs *int64 `json:"durationMs,omitempty"`
-	RunID      string `json:"runId,omitempty"`
-	ID         string `json:"id"`
-	ChatID     string `json:"chatId"`
-	Role       string `json:"role"`
-	Content    string `json:"content"`
-	Thinking   string `json:"thinking"`
-	CreatedAt  int64  `json:"createdAt"`
+	Attachments []MessageAttachment `json:"attachments,omitempty"`
+	Progress    string              `json:"progress,omitempty"`
+	DurationMs  *int64              `json:"durationMs,omitempty"`
+	RunID       string              `json:"runId,omitempty"`
+	ID          string              `json:"id"`
+	ChatID      string              `json:"chatId"`
+	Role        string              `json:"role"`
+	Content     string              `json:"content"`
+	Thinking    string              `json:"thinking"`
+	CreatedAt   int64               `json:"createdAt"`
 }
 
 func randomHex(n int) string {
@@ -115,15 +120,41 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db}
+	var uploadsDir string
+	var ownUploadsDir bool
+	if path == ":memory:" {
+		uploadsDir, err = os.MkdirTemp("", "agent-console-uploads-*")
+		if err != nil {
+			db.Close()
+			return nil, err
+		}
+		ownUploadsDir = true
+	} else {
+		uploadsDir = filepath.Join(filepath.Dir(path), "uploads")
+		if err := os.MkdirAll(uploadsDir, 0700); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	s := &Store{db: db, uploadsDir: uploadsDir, ownUploadsDir: ownUploadsDir}
 	if err := s.migrate(ctx); err != nil {
-		db.Close()
+		_ = s.Close()
 		return nil, fmt.Errorf("migrate SQLite: %w", err)
 	}
 	return s, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.ownUploadsDir && s.uploadsDir != "" {
+		_ = os.RemoveAll(s.uploadsDir)
+	}
+	return err
+}
+
+func (s *Store) UploadsDir() string {
+	return s.uploadsDir
+}
 
 func (s *Store) migrate(ctx context.Context) error {
 	conn, err := s.db.Conn(ctx)
@@ -135,7 +166,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version == 15 {
+	if version == 16 {
 		return nil
 	}
 	// SQLite requires disabling foreign keys outside the transaction on this connection.
@@ -152,7 +183,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	switch version {
 	case 0:
-		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=15;"); err != nil {
+		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=16;"); err != nil {
 			return err
 		}
 	case 1:
@@ -386,7 +417,29 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=15;`); err != nil {
 			return err
 		}
+		fallthrough
 	case 15:
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS chat_attachments (
+			id TEXT PRIMARY KEY,
+			chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+			message_id TEXT REFERENCES chat_messages(id) ON DELETE CASCADE,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			original_name TEXT NOT NULL,
+			mime_type TEXT NOT NULL,
+			kind TEXT NOT NULL CHECK (kind IN ('image', 'text', 'pdf', 'archive')),
+			size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+			sha256 TEXT NOT NULL,
+			storage_key TEXT NOT NULL UNIQUE,
+			extracted_text TEXT,
+			created_at INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS chat_attachments_by_chat ON chat_attachments (chat_id, created_at);
+		CREATE INDEX IF NOT EXISTS chat_attachments_by_message ON chat_attachments (message_id);
+		CREATE INDEX IF NOT EXISTS chat_attachments_orphans ON chat_attachments (created_at) WHERE message_id IS NULL;
+		PRAGMA user_version=16;`); err != nil {
+			return err
+		}
+	case 16:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}
@@ -711,6 +764,19 @@ func (s *Store) messages(ctx context.Context, userID, chatID string, includeShar
 	}
 	if !found {
 		return nil, sql.ErrNoRows
+	}
+	if len(messages) > 0 {
+		byMessage, err := s.messageAttachmentsForChat(ctx, chatID)
+		if err != nil {
+			return nil, err
+		}
+		for i := range messages {
+			if messages[i].Role == "user" {
+				if atts := byMessage[messages[i].ID]; len(atts) > 0 {
+					messages[i].Attachments = atts
+				}
+			}
+		}
 	}
 	return messages, nil
 }

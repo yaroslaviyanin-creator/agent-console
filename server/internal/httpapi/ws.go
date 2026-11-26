@@ -18,17 +18,19 @@ import (
 
 	"agent-console/server/internal/provider"
 	"agent-console/server/internal/store"
+	"agent-console/server/internal/uploads"
 	"github.com/gorilla/websocket"
 )
 
 // Direct RunRequest and RunEvent frames use the same field names as src/protocol/types.ts.
 type runRequest struct {
-	ChatID    string `json:"chatId"`
-	MessageID string `json:"messageId"`
-	Prompt    string `json:"prompt"`
-	Reasoning string `json:"reasoning,omitempty"`
-	Provider  string `json:"provider,omitempty"`
-	Model     struct {
+	ChatID        string   `json:"chatId"`
+	MessageID     string   `json:"messageId"`
+	Prompt        string   `json:"prompt"`
+	AttachmentIDs []string `json:"attachmentIds,omitempty"`
+	Reasoning     string   `json:"reasoning,omitempty"`
+	Provider      string   `json:"provider,omitempty"`
+	Model         struct {
 		Provider string `json:"provider"`
 		ID       string `json:"id"`
 	} `json:"model"`
@@ -39,19 +41,20 @@ type runRequest struct {
 }
 
 type runEvent struct {
-	ChatID     string `json:"chatId"`
-	MessageID  string `json:"messageId"`
-	Seq        int    `json:"seq"`
-	Type       string `json:"type"`
-	Prompt     string `json:"prompt,omitempty"`
-	Model      string `json:"model,omitempty"`
-	CreatedAt  int64  `json:"createdAt,omitempty"`
-	Delta      string `json:"delta,omitempty"`
-	Reason     string `json:"reason,omitempty"`
-	DurationMs *int64 `json:"durationMs,omitempty"`
-	Code       string `json:"code,omitempty"`
-	Message    string `json:"message,omitempty"`
-	Retryable  *bool  `json:"retryable,omitempty"`
+	ChatID      string                    `json:"chatId"`
+	MessageID   string                    `json:"messageId"`
+	Seq         int                       `json:"seq"`
+	Type        string                    `json:"type"`
+	Prompt      string                    `json:"prompt,omitempty"`
+	Attachments []store.MessageAttachment `json:"attachments,omitempty"`
+	Model       string                    `json:"model,omitempty"`
+	CreatedAt   int64                     `json:"createdAt,omitempty"`
+	Delta       string                    `json:"delta,omitempty"`
+	Reason      string                    `json:"reason,omitempty"`
+	DurationMs  *int64                    `json:"durationMs,omitempty"`
+	Code        string                    `json:"code,omitempty"`
+	Message     string                    `json:"message,omitempty"`
+	Retryable   *bool                     `json:"retryable,omitempty"`
 }
 
 const (
@@ -372,10 +375,18 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 		enqueue(client, req.failure(1, code, message, retryable))
 	}
 	req.Prompt = strings.TrimSpace(req.Prompt)
-	if req.Target.Mode != "chat" || req.RetryOf != "" || len(req.Prompt) > 32<<10 || req.Prompt == "" ||
+	if req.Target.Mode != "chat" || req.RetryOf != "" || len(req.Prompt) > 32<<10 ||
+		(req.Prompt == "" && len(req.AttachmentIDs) == 0) ||
+		len(req.AttachmentIDs) > 5 ||
 		strings.ContainsRune(req.Prompt, 0) || !modelID.MatchString(req.Model.ID) {
 		reject("invalid_request", "Send a message in chat mode with a valid model.", false)
 		return
+	}
+	for _, attID := range req.AttachmentIDs {
+		if !correlationID.MatchString(attID) {
+			reject("invalid_request", "Invalid attachment ID.", false)
+			return
+		}
 	}
 	if req.Reasoning != "" {
 		switch strings.ToLower(strings.TrimSpace(req.Reasoning)) {
@@ -452,6 +463,8 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 			reject("provider_mismatch", "Selected model provider does not match this chat's provider.", false)
 		case errors.Is(err, store.ErrDuplicateRun):
 			reject("duplicate_run", "This message ID has already been used.", false)
+		case errors.Is(err, store.ErrInvalidAttachments):
+			reject("invalid_attachments", "One or more attachments are invalid or unavailable.", false)
 		default:
 			a.logger.Error("save user message", "chatId", req.ChatID, "error", err)
 			reject("storage_error", "Could not save the message.", true)
@@ -469,27 +482,31 @@ var runDeniedMessages = map[store.RunDenied]string{
 }
 
 func (a *API) startRun(ctx context.Context, cancel context.CancelFunc, userID, deviceID, ownerID, targetProvider string, req runRequest, release func(*runEvent)) error {
-	_, err := a.db.BeginRunForDevice(ctx, userID, deviceID, req.ChatID, req.MessageID, req.Prompt, targetProvider, req.Model.ID)
+	_, attached, err := a.db.BeginRunForDeviceWithAttachments(ctx, userID, deviceID, req.ChatID, req.MessageID, req.Prompt, targetProvider, req.Model.ID, req.AttachmentIDs)
 	if err != nil {
 		return err
 	}
+	wireAtts := make([]store.MessageAttachment, 0, len(attached))
+	for _, att := range attached {
+		wireAtts = append(wireAtts, att.AsMessageAttachment())
+	}
 	a.live.publish(runEvent{
 		ChatID: req.ChatID, MessageID: req.MessageID, Seq: 1, Type: "started",
-		Prompt: req.Prompt, Model: req.Model.ID, CreatedAt: time.Now().UnixMilli(),
+		Prompt: req.Prompt, Attachments: wireAtts, Model: req.Model.ID, CreatedAt: time.Now().UnixMilli(),
 	})
 	go func() {
 		defer cancel()
-		terminal := a.streamRunForProvider(ctx, userID, ownerID, targetProvider, req)
+		terminal := a.streamRunForProvider(ctx, userID, ownerID, targetProvider, req, attached)
 		release(&terminal)
 	}()
 	return nil
 }
 
 func (a *API) streamRun(ctx context.Context, userID, ownerID string, req runRequest) runEvent {
-	return a.streamRunForProvider(ctx, userID, ownerID, strings.ToLower(strings.TrimSpace(req.Provider)), req)
+	return a.streamRunForProvider(ctx, userID, ownerID, strings.ToLower(strings.TrimSpace(req.Provider)), req, nil)
 }
 
-func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetProvider string, req runRequest) runEvent {
+func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetProvider string, req runRequest, attached []store.Attachment) runEvent {
 	seq := 1
 	failure := func(code, message string, err error) runEvent {
 		a.logger.Error("stream response", "chatId", req.ChatID, "code", code, "error", err)
@@ -542,8 +559,26 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 	if !ok {
 		return req.failure(seq+1, "provider_unavailable", "The provider for this chat is not available.", false)
 	}
+	var promptImages []provider.ImageAttachment
+	for _, att := range attached {
+		if att.Kind == string(uploads.KindImage) {
+			if targetProvider == "antigravity" {
+				return req.failure(seq+1, "unsupported_attachment", provider.ErrUnsupportedImageAttachments.Error(), false)
+			}
+			imgBytes, err := a.db.ReadAttachmentBytes(att.StorageKey)
+			if err != nil {
+				return failure("storage_error", "Could not load attached image.", err)
+			}
+			promptImages = append(promptImages, provider.ImageAttachment{
+				Name:     att.OriginalName,
+				MIMEType: att.MIMEType,
+				Data:     imgBytes,
+			})
+		}
+	}
+
 	resumeSessionID := ""
-	prompt := req.Prompt
+	prompt := buildPromptWithAttachments(req.Prompt, attached)
 	if targetProvider == sessionProvider {
 		resumeSessionID = sessionID
 	} else {
@@ -551,15 +586,22 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 		if err != nil {
 			return failure("storage_error", "Could not load chat history.", err)
 		}
-		prompt = buildHandoffPrompt(prior, req.Prompt)
+		priorAtts, err := a.db.PriorAttachmentsForChat(runCtx, req.ChatID)
+		if err != nil {
+			return failure("storage_error", "Could not load prior attachments.", err)
+		}
+		prompt = buildHandoffPromptWithAttachments(prior, priorAtts, prompt)
 	}
 	instructions, err := a.userInstructions(runCtx, userID, shared)
 	if err != nil {
 		return failure("storage_error", "Could not load your profile.", err)
 	}
 	started := time.Now()
-	events, err := backend.Stream(runCtx, provider.Request{UserID: ownerID, Model: req.Model.ID, Reasoning: req.Reasoning, Prompt: prompt, SessionID: resumeSessionID, SystemInstructions: instructions})
+	events, err := backend.Stream(runCtx, provider.Request{UserID: ownerID, Model: req.Model.ID, Reasoning: req.Reasoning, Prompt: prompt, SessionID: resumeSessionID, SystemInstructions: instructions, Images: promptImages})
 	if err != nil {
+		if errors.Is(err, provider.ErrUnsupportedImageAttachments) {
+			return req.failure(seq+1, "unsupported_attachment", err.Error(), false)
+		}
 		return failure("provider_error", "Could not start the provider.", err)
 	}
 	var text, thinking bytes.Buffer
@@ -642,6 +684,10 @@ func tailValidUTF8(s string, maxBytes int) string {
 }
 
 func buildHandoffPrompt(messages []store.Message, currentPrompt string) string {
+	return buildHandoffPromptWithAttachments(messages, nil, currentPrompt)
+}
+
+func buildHandoffPromptWithAttachments(messages []store.Message, priorAtts map[string][]store.Attachment, currentPrompt string) string {
 	const truncationNotice = "[Более ранние сообщения чата были сокращены из-за ограничения размера.]\n\n"
 	type entry struct {
 		prefix  string
@@ -650,6 +696,9 @@ func buildHandoffPrompt(messages []store.Message, currentPrompt string) string {
 	entries := make([]entry, 0, len(messages))
 	for _, m := range messages {
 		content := strings.TrimSpace(strings.ToValidUTF8(m.Content, ""))
+		if atts := priorAtts[m.ID]; m.Role == "user" && len(atts) > 0 {
+			content = buildPromptWithAttachments(content, atts)
+		}
 		if content == "" {
 			continue
 		}

@@ -5,12 +5,14 @@ import { Incoming, LimitActions, Quotas, ServerQuotas } from './Quotas'
 import { AuthScene } from './AuthScene'
 import { WorkspaceDialog } from './WorkspaceDialog'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Hourglass, Image as ImageIcon, Laptop, Menu, PanelLeft, Paperclip, Share2, Square, Terminal } from 'lucide-react'
+import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Hourglass, Laptop, Menu, PanelLeft, Paperclip, Share2, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
-import { demoPrompt, availableDevices, models, providerLabels, checkAccountStatus, logout, newChat, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, stopChat, switchChatProvider, updateChat, useChats } from './chatStore'
+import { clearChatAttachmentError, demoPrompt, availableDevices, models, providerLabels, checkAccountStatus, logout, newChat, removeChatAttachment, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, stopChat, switchChatProvider, updateChat, uploadChatFiles, useChats } from './chatStore'
 import type { Chat, Turn } from './chatStore'
 import type { Provider, ServerProvider } from '../protocol/types'
+import { CHAT_ATTACHMENT_ACCEPT, MAX_CHAT_ATTACHMENTS } from './attachments'
+import { DraftAttachmentsBar, TurnAttachments } from './AttachmentViews'
 import { fallbackProviders } from '../transport/RemoteTransport'
 import { EnvironmentPopover, ModelPopover } from './ComposerPopovers'
 import type { ProviderOption } from './ProviderSelect'
@@ -45,6 +47,7 @@ function progressLabel(durationMs?: number) {
 
 function Transcript({ turn, chatId, writable, busy, retry, demo }: { turn: Turn; chatId: string; writable: boolean; busy: boolean; retry: (modelId: string) => void; demo: boolean }) {
   const w = useChats(s => s.workspace)!
+  const remote = useChats(s => s.remote)
   const authorId = turn.authorId ?? w.chats.find(c => c.id === chatId)?.ownerId
   const authorMember = authorId === w.user.id ? w.user : w.users.find(u => u.id === authorId)
   const author = authorId === w.user.id ? 'Вы' : authorMember?.displayName?.trim() || authorMember?.name || 'Участник'
@@ -59,13 +62,8 @@ function Transcript({ turn, chatId, writable, busy, retry, demo }: { turn: Turn;
           <time>{clock.format(turn.time)}</time>
         </div>
         <div className="user-bubble">
-          {!!turn.attachments?.length && <ul className="message-attachments" aria-label="Вложения">
-            {turn.attachments.map((attachment, index) => {
-              const Icon = attachment.kind === 'image' ? ImageIcon : Paperclip
-              return <li key={index} title={attachment.name}><Icon size={14} aria-hidden="true"/><span>{attachment.name}</span></li>
-            })}
-          </ul>}
-          <div className="user-prompt">{turn.prompt}</div>
+          {!!turn.attachments?.length && <TurnAttachments attachments={turn.attachments} remote={remote} />}
+          {turn.prompt && <div className="user-prompt">{turn.prompt}</div>}
         </div>
       </div>
     )}
@@ -112,11 +110,18 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
   const scroll = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
   const input = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const composerRef = useRef<HTMLDivElement>(null)
+  const dragDepthRef = useRef(0)
+  const [draggingFiles, setDraggingFiles] = useState(false)
   const [openMenu, setOpenMenu] = useState<'model' | 'env' | null>(null)
   const running = chat.turns.at(-1)?.state === 'running'
   const editable = chat.access === 'owner' || chat.access === 'write'
   const locked = running || !editable
+  const draftAttachments = chat.attachments ?? []
+  const uploadingAttachments = draftAttachments.some(a => a.status === 'uploading')
+  const hasReadyAttachments = draftAttachments.some(a => a.status === 'ready' && !!a.remote?.id)
+  const canAttach = !!remote && editable && !locked && !chat.indexedCodex && draftAttachments.length < MAX_CHAT_ATTACHMENTS
   const last = chat.turns.at(-1)
   const pending = running && last?.parts.some(p => p.kind === 'tool' && p.permission && !p.result && !p.decision)
   useLayoutEffect(() => {
@@ -145,7 +150,7 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
     }
   }, [openMenu])
   const submit = () => {
-    if (!blocked && !running && editable && chat.draft.trim()) {
+    if (!blocked && !running && editable && !uploadingAttachments && (chat.draft.trim() || hasReadyAttachments)) {
       follow.current = true
       setOpenMenu(null)
       void sendPrompt(chat.id, chat.draft)
@@ -244,7 +249,39 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
       ? 'is-busy'
       : 'is-ready'
 
-  return <>
+  return <div
+    className={`chat-drop-zone${draggingFiles ? ' is-dragging' : ''}`}
+    onDragEnter={e => {
+      if (!editable || !remote || chat.indexedCodex) return
+      if (Array.from(e.dataTransfer.types).includes('Files')) {
+        e.preventDefault()
+        dragDepthRef.current++
+        setDraggingFiles(true)
+      }
+    }}
+    onDragOver={e => {
+      if (!editable || !remote || chat.indexedCodex) return
+      if (Array.from(e.dataTransfer.types).includes('Files')) {
+        e.preventDefault()
+      }
+    }}
+    onDragLeave={e => {
+      if (!editable || !remote || chat.indexedCodex) return
+      if (Array.from(e.dataTransfer.types).includes('Files')) {
+        dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+        if (dragDepthRef.current === 0) setDraggingFiles(false)
+      }
+    }}
+    onDrop={e => {
+      dragDepthRef.current = 0
+      setDraggingFiles(false)
+      if (!editable || !remote || chat.indexedCodex) return
+      if (e.dataTransfer.files?.length) {
+        e.preventDefault()
+        void uploadChatFiles(chat.id, e.dataTransfer.files)
+      }
+    }}
+  >
     <header className="chat-heading"><div className="heading-inner"><div className="heading-icon"><Terminal size={19}/></div><div className="heading-text"><h1 title={chat.title}>{chat.title}</h1><div className="heading-meta"><i/>{remote ? 'Сервер' : 'Демо-сессия'}<span>/</span><span>{chat.indexedCodex ? 'История Codex' : chat.access === 'owner' ? 'Личный чат' : 'Общий чат'}</span>{!editable && chat.model && <><span>/</span><span className="heading-model-tag">{chat.model}</span></>}</div></div>{!chat.indexedCodex && chat.access === 'owner' && <button className="share-action" onClick={share} aria-label="Поделиться"><Share2 size={15}/><span>Поделиться</span></button>}</div></header>
     <div className="history" ref={scroll} onScroll={() => { const el = scroll.current; if (el) follow.current = el.scrollHeight - el.clientHeight - el.scrollTop < 48 }}>
       <div className="thread">
@@ -332,11 +369,57 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
             }}
           />
         )}
+        <DraftAttachmentsBar
+          attachments={draftAttachments}
+          error={chat.attachmentError}
+          disabled={running}
+          onRemove={localId => removeChatAttachment(chat.id, localId)}
+          onDismissError={() => clearChatAttachmentError(chat.id)}
+        />
         <textarea disabled={!!reason} ref={input} rows={1} aria-label="Сообщение агенту" placeholder="Сообщение агенту…" value={chat.draft}
           onChange={e => updateChat(chat.id, c => ({ ...c, draft: e.target.value }))}
+          onPaste={e => {
+            if (!remote || locked || chat.indexedCodex) return
+            const files: File[] = []
+            for (const item of Array.from(e.clipboardData?.items ?? [])) {
+              if (item.kind === 'file') {
+                const f = item.getAsFile()
+                if (f) files.push(f)
+              }
+            }
+            if (files.length > 0) {
+              e.preventDefault()
+              void uploadChatFiles(chat.id, files)
+            }
+          }}
           onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit() } }}/>
         <div className="composer-controls">
           <div className="composer-triggers">
+            {remote && !chat.indexedCodex && (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  accept={CHAT_ATTACHMENT_ACCEPT}
+                  className="sr-only"
+                  onChange={e => {
+                    if (e.target.files?.length) void uploadChatFiles(chat.id, e.target.files)
+                    e.target.value = ''
+                  }}
+                />
+                <button
+                  type="button"
+                  className="composer-trigger composer-attach-btn"
+                  disabled={!canAttach}
+                  aria-label="Прикрепить файлы"
+                  title="Прикрепить файлы (картинки, код, HTML, PDF, ZIP)"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <Paperclip size={13} aria-hidden="true" />
+                </button>
+              </>
+            )}
             <button
               type="button"
               className={`composer-trigger${openMenu === 'model' ? ' is-open' : ''}`}
@@ -366,12 +449,12 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
           <div className="composer-actions">
             <span className={`status-lamp ${statusTone}`} role="status" title={statusText} aria-label={statusText} />
             {running && !remote ? <button className="send stop" title="Остановить ответ" aria-label="Остановить ответ" onClick={() => stopChat(chat.id)}><Square size={13} fill="currentColor"/></button>
-              : <button className="send" title="Отправить" aria-label="Отправить" disabled={blocked || running || !chat.draft.trim()} onClick={submit}><ArrowUp size={17}/></button>}
+              : <button className="send" title="Отправить" aria-label="Отправить" disabled={blocked || running || uploadingAttachments || (!chat.draft.trim() && !hasReadyAttachments)} onClick={submit}><ArrowUp size={17}/></button>}
           </div>
         </div>
       </div>
     </> : <div className="access-note">{chat.access === 'fork' ? <button onClick={() => newChat(chat)}><GitFork size={15}/>Ответвить к себе</button> : 'Этот чат доступен для чтения'}</div>}</div></footer>
-  </>
+  </div>
 }
 export function App() {
   const workspace = useChats(s => s.workspace)

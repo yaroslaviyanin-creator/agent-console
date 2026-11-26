@@ -104,6 +104,9 @@ func newRegistryHandler(ctx context.Context, db *store.Store, cfg config.Config,
 	if db != nil && cfg.MemoryAutoUpdate && cfg.MemoryCheckInterval > 0 {
 		go api.runMemoryWorker(ctx)
 	}
+	if db != nil {
+		go api.runAttachmentCleanupWorker(ctx)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", api.health)
 	mux.HandleFunc("POST /api/auth/login", api.login)
@@ -130,6 +133,10 @@ func newRegistryHandler(ctx context.Context, db *store.Store, cfg config.Config,
 	mux.HandleFunc("GET /api/users", api.withAuth(api.directoryUsers))
 	mux.HandleFunc("GET /api/chats", api.withAuth(api.chats))
 	mux.HandleFunc("POST /api/chats", api.withAuth(api.createChat))
+	mux.HandleFunc("DELETE /api/chats/{id}", api.withAuth(api.deleteChat))
+	mux.HandleFunc("POST /api/chats/{id}/attachments", api.withAuth(api.uploadAttachments))
+	mux.HandleFunc("GET /api/attachments/{id}", api.withAuth(api.getAttachment))
+	mux.HandleFunc("DELETE /api/attachments/{id}", api.withAuth(api.deleteAttachment))
 	mux.HandleFunc("GET /api/chats/{id}/messages", api.withAuth(api.messages))
 	mux.HandleFunc("PUT /api/chats/{id}/shares/{userId}", api.withAuth(api.putChatShare))
 	mux.HandleFunc("DELETE /api/chats/{id}/shares/{userId}", api.withAuth(api.deleteChatShare))

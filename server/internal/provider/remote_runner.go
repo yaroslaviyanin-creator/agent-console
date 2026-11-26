@@ -143,6 +143,17 @@ func (p *RemoteRunnerProvider) Stream(ctx context.Context, req Request) (<-chan 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var wireImages []runnerwire.ImageAttachment
+	if len(req.Images) > 0 {
+		wireImages = make([]runnerwire.ImageAttachment, 0, len(req.Images))
+		for _, img := range req.Images {
+			wireImages = append(wireImages, runnerwire.ImageAttachment{
+				Name:     img.Name,
+				MIMEType: img.MIMEType,
+				Data:     img.Data,
+			})
+		}
+	}
 	wireReq := runnerwire.Request{
 		Provider:           p.provider,
 		UserID:             req.UserID,
@@ -152,6 +163,7 @@ func (p *RemoteRunnerProvider) Stream(ctx context.Context, req Request) (<-chan 
 		SessionID:          req.SessionID,
 		SystemInstructions: req.SystemInstructions,
 		Ephemeral:          req.Ephemeral,
+		Images:             wireImages,
 	}
 	payload, err := json.Marshal(wireReq)
 	if err != nil {
@@ -175,7 +187,11 @@ func (p *RemoteRunnerProvider) Stream(ctx context.Context, req Request) (<-chan 
 		return nil, errors.New("remote runner request failed")
 	}
 	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusBadRequest && bytes.Contains(body, []byte(ErrUnsupportedImageAttachments.Error())) {
+			return nil, ErrUnsupportedImageAttachments
+		}
 		return nil, fmt.Errorf("remote runner returned status %d", resp.StatusCode)
 	}
 

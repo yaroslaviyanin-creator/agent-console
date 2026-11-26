@@ -23,6 +23,9 @@ func (p AntigravityCliProvider) Stream(ctx context.Context, req Request) (<-chan
 	if !userIDPattern.MatchString(req.UserID) {
 		return nil, errors.New("invalid workspace user ID")
 	}
+	if len(req.Images) > 0 {
+		return nil, ErrUnsupportedImageAttachments
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err

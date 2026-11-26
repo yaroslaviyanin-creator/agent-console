@@ -34,8 +34,20 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 		return nil, errors.New("Codex chat environment is not configured")
 	}
 	req.SessionID = chatSessionID(req.SessionID)
-	args, err := codexArgs(req)
+
+	imgDir, imagePaths, err := stageCodexImages(req.Images)
 	if err != nil {
+		return nil, err
+	}
+	cleanupImages := func() {
+		if imgDir != "" {
+			_ = os.RemoveAll(imgDir)
+		}
+	}
+
+	args, err := codexArgsWithImages(req, imagePaths)
+	if err != nil {
+		cleanupImages()
 		return nil, err
 	}
 	catalog, _ := json.Marshal(filepath.Join(p.home, "chat-models.json"))
@@ -53,14 +65,17 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 	cmd.Env = codexChatEnvironment(p.home)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		cleanupImages()
 		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
+		cleanupImages()
 		return nil, stderr.wrap("start codex exec", err)
 	}
 	out := make(chan Event)
 	go func() {
 		defer close(out)
+		defer cleanupImages()
 		terminal, parseErr := parseJSONL(stdout, func(event Event) bool {
 			return send(ctx, out, event)
 		})
@@ -114,7 +129,39 @@ func (t *stderrTail) wrap(operation string, err error) error {
 	return fmt.Errorf("%s: %w", operation, err)
 }
 
+func stageCodexImages(images []ImageAttachment) (string, []string, error) {
+	if len(images) == 0 {
+		return "", nil, nil
+	}
+	dir, err := os.MkdirTemp("", "req-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("create temp image dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", nil, err
+	}
+	paths := make([]string, 0, len(images))
+	for i, img := range images {
+		ext := ".jpg"
+		if img.MIMEType == "image/png" {
+			ext = ".png"
+		}
+		target := filepath.Join(dir, fmt.Sprintf("img_%d%s", i, ext))
+		if err := os.WriteFile(target, img.Data, 0600); err != nil {
+			_ = os.RemoveAll(dir)
+			return "", nil, fmt.Errorf("write temp image: %w", err)
+		}
+		paths = append(paths, target)
+	}
+	return dir, paths, nil
+}
+
 func codexArgs(req Request) ([]string, error) {
+	return codexArgsWithImages(req, nil)
+}
+
+func codexArgsWithImages(req Request, imagePaths []string) ([]string, error) {
 	args := []string{"exec", "--strict-config", "--ignore-rules", "--skip-git-repo-check", "--json"}
 	if req.SystemInstructions != "" {
 		instructions, err := json.Marshal(req.SystemInstructions)
@@ -142,6 +189,9 @@ func codexArgs(req Request) ([]string, error) {
 			return nil, errors.New("invalid Codex session ID")
 		}
 		args = append(args, "resume", req.SessionID)
+	}
+	for _, imgPath := range imagePaths {
+		args = append(args, "-i", imgPath)
 	}
 	return append(args, "-"), nil
 }

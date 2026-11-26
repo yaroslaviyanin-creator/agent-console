@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -488,7 +489,7 @@ func TestStreamUsageSessionRoundtrip(t *testing.T) {
 		SystemInstructions: wireReq.SystemInstructions,
 		Ephemeral:          wireReq.Ephemeral,
 	}
-	if gotReq != wantProvReq {
+	if !reflect.DeepEqual(gotReq, wantProvReq) {
 		t.Fatalf("mapped provider.Request mismatch:\ngot:  %+v\nwant: %+v", gotReq, wantProvReq)
 	}
 

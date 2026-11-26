@@ -1,6 +1,7 @@
 import { historyUntil, previousTurn } from './runHistory'
 import { create } from 'zustand'
 import type { LoginRequest, MessageAttachment, Workspace, PermissionDecision, Provider, RunEvent, ServerMessage, ServerModel, ServerProvider, ServerProviderInfo, ShareAccess, Target, ToolCall } from '../protocol/types'
+import { type DraftAttachment, inferDraftKind, isSafeRasterPreviewFile, MAX_CHAT_ATTACHMENTS } from './attachments'
 import { useAccountStore, blockReason } from './accountStore'
 import { readConnection, saveConnection, setTransport, transport } from './runtime'
 import type { ConnectionMode } from './runtime'
@@ -66,6 +67,8 @@ export interface Chat {
   modelByProvider?: Partial<Record<ServerProvider, { model: string; reasoning?: string | undefined }>>
   target: Target
   draft: string
+  attachments?: DraftAttachment[] | undefined
+  attachmentError?: string | undefined
   turns: Turn[]
   indexedCodex?: boolean
   archived?: boolean
@@ -497,6 +500,7 @@ function receiveRemoteRun(remote: RemoteTransport, event: RunEvent) {
     const fallbackLabel = chatProvider === 'stub' ? 'StubProvider' : providerLabels[chatProvider]
     const turn: Turn = {
       id: event.messageId, prompt: event.prompt, time: event.createdAt, parts: [], seq: event.seq,
+      ...(event.attachments?.length ? { attachments: event.attachments } : {}),
       model: label ?? fallbackLabel, state: 'running',
     }
     const turns = previous ? c.turns.map(t => t.id === turn.id ? turn : t) : [...c.turns, turn]
@@ -805,6 +809,96 @@ export async function newChat(source?: Chat) {
   if (runs.has(active)) stopChat(active)
   loadWorkspace(workspace, id)
 }
+export async function uploadChatFiles(chatId: string, fileList: FileList | File[]) {
+  const { remote, chats } = useChats.getState()
+  const files = Array.from(fileList)
+  if (!files.length) return
+  if (!remote) {
+    updateChat(chatId, c => ({ ...c, attachmentError: 'Загрузка файлов доступна в режиме «Сервер».' }))
+    return
+  }
+  const target = chats.find(c => c.id === chatId)
+  if (!target || (target.access !== 'owner' && target.access !== 'write')) return
+
+  const existing = target.attachments ?? []
+  const availableSlots = MAX_CHAT_ATTACHMENTS - existing.length
+  if (availableSlots <= 0) {
+    updateChat(chatId, c => ({ ...c, attachmentError: `Можно прикрепить не более ${MAX_CHAT_ATTACHMENTS} файлов к одному сообщению.` }))
+    return
+  }
+  const batch = files.slice(0, availableSlots)
+  const overflow = files.length > availableSlots
+  const pendingItems: DraftAttachment[] = batch.map(file => ({
+    localId: crypto.randomUUID(),
+    name: file.name,
+    sizeBytes: file.size,
+    kind: inferDraftKind(file),
+    status: 'uploading',
+    ...(isSafeRasterPreviewFile(file) && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
+      ? { previewUrl: URL.createObjectURL(file) }
+      : {}),
+  }))
+
+  updateChat(chatId, c => ({
+    ...c,
+    attachmentError: overflow ? `Прикреплены первые ${batch.length} из ${files.length} файлов (лимит ${MAX_CHAT_ATTACHMENTS}).` : undefined,
+    attachments: [...(c.attachments ?? []), ...pendingItems],
+  }))
+
+  const pendingIds = new Set(pendingItems.map(item => item.localId))
+  try {
+    const uploaded = await remote.uploadAttachments(chatId, batch)
+    updateChat(chatId, c => {
+      const next = (c.attachments ?? []).map(item => {
+        if (!pendingIds.has(item.localId)) return item
+        const idx = pendingItems.findIndex(p => p.localId === item.localId)
+        const remoteAtt = uploaded[idx]
+        if (!remoteAtt) {
+          return { ...item, status: 'error' as const, error: 'Сервер не вернул метаданные файла.' }
+        }
+        return {
+          ...item,
+          name: remoteAtt.name,
+          sizeBytes: remoteAtt.sizeBytes ?? item.sizeBytes,
+          kind: (remoteAtt.kind === 'image' || remoteAtt.kind === 'pdf' || remoteAtt.kind === 'archive' ? remoteAtt.kind : 'text') as DraftAttachment['kind'],
+          status: 'ready' as const,
+          remote: remoteAtt,
+        }
+      })
+      return { ...c, attachments: next }
+    })
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : 'Не удалось загрузить файлы.'
+    for (const item of pendingItems) {
+      if (item.previewUrl && typeof URL !== 'undefined') URL.revokeObjectURL(item.previewUrl)
+    }
+    updateChat(chatId, c => ({
+      ...c,
+      attachmentError: msg,
+      attachments: (c.attachments ?? []).filter(item => !pendingIds.has(item.localId)),
+    }))
+  }
+}
+
+export function removeChatAttachment(chatId: string, localId: string) {
+  const { remote, chats } = useChats.getState()
+  const target = chats.find(c => c.id === chatId)
+  const item = target?.attachments?.find(a => a.localId === localId)
+  if (item?.previewUrl && typeof URL !== 'undefined') URL.revokeObjectURL(item.previewUrl)
+  updateChat(chatId, c => ({
+    ...c,
+    attachmentError: undefined,
+    attachments: (c.attachments ?? []).filter(a => a.localId !== localId),
+  }))
+  if (remote && item?.remote?.id) {
+    void remote.deleteAttachment(item.remote.id).catch(() => {})
+  }
+}
+
+export function clearChatAttachmentError(chatId: string) {
+  updateChat(chatId, c => ({ ...c, attachmentError: undefined }))
+}
+
 export function sendPrompt(id: string, input: string) {
   return startRun(id, input)
 }
@@ -828,19 +922,55 @@ async function startRun(id: string, input: string, retry?: { turnId: string; mod
     ? { id: c.model, provider: remoteProvider, label: serverModel?.name ?? (chatProvider === 'stub' ? 'StubProvider' : providerLabels[remoteProvider]) }
     : models.find(m => m.id === (retry?.modelId ?? c.model))
   if (!model || (retry && (!source || source.state === 'running' || source.model === model.label))) return
+
+  const draftAttachments = source ? [] : (c.attachments ?? [])
+  if (draftAttachments.some(a => a.status === 'uploading')) return
+  const readyAttachments = draftAttachments.filter(a => a.status === 'ready' && a.remote?.id)
   const prompt = source?.prompt ?? input.trim()
-  if (!prompt || (!remote && blockReason(useAccountStore.getState().quotas[model.provider]))) return
+  if ((!prompt && readyAttachments.length === 0) || (!remote && blockReason(useAccountStore.getState().quotas[model.provider]))) return
+
+  const attachmentIds = readyAttachments.map(a => a.remote!.id!)
+  const messageAttachments = readyAttachments.map(a => a.remote!)
+  if (!source) {
+    for (const item of draftAttachments) {
+      if (item.previewUrl && typeof URL !== 'undefined') URL.revokeObjectURL(item.previewUrl)
+    }
+  }
+
   const parentId = source ? previousTurn(c.turns, index) : c.turns.at(-1)?.id ?? null
   const history = remote ? undefined : historyUntil(c.turns, parentId)
   const target = source?.target ?? (source ? { mode: 'chat' } as const : c.target)
   const retryFields = source ? { retryOf: source.id } : {}
-  const turn: Turn = { ...retryFields, parentId, target, id: crypto.randomUUID(), time: Date.now(), authorId: workspace.user.id,
-    prompt, model: remote && chatProvider === 'stub' ? 'StubProvider' : model.label, seq: 0, state: 'running', parts: [] }
+  const turn: Turn = {
+    ...retryFields, parentId, target, id: crypto.randomUUID(), time: Date.now(), authorId: workspace.user.id,
+    ...(messageAttachments.length ? { attachments: messageAttachments } : {}),
+    prompt, model: remote && chatProvider === 'stub' ? 'StubProvider' : model.label, seq: 0, state: 'running', parts: [],
+  }
   const controller = new AbortController()
   runs.set(id, controller)
-  updateChat(id, value => ({ ...value, title: !remote && value.title === 'Новый чат' ? prompt : value.title, draft: source ? value.draft : '', model: model.id, target, turns: [...value.turns, turn] }))
+  updateChat(id, value => ({
+    ...value,
+    title: !remote && value.title === 'Новый чат' ? (prompt || messageAttachments[0]?.name || 'Новый чат') : value.title,
+    draft: source ? value.draft : '',
+    attachments: source ? value.attachments : [],
+    attachmentError: undefined,
+    model: model.id,
+    target,
+    turns: [...value.turns, turn],
+  }))
   try {
-    for await (const event of transport.stream({ chatId: id, messageId: turn.id, ...(remote ? { provider: chatProvider } : {}), model: { id: model.id, provider: model.provider }, ...(c.reasoning ? { reasoning: c.reasoning } : {}), target, prompt, ...(history ? { history } : {}), ...retryFields }, controller.signal)) {
+    for await (const event of transport.stream({
+      chatId: id,
+      messageId: turn.id,
+      ...(remote ? { provider: chatProvider } : {}),
+      model: { id: model.id, provider: model.provider },
+      ...(c.reasoning ? { reasoning: c.reasoning } : {}),
+      target,
+      prompt,
+      ...(attachmentIds.length ? { attachmentIds } : {}),
+      ...(history ? { history } : {}),
+      ...retryFields,
+    }, controller.signal)) {
       if (controller.signal.aborted) break
       if (event.chatId === id && event.messageId === turn.id) {
         updateTurn(id, turn.id, t => applyEvent(t, event))

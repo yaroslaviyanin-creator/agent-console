@@ -185,7 +185,7 @@ func TestRemoteRunnerStreamRoundtripDeltaUsageSession(t *testing.T) {
 		SystemInstructions: req.SystemInstructions,
 		Ephemeral:          req.Ephemeral,
 	}
-	if decoded != wantWire {
+	if !reflect.DeepEqual(decoded, wantWire) {
 		t.Fatalf("wire request = %+v, want %+v", decoded, wantWire)
 	}
 }

@@ -466,6 +466,17 @@ func (s *runnerServer) handleStream(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), maxStreamDuration)
 	defer cancel()
 
+	var provImages []provider.ImageAttachment
+	if len(req.Images) > 0 {
+		provImages = make([]provider.ImageAttachment, 0, len(req.Images))
+		for _, img := range req.Images {
+			provImages = append(provImages, provider.ImageAttachment{
+				Name:     img.Name,
+				MIMEType: img.MIMEType,
+				Data:     img.Data,
+			})
+		}
+	}
 	provReq := provider.Request{
 		UserID:             req.UserID,
 		Model:              req.Model,
@@ -474,10 +485,15 @@ func (s *runnerServer) handleStream(w http.ResponseWriter, r *http.Request) {
 		SessionID:          req.SessionID,
 		SystemInstructions: req.SystemInstructions,
 		Ephemeral:          req.Ephemeral,
+		Images:             provImages,
 	}
 
 	events, err := prov.Stream(ctx, provReq)
 	if err != nil {
+		if errors.Is(err, provider.ErrUnsupportedImageAttachments) {
+			writeJSONError(w, http.StatusBadRequest, provider.ErrUnsupportedImageAttachments.Error())
+			return
+		}
 		slog.Error("provider stream failed to start", "error", err)
 		writeJSONError(w, http.StatusBadGateway, publicStreamError)
 		return

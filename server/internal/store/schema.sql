@@ -74,6 +74,21 @@ CREATE TABLE IF NOT EXISTS usage_events (
     UNIQUE (chat_id, run_id)
 );
 
+CREATE TABLE IF NOT EXISTS chat_attachments (
+    id TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    message_id TEXT REFERENCES chat_messages(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    original_name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('image', 'text', 'pdf', 'archive')),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    sha256 TEXT NOT NULL,
+    storage_key TEXT NOT NULL UNIQUE,
+    extracted_text TEXT,
+    created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS devices_by_user ON devices (user_id);
 CREATE INDEX IF NOT EXISTS chats_by_user ON chats (user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS messages_by_chat ON chat_messages (chat_id, created_at);
@@ -82,3 +97,6 @@ CREATE INDEX IF NOT EXISTS chat_messages_by_role_time ON chat_messages (chat_id,
 CREATE INDEX IF NOT EXISTS chat_messages_by_sender ON chat_messages (run_user_id, created_at) WHERE role = 'user';
 CREATE INDEX IF NOT EXISTS chat_shares_by_user ON chat_shares (user_id);
 CREATE INDEX IF NOT EXISTS usage_events_by_user_time ON usage_events (user_id, created_at);
+CREATE INDEX IF NOT EXISTS chat_attachments_by_chat ON chat_attachments (chat_id, created_at);
+CREATE INDEX IF NOT EXISTS chat_attachments_by_message ON chat_attachments (message_id);
+CREATE INDEX IF NOT EXISTS chat_attachments_orphans ON chat_attachments (created_at) WHERE message_id IS NULL;

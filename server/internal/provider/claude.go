@@ -3,6 +3,7 @@ package provider
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,9 +72,13 @@ func (p ClaudeCliProvider) Stream(ctx context.Context, req Request) (<-chan Even
 			return nil, err
 		}
 	}
+	stdinPayload, err := claudeStdinPayload(req)
+	if err != nil {
+		return nil, err
+	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = workspace
-	cmd.Stdin = strings.NewReader(req.Prompt)
+	cmd.Stdin = strings.NewReader(stdinPayload)
 	var stderr stderrTail
 	cmd.Stderr = &stderr
 	cmd.WaitDelay = 3 * time.Second
@@ -157,6 +162,9 @@ func claudeArgs(req Request) ([]string, error) {
 		"--model", model,
 		"--append-system-prompt", instructions,
 	}
+	if len(req.Images) > 0 {
+		args = append(args, "--input-format", "stream-json")
+	}
 	switch effort := strings.ToLower(strings.TrimSpace(req.Reasoning)); effort {
 	case "", "default":
 	case "low", "medium", "high", "xhigh", "max":
@@ -175,6 +183,52 @@ func claudeArgs(req Request) ([]string, error) {
 		args = append(args, "--resume", req.SessionID)
 	}
 	return args, nil
+}
+
+func claudeStdinPayload(req Request) (string, error) {
+	if len(req.Images) == 0 {
+		return req.Prompt, nil
+	}
+	type imageSource struct {
+		Type      string `json:"type"`
+		MediaType string `json:"media_type"`
+		Data      string `json:"data"`
+	}
+	type contentBlock struct {
+		Type   string       `json:"type"`
+		Text   string       `json:"text,omitempty"`
+		Source *imageSource `json:"source,omitempty"`
+	}
+	blocks := make([]contentBlock, 0, len(req.Images)+1)
+	for _, img := range req.Images {
+		blocks = append(blocks, contentBlock{
+			Type: "image",
+			Source: &imageSource{
+				Type:      "base64",
+				MediaType: img.MIMEType,
+				Data:      base64.StdEncoding.EncodeToString(img.Data),
+			},
+		})
+	}
+	if req.Prompt != "" {
+		blocks = append(blocks, contentBlock{Type: "text", Text: req.Prompt})
+	}
+	envelope := struct {
+		Type    string `json:"type"`
+		Message struct {
+			Role    string         `json:"role"`
+			Content []contentBlock `json:"content"`
+		} `json:"message"`
+	}{
+		Type: "user",
+	}
+	envelope.Message.Role = "user"
+	envelope.Message.Content = blocks
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded) + "\n", nil
 }
 
 func claudeEnvironment(home string) []string {
