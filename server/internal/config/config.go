@@ -13,20 +13,19 @@ import (
 )
 
 type Config struct {
-	Addr                    string
-	DBPath                  string
-	Provider                string
-	CodexBin                string
-	AntigravityBin          string
-	AntigravityDefaultModel string
-	CORSOrigin              string
-	TrustProxyHeaders       bool
-	MaxConcurrentStreams    int
-	CodexHistoryUsername    string
-	MemoryAutoUpdate        bool
-	MemoryModel             string
-	MemoryCheckInterval     time.Duration
-	MemoryMinNewMessages    int
+	Addr                 string
+	DBPath               string
+	Provider             string
+	RunnerURL            string
+	RunnerSharedSecret   string
+	CORSOrigin           string
+	TrustProxyHeaders    bool
+	MaxConcurrentStreams int
+	CodexHistoryUsername string
+	MemoryAutoUpdate     bool
+	MemoryModel          string
+	MemoryCheckInterval  time.Duration
+	MemoryMinNewMessages int
 }
 
 func Load() (Config, error) {
@@ -34,14 +33,13 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("load .env: %w", err)
 	}
 	cfg := Config{
-		Addr:                    value("SERVER_ADDR", ":8080"),
-		DBPath:                  value("DB_PATH", "./data/app.db"),
-		Provider:                value("PROVIDER", "stub"),
-		CodexBin:                value("CODEX_BIN", "codex"),
-		AntigravityBin:          value("ANTIGRAVITY_BIN", "agy"),
-		AntigravityDefaultModel: value("ANTIGRAVITY_MODEL", "gemini-3.8-flash-high"),
-		CORSOrigin:              strings.TrimSpace(value("CORS_ORIGIN", "*")),
-		CodexHistoryUsername:    strings.TrimSpace(os.Getenv("CODEX_HISTORY_USERNAME")),
+		Addr:                 value("SERVER_ADDR", ":8080"),
+		DBPath:               value("DB_PATH", "./data/app.db"),
+		Provider:             value("PROVIDER", "stub"),
+		RunnerURL:            strings.TrimSpace(os.Getenv("RUNNER_URL")),
+		RunnerSharedSecret:   os.Getenv("RUNNER_SHARED_SECRET"),
+		CORSOrigin:           strings.TrimSpace(value("CORS_ORIGIN", "*")),
+		CodexHistoryUsername: strings.TrimSpace(os.Getenv("CODEX_HISTORY_USERNAME")),
 	}
 	if cfg.Provider != "stub" && !isRunningInDocker() && !isEnvTrue("ALLOW_HOST_CLI_EXECUTION") {
 		return Config{}, errors.New("refusing to run CLI provider outside Docker; use docker compose")

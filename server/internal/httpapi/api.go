@@ -39,22 +39,24 @@ type session struct {
 }
 
 func New(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.Logger) (http.Handler, error) {
-	var backend provider.Provider
 	switch cfg.Provider {
-	case "stub":
-		backend = provider.StubProvider{Delay: 100 * time.Millisecond}
-	case "codex":
-		codex, err := provider.NewCodexCliProvider(ctx, cfg.CodexBin)
-		if err != nil {
-			return nil, fmt.Errorf("configure Codex chat: %w", err)
-		}
-		backend = codex
-	case "antigravity":
-		backend = provider.AntigravityCliProvider{Bin: cfg.AntigravityBin, DefaultModel: cfg.AntigravityDefaultModel}
+	case "stub", "codex", "antigravity":
 	case "claude", "paid_api":
 		return nil, fmt.Errorf("provider %q is not implemented yet", cfg.Provider)
 	default:
 		return nil, fmt.Errorf("unsupported provider %q", cfg.Provider)
+	}
+	var backend provider.Provider
+	if cfg.RunnerURL != "" {
+		remote, err := provider.NewRemoteRunnerProvider(cfg.RunnerURL, cfg.RunnerSharedSecret)
+		if err != nil {
+			return nil, fmt.Errorf("configure runner: %w", err)
+		}
+		backend = remote
+	} else if cfg.Provider == "stub" {
+		backend = provider.StubProvider{Delay: 100 * time.Millisecond}
+	} else {
+		return nil, errors.New("RUNNER_URL is required for CLI providers")
 	}
 	return newHandler(ctx, db, cfg, logger, backend), nil
 }

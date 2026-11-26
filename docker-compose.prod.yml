@@ -1,23 +1,37 @@
 services:
-  backend:
+  core:
     ports: !reset []
+    networks: !override [frontend, runner_rpc]
     environment:
       TRUST_PROXY_HEADERS: "true"
-      CORS_ORIGIN: https://${DOMAIN}
-      AG_UNLOCKER_ENABLED: ${AG_UNLOCKER_ENABLED:-true}
-      AG_UNLOCKER_CODE: ${AG_UNLOCKER_CODE:-}
+      CORS_ORIGIN: https://${DOMAIN:?Set DOMAIN in .env}
     mem_limit: 2g
 
+  runner:
+    build:
+      args:
+        AGY_USE_UNLOCKER: "true"
+    depends_on:
+      unlocker:
+        condition: service_healthy
+    environment:
+      AG_LS_PROXY: http://unlocker:53130
+
+  unlocker:
+    profiles: !reset []
+
   web:
-    ports:
+    ports: !override
       - "80:80"
       - "443:443"
     environment:
-      DOMAIN: ${DOMAIN}
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env}
     volumes:
       - ./deploy/Caddyfile.prod:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://core:8080/api/health && wget -q -O /dev/null http://127.0.0.1:2019/config/"]
 
 volumes:
   caddy_data:

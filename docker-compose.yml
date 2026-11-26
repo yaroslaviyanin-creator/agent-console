@@ -1,68 +1,111 @@
 services:
-  backend:
-    # Antigravity Unlocker (AG_*_linux.tar.gz) выпускается только под x86_64/amd64.
-    # На Apple Silicon (M1/M2/M3/M4) раскомментируйте строку ниже:
-    # platform: linux/amd64
+  core:
     build:
       context: .
-      args:
-        INSTALL_CODEX: ${INSTALL_CODEX:-false}
-        INSTALL_AG_UNLOCKER: ${INSTALL_AG_UNLOCKER:-true}
+      target: core
     restart: unless-stopped
-    env_file:
-      - path: .env
-        required: false
     environment:
       SERVER_ADDR: 0.0.0.0:8080
       DB_PATH: /app/data/app.db
       PROVIDER: ${PROVIDER:-stub}
-      ANTIGRAVITY_BIN: ${ANTIGRAVITY_BIN:-agy}
-      ANTIGRAVITY_MODEL: ${ANTIGRAVITY_MODEL:-gemini-3.8-flash-high}
-      AG_UNLOCKER_ENABLED: ${AG_UNLOCKER_ENABLED:-true}
-      AG_UNLOCKER_CODE: ${AG_UNLOCKER_CODE:-}
+      RUNNER_URL: http://runner:8081
+      RUNNER_SHARED_SECRET: ${RUNNER_SHARED_SECRET:?Set RUNNER_SHARED_SECRET in .env}
+      CODEX_HISTORY_USERNAME: ${CODEX_HISTORY_USERNAME:-}
       MAX_CONCURRENT_STREAMS: ${MAX_CONCURRENT_STREAMS:-1}
       TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-true}
       CORS_ORIGIN: ${CORS_ORIGIN:-*}
-      HTTP_PROXY: ${HTTP_PROXY:-}
-      HTTPS_PROXY: ${HTTPS_PROXY:-}
-      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,backend,web}
       MEMORY_AUTO_UPDATE: ${MEMORY_AUTO_UPDATE:-true}
       MEMORY_MODEL: ${MEMORY_MODEL:-}
       MEMORY_CHECK_INTERVAL: ${MEMORY_CHECK_INTERVAL:-5m}
       MEMORY_MIN_NEW_MESSAGES: ${MEMORY_MIN_NEW_MESSAGES:-6}
+      PRO_LIMIT_5H_CENTS: ${PRO_LIMIT_5H_CENTS:-1500}
+      PRO_LIMIT_7D_CENTS: ${PRO_LIMIT_7D_CENTS:-15000}
+    depends_on:
+      runner:
+        condition: service_healthy
+    networks: [frontend, runner_rpc, core_host]
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
       - app_data:/app/data
-      - agy_auth:/home/app/.gemini
-      - ag_unlocker_data:/home/app/.local/share/agunlocker
-      - cli_codex:/home/app/.codex
-      - cli_codex_chat:/home/app/.codex-chat
-      - cli_claude:/home/app/.claude
-    # Если анлокер или Google API в Docker падают с ошибкой 400 по IPv6,
-    # раскомментируйте отключение IPv6 в контейнере:
-    # sysctls:
-    #   - net.ipv6.conf.all.disable_ipv6=1
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     healthcheck:
       test:
-        - CMD-SHELL
-        - >-
-          curl -fsS http://127.0.0.1:8080/api/health >/dev/null || exit 1;
-          if [ "$$PROVIDER" = "antigravity" ]; then
-            case "$$(printf '%s' "$${AG_UNLOCKER_ENABLED:-true}" | tr '[:upper:]' '[:lower:]')" in
-              1|true|yes|on)
-                node -e 'const fs=require("fs"),net=require("net"),p=(process.env.XDG_DATA_HOME||process.env.HOME+"/.local/share")+"/agunlocker/proxy_port";let port=53129;try{const v=fs.readFileSync(p,"utf8").trim();if(v)port=Number(v)}catch{};const s=net.connect({host:"127.0.0.1",port});s.setTimeout(1000);s.on("connect",()=>{s.destroy();process.exit(0)});s.on("timeout",()=>{s.destroy();process.exit(1)});s.on("error",()=>process.exit(1))' || exit 1
-                ;;
-            esac;
-          fi
+        - CMD
+        - bash
+        - -ec
+        - |
+          exec 3<>/dev/tcp/127.0.0.1/8080
+          printf 'GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3
+          read -r status <&3
+          [[ "$$status" == 'HTTP/1.1 200 '* ]]
       interval: 10s
-      timeout: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  runner:
+    build:
+      context: .
+      target: runner
+      args:
+        AGY_USE_UNLOCKER: ${AGY_USE_UNLOCKER:-false}
+    restart: unless-stopped
+    stop_grace_period: 20s
+    environment:
+      RUNNER_ADDR: 0.0.0.0:8081
+      RUNNER_SHARED_SECRET: ${RUNNER_SHARED_SECRET:?Set RUNNER_SHARED_SECRET in .env}
+      PROVIDER: ${PROVIDER:-stub}
+      MAX_CONCURRENT_STREAMS: ${MAX_CONCURRENT_STREAMS:-1}
+      ANTIGRAVITY_MODEL: ${ANTIGRAVITY_MODEL:-gemini-3.8-flash-high}
+      ANTIGRAVITY_MODELS: ${ANTIGRAVITY_MODELS:-}
+      AG_LS_PROXY: ${AG_LS_PROXY:-}
+      XDG_CACHE_HOME: /tmp/cache
+    networks: [runner_rpc, runner_proxy, runner_egress]
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,mode=1777
+      - /workspace:ro,noexec,nosuid,nodev,mode=0555
+    volumes:
+      - agy_auth:/home/app/.gemini
+      - cli_codex:/home/app/.codex
+      # Contains isolated auth and session state with a generated chat policy.
+      - cli_codex_chat:/home/app/.codex-chat
+      - cli_claude:/home/app/.claude
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+  unlocker:
+    profiles: ["antigravity"]
+    platform: linux/amd64
+    build:
+      context: .
+      target: unlocker
+    restart: unless-stopped
+    init: true
+    environment:
+      AG_UNLOCKER_CODE: ${AG_UNLOCKER_CODE:-}
+    networks: [runner_proxy, unlocker_egress]
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,mode=1777
+    volumes:
+      - ag_unlocker_data:/home/app/.local/share/agunlocker
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/unlocker-entrypoint", "healthcheck"]
+      interval: 10s
+      timeout: 3s
       retries: 5
       start_period: 10s
-    security_opt:
-      - "no-new-privileges:true"
-    cap_drop:
-      - "ALL"
 
   web:
     build:
@@ -70,12 +113,30 @@ services:
       dockerfile: Dockerfile.web
     restart: unless-stopped
     depends_on:
-      backend:
+      core:
         condition: service_healthy
+    networks: [frontend, web_egress]
     volumes:
       - ./deploy/Caddyfile.local:/etc/caddy/Caddyfile:ro
     ports:
       - "127.0.0.1:3000:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+networks:
+  core_host:
+  frontend:
+    internal: true
+  runner_rpc:
+    internal: true
+  runner_proxy:
+    internal: true
+  runner_egress:
+  unlocker_egress:
+  web_egress:
 
 volumes:
   app_data:

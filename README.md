@@ -12,7 +12,7 @@
 
 ## Быстрый старт в Docker (Windows / macOS / Linux)
 
-Требуется установленный Docker Engine и Docker Compose v2+. Docker является основной средой запуска и проверки проекта: после внесения изменений в код необходимо пересобрать и перезапустить обновлённый сервис (`docker compose up -d --build web` для фронтенда, `docker compose up -d --build backend` для бэкенда или `docker compose up -d --build` целиком).
+Требуется установленный Docker Engine и Docker Compose v2+. Docker является основной средой запуска и проверки проекта: после внесения изменений в код необходимо пересобрать и перезапустить обновлённый сервис (`docker compose up -d --build web` для фронтенда, `docker compose up -d --build core runner` для бэкенда или `docker compose up -d --build` целиком).
 
 1. Клонируйте репозиторий и создайте `.env` из шаблона:
    ```sh
@@ -20,6 +20,7 @@
    cd agent-console
    cp .env.example .env
    ```
+   Сгенерируйте токен командой `openssl rand -hex 32` и запишите его в `RUNNER_SHARED_SECRET` в `.env`.
 
 2. Соберите и запустите стек:
    ```sh
@@ -28,7 +29,7 @@
 
 3. Создайте первого пользователя (например, администратора `demo`):
    ```sh
-   docker compose exec -it backend /app/agent-server create-user --username demo --password 'demo-password' --role admin
+   docker compose exec -it core /app/agent-server create-user --username demo --password 'demo-password' --role admin
    ```
 
 4. Откройте веб-клиент:
@@ -41,20 +42,17 @@
 ### Подключение Antigravity CLI (`agy`) внутри Docker
 
 1. В `.env` задайте `PROVIDER=antigravity` (и при необходимости `ANTIGRAVITY_MODEL=gemini-3.8-flash-high`).
-2. Перезапустите `backend`:
+2. Выполните `docker compose up -d --build core runner`. Для запуска с локальным прокси используйте профиль `antigravity` и параметры из [HANDOFF.md](HANDOFF.md#docker).
+3. Выполните одноразовую авторизацию в контейнере `runner`:
    ```sh
-   docker compose up -d backend
-   ```
-3. Выполните одноразовую авторизацию (учётные данные сохранятся в named volume `agy_auth`):
-   ```sh
-   docker compose exec -it backend agy
+   docker compose exec -it runner agy
    ```
 
 ### Горячий бэкап SQLite из volume
 
 ```sh
-docker compose exec backend sqlite3 /app/data/app.db ".backup /tmp/backup.db"
-docker compose cp backend:/tmp/backup.db ./backup.db
+docker compose exec core sqlite3 /app/data/app.db ".backup /tmp/backup.db"
+docker compose cp core:/tmp/backup.db ./backup.db
 ```
 
 ---
@@ -62,20 +60,18 @@ docker compose cp backend:/tmp/backup.db ./backup.db
 ## Деплой на Linux VPS (HTTPS через Caddy)
 
 1. Настройте DNS A-запись домена на IP сервера и откройте порты `80` и `443`.
-2. В `.env` укажите ваш домен и точные CORS origin:
+2. В `.env` задайте `DOMAIN` и `RUNNER_SHARED_SECRET`. Prod-оверлей устанавливает CORS по указанному домену и запускает `unlocker`:
    ```env
    DOMAIN=console.example.com
-   CORS_ORIGIN=https://console.example.com
    TRUST_PROXY_HEADERS=true
    ```
-   *(Если используете Telegram Mini App, добавьте его origin в `CORS_ORIGIN` через запятую.)*
 3. Запустите стек с prod-оверлеем:
    ```sh
    docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
    ```
 4. Создайте пользователя:
    ```sh
-   docker compose exec -it backend /app/agent-server create-user --username admin --password 'strong-password' --role admin
+   docker compose exec -it core /app/agent-server create-user --username admin --password 'strong-password' --role admin
    ```
 
 ---

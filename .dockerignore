@@ -7,3 +7,7 @@ server/data
 .env
 server/.env
 *.log
+**/.env
+**/.env.*
+**/app.db
+**/app.db-*

@@ -1,76 +1,82 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.26-bookworm AS go-builder
-
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS go-source
 WORKDIR /src
-
 COPY server/go.mod server/go.sum ./
 RUN go mod download
-
 COPY server/ ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/agent-server ./cmd/server
 
-FROM node:22-bookworm-slim AS runtime
+FROM go-source AS build-core
+ARG TARGETOS TARGETARCH
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/agent-server ./cmd/server
 
+FROM go-source AS build-runner
+ARG TARGETOS TARGETARCH
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/agent-runner ./cmd/runner
+
+FROM debian:bookworm-slim AS core
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl sqlite3 \
-    && rm -rf /var/lib/apt/lists/*
-
-ARG INSTALL_CODEX=false
-ARG INSTALL_CLAUDE=false
-
-RUN if [ "$INSTALL_CODEX" = "true" ]; then npm install -g @openai/codex@0.172.0; fi \
-    && if [ "$INSTALL_CLAUDE" = "true" ]; then npm install -g @anthropic-ai/claude-code; fi \
-    && if [ "$INSTALL_CODEX" = "true" ] || [ "$INSTALL_CLAUDE" = "true" ]; then npm cache clean --force; fi
-
-RUN useradd -m -d /home/app -s /bin/bash app \
-    && install -d -m 0555 /workspace \
-    && mkdir -p /app/data /home/app/.codex-chat /home/app/.local/bin /home/app/.local/share/agunlocker /home/app/.gemini /home/app/.codex /home/app/.claude \
-    && chown -R app:app /app /home/app
-
-ARG INSTALL_AG_UNLOCKER=true
-ARG AG_UNLOCKER_VERSION=v2.35.0
-
-# Install Linux x86_64 Antigravity Unlocker binary (amd64 only).
-RUN if [ "$INSTALL_AG_UNLOCKER" = "true" ]; then \
-        ARCH="$(uname -m)" \
-        && case "$ARCH" in \
-            x86_64|amd64) ;; \
-            *) echo "Unsupported architecture for ag_unlocker: $ARCH (only linux/amd64 is supported). Rebuild with --platform=linux/amd64 or --build-arg INSTALL_AG_UNLOCKER=false." >&2; exit 1 ;; \
-        esac \
-        && TAG="${AG_UNLOCKER_VERSION}" \
-        && case "$TAG" in v*) ;; *) TAG="v${TAG}" ;; esac \
-        && VER="${TAG#v}" \
-        && ALT="$(echo "$VER" | sed -E 's/\.([0-9]+)$/_\1/')" \
-        && TMP_DIR="$(mktemp -d)" \
-        && DOWNLOADED="" \
-        && for cand in "$VER" "$ALT"; do \
-            URL="https://github.com/confeden/Antigravity/releases/download/${TAG}/AG_${cand}_linux.tar.gz"; \
-            if curl -fsSL "$URL" -o "$TMP_DIR/ag.tar.gz" 2>/dev/null; then \
-                tar -xzf "$TMP_DIR/ag.tar.gz" -C "$TMP_DIR"; \
-                install -m 0755 "$TMP_DIR/AG_${cand}_linux/ag_unlocker" /usr/local/bin/ag_unlocker; \
-                DOWNLOADED="1"; \
-                break; \
-            fi; \
-        done \
-        && rm -rf "$TMP_DIR" \
-        && test -n "$DOWNLOADED"; \
-    else \
-        echo "Skipping ag_unlocker installation (INSTALL_AG_UNLOCKER=$INSTALL_AG_UNLOCKER)" >&2; \
-    fi
-
-COPY --chown=app:app --chmod=0755 deploy/entrypoint.sh /app/entrypoint.sh
-
+    && apt-get install -y --no-install-recommends sqlite3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 1001 app \
+    && useradd -u 1001 -g app -m -d /home/app -s /usr/sbin/nologin app \
+    && install -d -o app -g app -m 0700 /app/data
+COPY --from=build-core /out/agent-server /app/agent-server
+ENV RUNNING_IN_DOCKER=true
 USER app
 WORKDIR /app
-
-ENV RUNNING_IN_DOCKER=true
-ENV PATH="/home/app/.local/bin:${PATH}"
-
-RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
-
-COPY --from=go-builder --chown=app:app /out/agent-server /app/agent-server
-
 EXPOSE 8080
+ENTRYPOINT ["/app/agent-server"]
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+FROM node:22-bookworm-slim AS runner
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -d /home/app -s /bin/bash app \
+    && install -d -m 0555 /workspace \
+    && install -d -o app -g app -m 0700 /home/app/.gemini /home/app/.codex /home/app/.codex-chat /home/app/.claude
+RUN npm install -g @openai/codex@0.172.0 @anthropic-ai/claude-code@2.1.332 \
+    && npm cache clean --force
+RUN mkdir -p /tmp/agy-install \
+    && curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy-install/install.sh \
+    && HOME=/tmp/agy-install bash /tmp/agy-install/install.sh \
+    && install -m 0755 /tmp/agy-install/.local/bin/agy /usr/local/bin/agy \
+    && rm -rf /tmp/agy-install
+ARG AGY_USE_UNLOCKER=false
+RUN --mount=type=bind,source=deploy/patch-agy.cjs,target=/tmp/patch-agy.cjs \
+    if [ "$AGY_USE_UNLOCKER" = "true" ]; then node /tmp/patch-agy.cjs /usr/local/bin/agy; fi
+COPY --from=build-runner /out/agent-runner /app/agent-runner
+ENV RUNNING_IN_DOCKER=true HOME=/home/app
+USER app
+WORKDIR /app
+EXPOSE 8081
+ENTRYPOINT ["/app/agent-runner"]
+
+FROM node:22-bookworm-slim AS unlocker
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl socat \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -d /home/app -s /usr/sbin/nologin app \
+    && install -d -o app -g app -m 0700 /home/app/.local/share/agunlocker
+ARG AG_UNLOCKER_VERSION=v2.35.0
+RUN set -eu; \
+    tag="$AG_UNLOCKER_VERSION"; \
+    version="${tag#v}"; \
+    alt="$(printf '%s' "$version" | sed -E 's/\.([0-9]+)$/_\1/')"; \
+    temp="$(mktemp -d)"; \
+    for candidate in "$version" "$alt"; do \
+        if curl -fsSL "https://github.com/confeden/Antigravity/releases/download/$tag/AG_${candidate}_linux.tar.gz" -o "$temp/ag.tar.gz"; then \
+            tar -xzf "$temp/ag.tar.gz" -C "$temp"; \
+            install -m 0755 "$temp/AG_${candidate}_linux/ag_unlocker" /usr/local/bin/ag_unlocker; \
+            break; \
+        fi; \
+    done; \
+    test -x /usr/local/bin/ag_unlocker; \
+    rm -rf "$temp"
+COPY --chmod=0755 deploy/unlocker-entrypoint.sh /usr/local/bin/unlocker-entrypoint
+ENV HOME=/home/app
+USER app
+EXPOSE 53130
+ENTRYPOINT ["/usr/local/bin/unlocker-entrypoint"]

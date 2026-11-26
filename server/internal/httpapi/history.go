@@ -24,7 +24,7 @@ type indexedHistory struct {
 
 func (a *API) privateHistory(s session) (codexHistory, bool) {
 	h, ok := a.live.backend.(codexHistory)
-	return h, ok && a.config.CodexHistoryUsername != "" && s.User.Username == a.config.CodexHistoryUsername
+	return h, ok && a.config.Provider == "codex" && a.config.CodexHistoryUsername != "" && s.User.Username == a.config.CodexHistoryUsername
 }
 
 func (a *API) loadIndex(ctx context.Context, source codexHistory) ([]provider.IndexedChat, error) {
