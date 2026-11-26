@@ -2,22 +2,22 @@ import { useTelegramBack } from '../platform/telegram'
 import { RetryActions } from './RetryActions'
 import { Billing } from './Billing'
 import { Incoming, LimitActions, Quotas, ServerQuotas } from './Quotas'
-import { Login } from './Login'
+import { AuthScene } from './AuthScene'
 import { WorkspaceDialog } from './WorkspaceDialog'
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ArrowUp, Brain, Check, ChevronRight, CodeXml, GitFork, Hourglass, Image as ImageIcon, Laptop, Menu, MessageSquare, PanelLeft, Paperclip, Settings2, Share2, Square, Terminal } from 'lucide-react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Hourglass, Image as ImageIcon, Laptop, Menu, PanelLeft, Paperclip, Settings2, Share2, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
 import { demoPrompt, availableDevices, models, providerLabels, checkAccountStatus, logout, newChat, retryAnswer, retryHistory, sendPrompt, stopChat, updateChat, useChats } from './chatStore'
 import type { Chat, Turn } from './chatStore'
-import { ServerModelSelect } from './ServerModelSelect'
-import { ProviderSelect, type ProviderOption } from './ProviderSelect'
-import { SelectMenu } from './SelectMenu'
-import { defaultReasoningForProvider } from './modelCatalog'
+import { EnvironmentPopover, ModelPopover } from './ComposerPopovers'
+import type { ProviderOption } from './ProviderSelect'
+import { defaultReasoningForProvider, groupServerModels } from './modelCatalog'
 import { Sidebar } from './Sidebar'
 import { ToolCard } from './ToolCard'
 import { RichText } from './Markdown'
 import { AdminDialog } from './AdminDialog'
+import { AmbientBackground } from './AmbientBackground'
 
 const mcpExamples = [
   ['Список файлов', 'Покажи файлы проекта'],
@@ -44,29 +44,36 @@ function Transcript({ turn, chatId, writable, busy, retry, demo }: { turn: Turn;
   const w = useChats(s => s.workspace)!
   const authorId = turn.authorId ?? w.chats.find(c => c.id === chatId)?.ownerId
   const author = authorId === w.user.id ? 'Вы' : w.users.find(u => u.id === authorId)?.name ?? 'Участник'
+  const isSelf = authorId === w.user.id
   return <article className="turn">
-    {(turn.prompt || !!turn.attachments?.length) && <>
-      <div className="person"><span className="person-avatar">{author === 'Вы' ? 'Я' : author[0]}</span><strong>{author}</strong><time>{clock.format(turn.time)}</time></div>
-      <div className="user-prompt">
-        {!!turn.attachments?.length && <ul className="message-attachments" aria-label="Вложения">
-          {turn.attachments.map((attachment, index) => {
-            const Icon = attachment.kind === 'image' ? ImageIcon : Paperclip
-            return <li key={index} title={attachment.name}><Icon size={14} aria-hidden="true"/><span>{attachment.name}</span></li>
-          })}
-        </ul>}
-        {turn.prompt}
+    {(turn.prompt || !!turn.attachments?.length) && (
+      <div className={'user-turn-block' + (isSelf ? ' is-self' : '')}>
+        <div className="person user-person">
+          <span className="person-avatar">{author === 'Вы' ? 'Я' : author[0]}</span>
+          <strong>{author}</strong>
+          <time>{clock.format(turn.time)}</time>
+        </div>
+        <div className="user-bubble">
+          {!!turn.attachments?.length && <ul className="message-attachments" aria-label="Вложения">
+            {turn.attachments.map((attachment, index) => {
+              const Icon = attachment.kind === 'image' ? ImageIcon : Paperclip
+              return <li key={index} title={attachment.name}><Icon size={14} aria-hidden="true"/><span>{attachment.name}</span></li>
+            })}
+          </ul>}
+          <div className="user-prompt">{turn.prompt}</div>
+        </div>
       </div>
-    </>}
-    <div className="person agent"><span className="agent-avatar"><CodeXml size={17}/></span><strong>{turn.model}</strong>{turn.retryOf && <span className="retry-label">Повтор ответа</span>}<time>{clock.format(turn.time)}</time></div>
+    )}
+    <div className="person agent"><span className="agent-avatar"><CodeXml size={15}/></span><strong>{turn.model}</strong>{turn.retryOf && <span className="retry-label">Повтор ответа</span>}<time>{clock.format(turn.time)}</time></div>
     <div className="response">
       {turn.progress ? <details className="response-progress">
         <summary>{progressLabel(turn.durationMs)}<ChevronRight size={14}/></summary>
         <div className="response-progress-body"><RichText text={turn.progress}/></div>
       </details> : turn.durationMs != null && <span className="response-duration">{progressLabel(turn.durationMs)}</span>}
       {turn.parts.map((p, i) => p.kind === 'tool' ? <ToolCard key={p.callId} chatId={chatId} turn={turn} entry={p}/> : p.kind === 'thinking'
-      ? <details className="thinking" key={i}><summary><Brain size={14}/>Thinking<ChevronRight size={13}/></summary><p>{p.text}</p></details>
+      ? <details className="thinking" key={i}><summary><Brain size={14}/><span>Рассуждения</span><ChevronRight size={13}/></summary><p>{p.text}</p></details>
       : <RichText text={p.text} key={i}/>)}
-      {turn.parts.length === 0 && turn.state === 'running' && <span role="status" className="waiting">Агент подключается…</span>}
+      {turn.parts.length === 0 && turn.state === 'running' && <span role="status" className="waiting"><i aria-hidden="true"/>Агент подключается…</span>}
       {(turn.notice || turn.state === 'stopped') && <p role="status" className="notice">{turn.notice ?? 'Ответ остановлен.'}</p>}
       {demo && <RetryActions turn={turn} writable={writable} busy={busy} retry={retry}/>}
     </div>
@@ -74,7 +81,7 @@ function Transcript({ turn, chatId, writable, busy, retry, demo }: { turn: Turn;
 }
 
 function Conversation({ chat, share, billing }: { chat: Chat; share: () => void; billing: () => void }) {
-  const { workspace: w, remote, connected, serverModels } = useChats()
+  const { workspace: w, remote, connected, serverModels, connectionError } = useChats()
   const provider = models.find(m => m.id === chat.model)?.provider ?? (remote ? (remote.provider === 'stub' ? 'codex' : remote.provider) : 'claude')
   const sampleBlocked = useAccountStore(s => !!blockReason(s.quotas.claude))
   const reason = useAccountStore(s => remote ? undefined : blockReason(s.quotas[provider]))
@@ -84,6 +91,8 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
   const scroll = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
   const input = useRef<HTMLTextAreaElement>(null)
+  const composerRef = useRef<HTMLDivElement>(null)
+  const [openMenu, setOpenMenu] = useState<'model' | 'env' | null>(null)
   const running = chat.turns.at(-1)?.state === 'running'
   const editable = chat.access === 'owner' || chat.access === 'write'
   const locked = running || !editable
@@ -93,9 +102,31 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
     const box = scroll.current
     if (box && follow.current) box.scrollTop = box.scrollHeight
   }, [chat.turns])
+  useLayoutEffect(() => {
+    const el = input.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 180)}px`
+  }, [chat.draft, editable])
+  useEffect(() => {
+    if (!openMenu) return
+    const onPointerDown = (e: PointerEvent) => {
+      if (!composerRef.current?.contains(e.target as Node)) setOpenMenu(null)
+    }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpenMenu(null)
+    }
+    window.addEventListener('pointerdown', onPointerDown)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [openMenu])
   const submit = () => {
     if (!blocked && !running && editable && chat.draft.trim()) {
       follow.current = true
+      setOpenMenu(null)
       void sendPrompt(chat.id, chat.draft)
       input.current?.focus()
     }
@@ -127,122 +158,210 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
       ]
     : providerEntries.map(([id, label]) => ({ id, label, available: models.some(m => m.provider === id) }))
 
+  const remoteGroups = remote ? groupServerModels(serverModels) : []
+  const remoteActiveGroup = remote && chat.model !== 'default'
+    ? remoteGroups.find(g => g.variants.some(v => v.id === chat.model))
+    : undefined
+  const remoteVariant = remoteActiveGroup?.variants.find(v => v.id === chat.model)
+  const modelButtonName = remote
+    ? chat.model === 'default'
+      ? 'По умолчанию'
+      : remoteActiveGroup?.name ?? chat.model
+    : activeDemoGroup?.name ?? chat.model
+  const activeDemoVariant = activeDemoGroup?.variants.find(v => v.id === chat.model)
+  const rawReasoningLabel = remote
+    ? remoteActiveGroup?.hasVariantReasoning
+      ? remoteVariant?.reasoning
+      : chat.reasoning || undefined
+    : hasDemoVariantReasoning
+      ? (activeDemoVariant && 'reasoning' in activeDemoVariant ? activeDemoVariant.reasoning : undefined)
+      : chat.reasoning || undefined
+  const reasoningPillLabel = rawReasoningLabel
+    ? demoReasoningOptions.find(o => o.value === rawReasoningLabel)?.label ?? rawReasoningLabel
+    : 'По умолчанию'
+  const modelTriggerLabel = `${modelButtonName} · ${reasoningPillLabel}`
+
+  const targetDeviceId = chat.target.mode === 'mcp' ? chat.target.deviceId : w!.deviceId
+  const activeDevice = chat.target.mode === 'mcp'
+    ? devices.find(d => d.id === targetDeviceId) ?? devices[0]
+    : undefined
+  const envTriggerLabel = chat.target.mode === 'mcp' ? 'Управление ПК' : 'Чат'
+
+  const statusText = pending
+    ? 'Ожидается разрешение'
+    : running
+      ? 'Агент отвечает…'
+      : reason
+        ? 'Ввод приостановлен: ' + reason
+        : connectionError
+          ? connectionError
+          : remote && !connected
+            ? 'Подключение к серверу…'
+            : remote && !chat.historyLoaded
+              ? 'Ожидание истории…'
+              : unavailableModel
+                ? 'Выберите доступную модель'
+                : 'Готов к сообщению'
+  const statusTone = (reason || connectionError || unavailableModel)
+    ? 'is-error'
+    : (pending || running || (remote && (!connected || !chat.historyLoaded)))
+      ? 'is-busy'
+      : 'is-ready'
+
   return <>
-    <header className="chat-heading"><div className="heading-inner"><div className="heading-icon"><Terminal size={21}/></div><div className="heading-text"><h1 title={chat.title}>{chat.title}</h1><div className="heading-meta"><i/>{remote ? 'Сервер' : 'Демо-сессия'}<span>/</span><span>{chat.indexedCodex ? 'История Codex' : chat.access === 'owner' ? 'Личный чат' : 'Общий чат'}</span></div></div>{!chat.indexedCodex && chat.access === 'owner' && <button className="share-action" onClick={share} aria-label="Поделиться"><Share2 size={15}/><span>Поделиться</span></button>}</div><div className="header-controls">
-          {remote ? (
-            <ProviderSelect value={remote.provider} options={providerOptions} disabled={locked} onChange={() => {}} />
-          ) : (
-            <ProviderSelect
-              value={provider}
-              options={providerOptions}
-              disabled={locked}
-              onChange={nextProvider => {
-                const first = models.find(m => m.provider === nextProvider)
-                if (first) updateChat(chat.id, c => ({ ...c, model: first.id, reasoning: undefined }))
-              }}
-            />
-          )}
-          {chat.indexedCodex ? null : remote ? <ServerModelSelect model={chat.model} reasoning={chat.reasoning} unavailable={unavailableModel} disabled={locked}
-            onChangeModel={model => updateChat(chat.id, c => ({ ...c, model }))}
-            onChangeReasoning={reasoning => updateChat(chat.id, c => ({ ...c, reasoning: reasoning || undefined }))}/>
-            : <>
-              <div className="select-wrap catalog-select"><span>Модель</span><SelectMenu
-                ariaLabel="Модель"
-                disabled={locked}
-                value={activeDemoGroup?.name ?? ''}
-                options={demoModelGroups.map(g => ({ value: g.name, label: g.name }))}
-                onChange={nextName => {
-                  const nextGroup = demoModelGroups.find(g => g.name === nextName)
-                  if (!nextGroup) return
-                  const currentReasoning = activeDemoGroup?.variants.find(v => v.id === chat.model)
-                  const currentLevel = currentReasoning && 'reasoning' in currentReasoning ? currentReasoning.reasoning : undefined
-                  const matched = currentLevel
-                    ? nextGroup.variants.find(v => 'reasoning' in v && v.reasoning === currentLevel)
-                    : undefined
-                  const chosen = matched ?? nextGroup.variants[0]
-                  if (chosen) updateChat(chat.id, c => ({ ...c, model: chosen.id }))
-                }}
-              /></div>
-              <div className="select-wrap catalog-select"><span>Рассуждения</span>{hasDemoVariantReasoning ? (
-                <SelectMenu
-                  ariaLabel="Рассуждения"
-                  disabled={locked || (activeDemoGroup?.variants.length ?? 0) <= 1}
-                  value={chat.model}
-                  options={(activeDemoGroup?.variants ?? []).map(v => ({
-                    value: v.id,
-                    label: 'reasoning' in v && v.reasoning ? v.reasoning : v.shortLabel,
-                  }))}
-                  onChange={model => updateChat(chat.id, c => ({ ...c, model }))}
-                />
-              ) : (
-                <SelectMenu
-                  ariaLabel="Рассуждения"
-                  disabled={locked || demoReasoningOptions.length === 0}
-                  value={demoReasoningOptions.length ? (chat.reasoning ?? '') : ''}
-                  options={[{ value: '', label: 'По умолчанию' }, ...demoReasoningOptions]}
-                  onChange={nextReasoning => updateChat(chat.id, c => ({ ...c, reasoning: nextReasoning || undefined }))}
-                />
-              )}</div>
-            </>}
-          {remote ? <span className="select-wrap"><Terminal size={14}/>Только чат</span> : <div className="select-wrap mode"><Terminal size={14}/><SelectMenu
-            ariaLabel="Режим"
-            disabled={locked}
-            value={chat.target.mode}
-            options={[{ value: 'chat', label: 'Только чат' }, { value: 'mcp', label: 'Управление ПК (MCP)' }]}
-            onChange={modeValue => updateChat(chat.id, c => ({ ...c, target: modeValue === 'chat' ? { mode: 'chat' } : { mode: 'mcp', deviceId: w!.deviceId } }))}
-          /></div>}
-          {chat.target.mode === 'mcp' && <div className="device-select"><Laptop size={13}/><SelectMenu
-            ariaLabel="Целевое устройство"
-            disabled={locked}
-            value={chat.target.deviceId}
-            options={devices.map(d => ({
-              value: d.id,
-              label: `${d.name} · ${d.ownerId !== w!.user.id ? 'ПК владельца · ' : ''}${d.online ? 'онлайн' : 'офлайн'}`,
-              disabled: !d.online,
-            }))}
-            onChange={deviceId => updateChat(chat.id, c => ({ ...c, target: { mode: 'mcp', deviceId } }))}
-          /></div>}</div></header>
+    <header className="chat-heading"><div className="heading-inner"><div className="heading-icon"><Terminal size={19}/></div><div className="heading-text"><h1 title={chat.title}>{chat.title}</h1><div className="heading-meta"><i/>{remote ? 'Сервер' : 'Демо-сессия'}<span>/</span><span>{chat.indexedCodex ? 'История Codex' : chat.access === 'owner' ? 'Личный чат' : 'Общий чат'}</span>{!editable && chat.model && <><span>/</span><span className="heading-model-tag">{chat.model}</span></>}</div></div>{!chat.indexedCodex && chat.access === 'owner' && <button className="share-action" onClick={share} aria-label="Поделиться"><Share2 size={15}/><span>Поделиться</span></button>}</div></header>
     <div className="history" ref={scroll} onScroll={() => { const el = scroll.current; if (el) follow.current = el.scrollHeight - el.clientHeight - el.scrollTop < 48 }}>
       <div className="thread">
         {chat.historyError && <div className="notice" role="alert">{chat.historyError} <button className="text-action" onClick={retryHistory}>Повторить загрузку</button></div>}
-        {remote && !chat.historyLoaded ? !chat.historyError && <p role="status" className="notice">Загружаю историю…</p>
-          : chat.turns.length ? chat.turns.map(turn => <Transcript key={turn.id} chatId={chat.id} turn={turn} writable={editable} busy={running} demo={!remote} retry={modelId => {
+        {remote && !chat.historyLoaded ? !chat.historyError && (
+          <div className="skeleton-stack" role="status" aria-label="Загружаю историю…">
+            <span className="sr-only">Загружаю историю…</span>
+            <div className="skeleton-line is-short" />
+            <div className="skeleton-line is-medium" />
+            <div className="skeleton-line is-long" />
+          </div>
+        ) : chat.turns.length ? chat.turns.map(turn => <Transcript key={turn.id} chatId={chat.id} turn={turn} writable={editable} busy={running} demo={!remote} retry={modelId => {
         follow.current = true
         void retryAnswer(chat.id, turn.id, modelId)
       }}/>) :
-        <div className="empty"><MessageSquare size={23}/><h2>{chat.indexedCodex ? 'В этом чате нет сообщений' : 'Начните разговор'}</h2>{remote ? editable && <p>Отправьте первое сообщение.</p> : editable && <><p>Отправьте сообщение или попробуйте демо-сценарий.</p><div>{['Предложи изменение settings.ts', 'Запусти тесты'].map(prompt => <button key={prompt} disabled={!!reason} onClick={() => { updateChat(chat.id, c => ({ ...c, target: { mode: 'mcp', deviceId: w!.deviceId } })); void sendPrompt(chat.id, prompt) }}>{prompt}<ChevronRight size={13}/></button>)}<button disabled={sampleBlocked} onClick={() => {
-          updateChat(chat.id, c => ({ ...c, model: provider === 'claude' ? c.model : 'sonnet', target: { mode: 'chat' } }))
-          void sendPrompt(chat.id, 'Объясни на примере, что такое тайм-аут подключения.')
-        }}>Пример отказа модели<ChevronRight size={13}/></button></div></>}</div>}
+        <div className="empty empty-hero">
+          <div className="empty-squircle" aria-hidden="true"><CodeXml size={26} strokeWidth={2.1}/></div>
+          <h2>{chat.indexedCodex ? 'В этом чате нет сообщений' : 'Начните разговор'}</h2>
+          {remote ? editable && <p>Отправьте первое сообщение.</p> : editable && <>
+            <p>Отправьте сообщение или попробуйте готовый демо-сценарий.</p>
+            <div className="empty-suggestions">
+              {['Предложи изменение settings.ts', 'Запусти тесты'].map(prompt => (
+                <button key={prompt} disabled={!!reason} onClick={() => { updateChat(chat.id, c => ({ ...c, target: { mode: 'mcp', deviceId: w!.deviceId } })); void sendPrompt(chat.id, prompt) }}>
+                  {prompt}<ChevronRight size={13}/>
+                </button>
+              ))}
+              <button disabled={sampleBlocked} onClick={() => {
+                updateChat(chat.id, c => ({ ...c, model: provider === 'claude' ? c.model : 'sonnet', target: { mode: 'chat' } }))
+                void sendPrompt(chat.id, 'Объясни на примере, что такое тайм-аут подключения.')
+              }}>Пример отказа модели<ChevronRight size={13}/></button>
+            </div>
+          </>}
+        </div>}
       </div>
     </div>
     <footer className="composer-wrap"><div className="composer-inner">{editable ? <>
       {reason && !running && <LimitActions key={provider} w={w!} provider={provider} reason={reason} switchCodex={() => updateChat(chat.id,c => ({ ...c, model: 'codex' }))} billing={billing}/>}
-      <div className="composer"><textarea disabled={!!reason} ref={input} rows={2} aria-label="Сообщение агенту" placeholder="Сообщение агенту…" value={chat.draft}
-        onChange={e => updateChat(chat.id, c => ({ ...c, draft: e.target.value }))}
-        onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit() } }}/>
-        <div className="composer-controls">{chat.target.mode === 'mcp' && <div className="select-wrap mcp-examples"><Terminal size={14}/>
-          <SelectMenu
-            ariaLabel="Сценарии MCP"
-            placeholder="Сценарии MCP"
-            placement="top"
-            disabled={!!reason || running}
-            value=""
-            options={mcpExamples.map(([name, prompt]) => ({ value: prompt, label: name }))}
-            onChange={draft => {
-              if (draft) { updateChat(chat.id, c => ({ ...c, draft })); input.current?.focus() }
+      <div className="composer" ref={composerRef}>
+        {openMenu === 'model' && (
+          <ModelPopover
+            remoteMode={!!remote}
+            provider={remote ? remote.provider : provider}
+            providerOptions={providerOptions}
+            model={chat.model}
+            reasoning={chat.reasoning}
+            unavailableModel={unavailableModel}
+            disabled={locked}
+            demoModelGroups={demoModelGroups}
+            activeDemoGroup={activeDemoGroup}
+            hasDemoVariantReasoning={hasDemoVariantReasoning}
+            demoReasoningOptions={demoReasoningOptions}
+            onSelectProvider={nextProvider => {
+              if (remote) return
+              const first = models.find(m => m.provider === nextProvider)
+              if (first) updateChat(chat.id, c => ({ ...c, model: first.id, reasoning: undefined }))
             }}
-          /></div>}
-          <span className="key-hint"><kbd>Enter</kbd> отправить <span>·</span> <kbd>Shift ↵</kbd> новая строка</span>{running && !remote ? <button className="send stop" title="Остановить ответ" aria-label="Остановить ответ" onClick={() => stopChat(chat.id)}><Square size={14} fill="currentColor"/></button>
-            : <button className="send" title="Отправить" aria-label="Отправить" disabled={blocked || running || !chat.draft.trim()} onClick={submit}><ArrowUp size={18}/></button>}</div></div>
-      <div className="composer-meta"><span role="status">{pending ? 'Ожидается разрешение' : running ? 'Агент отвечает…' : <><Check size={13}/>{reason ? 'Ввод приостановлен' : remote && !connected ? 'Подключение к серверу…' : remote && !chat.historyLoaded ? 'Ожидание истории' : unavailableModel ? 'Выберите модель' : 'Готов к сообщению'}</>}</span></div>
+            onSelectModel={model => updateChat(chat.id, c => ({ ...c, model }))}
+            onSelectReasoning={nextReasoning => updateChat(chat.id, c => ({ ...c, reasoning: nextReasoning || undefined }))}
+          />
+        )}
+        {openMenu === 'env' && (
+          <EnvironmentPopover
+            remoteMode={!!remote}
+            mode={chat.target.mode}
+            deviceId={chat.target.mode === 'mcp' ? chat.target.deviceId : w!.deviceId}
+            devices={devices}
+            ownerId={w!.user.id}
+            disabled={locked}
+            mcpExamples={mcpExamples}
+            onSelectMode={nextMode => updateChat(chat.id, c => ({
+              ...c,
+              target: nextMode === 'chat' ? { mode: 'chat' } : { mode: 'mcp', deviceId: w!.deviceId },
+            }))}
+            onSelectDevice={deviceId => updateChat(chat.id, c => ({ ...c, target: { mode: 'mcp', deviceId } }))}
+            onPickExample={draft => {
+              updateChat(chat.id, c => ({ ...c, draft }))
+              setOpenMenu(null)
+              input.current?.focus()
+            }}
+          />
+        )}
+        <textarea disabled={!!reason} ref={input} rows={1} aria-label="Сообщение агенту" placeholder="Сообщение агенту…" value={chat.draft}
+          onChange={e => updateChat(chat.id, c => ({ ...c, draft: e.target.value }))}
+          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit() } }}/>
+        <div className="composer-controls">
+          <div className="composer-triggers">
+            <button
+              type="button"
+              className={`composer-trigger${openMenu === 'model' ? ' is-open' : ''}`}
+              aria-haspopup="dialog"
+              aria-expanded={openMenu === 'model'}
+              onClick={() => setOpenMenu(prev => prev === 'model' ? null : 'model')}
+              title={modelTriggerLabel}
+            >
+              <Cpu size={13} aria-hidden="true" />
+              <span>{modelTriggerLabel}</span>
+              <ChevronDown size={12} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              className={`composer-trigger${openMenu === 'env' ? ' is-open' : ''}`}
+              aria-haspopup="dialog"
+              aria-expanded={openMenu === 'env'}
+              onClick={() => setOpenMenu(prev => prev === 'env' ? null : 'env')}
+              title={activeDevice ? `${envTriggerLabel} · ${activeDevice.name}` : envTriggerLabel}
+            >
+              {chat.target.mode === 'mcp' ? <Laptop size={13} aria-hidden="true" /> : <Terminal size={13} aria-hidden="true" />}
+              <span>{envTriggerLabel}</span>
+              {chat.target.mode === 'mcp' && <i className={`env-dot ${activeDevice?.online ? 'is-online' : 'is-offline'}`} aria-hidden="true" />}
+              <ChevronDown size={12} aria-hidden="true" />
+            </button>
+          </div>
+          <div className="composer-actions">
+            <span className={`status-lamp ${statusTone}`} role="status" title={statusText} aria-label={statusText} />
+            {running && !remote ? <button className="send stop" title="Остановить ответ" aria-label="Остановить ответ" onClick={() => stopChat(chat.id)}><Square size={13} fill="currentColor"/></button>
+              : <button className="send" title="Отправить" aria-label="Отправить" disabled={blocked || running || !chat.draft.trim()} onClick={submit}><ArrowUp size={17}/></button>}
+          </div>
+        </div>
+      </div>
     </> : <div className="access-note">{chat.access === 'fork' ? <button onClick={() => newChat(chat)}><GitFork size={15}/>Ответвить к себе</button> : 'Этот чат доступен для чтения'}</div>}</div></footer>
   </>
 }
 export function App() {
   const workspace = useChats(s => s.workspace)
-  if (!workspace) return <Login/>
-  return workspace.user.role === 'pending' ? <PendingAccount/> : <Connected key={workspace.user.id}/>
+  const restoring = useChats(s => s.restoring)
+  const [showAuthScene, setShowAuthScene] = useState(() => !workspace)
+  const [skipSplash, setSkipSplash] = useState(false)
+  const prevWorkspaceRef = useRef(workspace)
+
+  useEffect(() => {
+    if (prevWorkspaceRef.current && !workspace) {
+      setSkipSplash(true)
+      setShowAuthScene(true)
+    }
+    prevWorkspaceRef.current = workspace
+  }, [workspace])
+
+  const handleExited = useCallback(() => {
+    setShowAuthScene(false)
+  }, [])
+
+  return <>
+    <AmbientBackground dimmed={!!workspace && !showAuthScene}/>
+    {workspace && (workspace.user.role === 'pending' ? <PendingAccount/> : <Connected key={workspace.user.id}/>)}
+    {(showAuthScene || !workspace) && (
+      <AuthScene
+        authenticated={!!workspace}
+        restoring={restoring}
+        skipSplash={skipSplash}
+        onExited={handleExited}
+      />
+    )}
+  </>
 }
 function PendingAccount() {
   const [busy, setBusy] = useState(false)
@@ -262,7 +381,9 @@ function PendingAccount() {
       setBusy(false)
     }
   }
-  return <main className="login-screen"><section className="login-card pending-account">
+  return <main className="login-screen">
+    <div className="titlebar-drag-strip" data-tauri-drag-region aria-hidden="true" />
+    <section className="login-card pending-account">
     <div className="auth-brand"><span className="brand-logo"><Hourglass size={20}/></span>Agent Console</div>
     <h1>Ожидание активации</h1>
     <p className="form-help">Аккаунт создан и ожидает выдачи доступа администратором.</p>
@@ -302,15 +423,15 @@ function Connected() {
     return () => { clearTimeout(timer); unsubscribe(); useAccountStore.setState({ quotas: {}, requests: [] }); stopChat(useChats.getState().activeId) }
   }, [remote])
   return <div className={'workspace ' + (collapsed ? 'collapsed' : '')}>
-    <aside className="desktop-side"><Sidebar openBilling={() => setView('billing')} close={() => setView('chat')}/></aside>
-    <dialog ref={drawer} onClose={() => setDrawerOpen(false)} className="drawer" aria-label="Список чатов" onClick={e => { if (e.target === drawer.current) drawer.current.close() }}><Sidebar openBilling={() => { drawer.current?.close(); setView('billing') }} close={() => { drawer.current?.close(); setView('chat') }}/></dialog>
-    <main className="main"><div className="topbar"><button className="icon-btn desk-toggle" aria-label="Переключить боковую панель" onClick={() => setCollapsed(!collapsed)}><PanelLeft size={17}/></button><button className="icon-btn mobile" aria-label="Открыть список чатов" onClick={() => { drawer.current?.showModal(); setDrawerOpen(true) }}><Menu size={18}/></button>
-      <span className="crumb">Рабочее пространство</span><ChevronRight className="crumb-arrow" size={13}/><span>{view === 'billing' ? 'Биллинг API' : chat?.indexedCodex ? 'Чаты Codex' : (!chat || chat.access === 'owner') ? 'Мои чаты' : 'Доступные мне'}</span>{remote ? <ServerQuotas menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> : <Quotas userId={w.user.id} menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> }
+    <aside className="desktop-side"><Sidebar openBilling={() => setView('billing')} openSettings={() => setPanel('devices')} close={() => setView('chat')}/></aside>
+    <dialog ref={drawer} onClose={() => setDrawerOpen(false)} className="drawer" aria-label="Список чатов" onClick={e => { if (e.target === drawer.current) drawer.current.close() }}><Sidebar openBilling={() => { drawer.current?.close(); setView('billing') }} openSettings={() => { drawer.current?.close(); setPanel('devices') }} close={() => { drawer.current?.close(); setView('chat') }}/></dialog>
+    <main className="main"><div className="topbar" data-tauri-drag-region><button className="icon-btn desk-toggle" aria-label="Переключить боковую панель" onClick={() => setCollapsed(!collapsed)}><PanelLeft size={17}/></button><button className="icon-btn mobile" aria-label="Открыть список чатов" onClick={() => { drawer.current?.showModal(); setDrawerOpen(true) }}><Menu size={18}/></button>
+      <span className="crumb" data-tauri-drag-region>Рабочее пространство</span><ChevronRight className="crumb-arrow" size={13} aria-hidden="true"/><span className="topbar-section" data-tauri-drag-region>{view === 'billing' ? 'Биллинг API' : chat?.indexedCodex ? 'Чаты Codex' : (!chat || chat.access === 'owner') ? 'Мои чаты' : 'Доступные мне'}</span>{remote ? <ServerQuotas menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> : <Quotas userId={w.user.id} menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> }
       {isAdmin && <button className="alt-action admin-entry" onClick={() => setPanel('admin')}>Админка</button>}
       <button className="account-button" title="Настройки и устройства" aria-label="Настройки и устройства" onClick={() => setPanel('devices')}><Settings2 size={15}/><span>{'@' + (remote ? w.user.name : w.user.id)}</span></button></div>
       {connectionError && <p className="notice connection-error" role="alert">{connectionError}</p>}
       {!remote && incoming && <Incoming key={incoming.requestId} request={incoming}/>}
-      {view === 'billing' ? <Billing back={() => setView('chat')}/> : chat ? <Conversation key={chat.id} chat={chat} billing={() => setView('billing')} share={() => setPanel('share')}/> : <div className="empty thread"><h2>Пока нет чатов</h2><button onClick={() => void newChat()}>Создать чат</button></div>}
+      {view === 'billing' ? <Billing back={() => setView('chat')}/> : chat ? <Conversation key={chat.id} chat={chat} billing={() => setView('billing')} share={() => setPanel('share')}/> : <div className="empty empty-hero thread"><div className="empty-squircle" aria-hidden="true"><CodeXml size={26} strokeWidth={2.1}/></div><h2>Пока нет чатов</h2><p>Создайте первый диалог, чтобы начать работу с агентом.</p><button onClick={() => void newChat()}>Создать чат</button></div>}
       {panel === 'admin' && isAdmin && <AdminDialog admin={remote.admin} userId={w.user.id} close={() => setPanel(null)}/>}
       {panel && panel !== 'admin' && <WorkspaceDialog kind={panel} w={w} chatId={activeId} close={() => setPanel(null)}/>}
     </main></div>

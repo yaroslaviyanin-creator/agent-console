@@ -132,17 +132,23 @@ export function AdminDialog({ admin, userId, close }: { admin: ServerAdminAdapte
           {(Object.keys(filters) as Filter[]).map(key => <button key={key} type="button" className="alt-action" aria-pressed={key === filter} onClick={() => setFilter(key)}>{filters[key]}</button>)}
         </div>
         <div className="panel-form admin-search"><input type="search" aria-label="Поиск по логину" placeholder="Поиск по логину" value={search} onChange={event => setSearch(event.target.value)}/></div>
-        {loading && <p className="form-help" role="status">Загрузка…</p>}
+        {loading && (
+          <div className="skeleton-stack" role="status" aria-label="Загрузка…">
+            <span className="sr-only">Загрузка…</span>
+            <div className="skeleton-line is-medium" />
+            <div className="skeleton-line is-long" />
+          </div>
+        )}
         {!loading && !visibleUsers.length && !error && <p className="form-help">Пользователи не найдены.</p>}
         <ul className="admin-users">
           {visibleUsers.map(user => <li key={user.id} className="admin-user">
             <div className="admin-user-heading">
               <strong>{user.username}{user.id === userId && ' (вы)'}</strong>
               <div className="admin-badges">
-                <span>{roleLabel[user.role]}</span>
-                <span data-active={user.role === 'pending' && user.isActive ? undefined : user.isActive}>{!user.isActive ? 'Заблокирован' : user.role === 'pending' ? 'Ждёт доступа' : 'Активен'}</span>
-                <span>{user.planTier === 'none' ? 'Без тарифа' : planLabel[user.planTier]}</span>
-                {user.bypass5hLimit && <span>Без 5ч</span>}
+                <span data-role={user.role}>{roleLabel[user.role]}</span>
+                <span data-active={user.role === 'pending' && user.isActive ? 'pending' : String(user.isActive)}>{!user.isActive ? 'Заблокирован' : user.role === 'pending' ? 'Ждёт доступа' : 'Активен'}</span>
+                <span data-plan={user.planTier}>{user.planTier === 'none' ? 'Без тарифа' : planLabel[user.planTier]}</span>
+                {user.bypass5hLimit && <span data-bypass="true">Без 5ч</span>}
               </div>
             </div>
             <div className="admin-usage">

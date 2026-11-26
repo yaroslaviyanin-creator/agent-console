@@ -169,7 +169,12 @@ function ProfileSettings({ remote }: { remote: RemoteTransport }) {
       setError('')
       setAttempt(n => n + 1)
     }}>Повторить</button></div>
-    : <p className="form-help" role="status">Загрузка настроек…</p>
+    : <div className="skeleton-stack" role="status" aria-label="Загрузка настроек…">
+        <span className="sr-only">Загрузка настроек…</span>
+        <div className="skeleton-line is-short" />
+        <div className="skeleton-line is-long" />
+        <div className="skeleton-line is-medium" />
+      </div>
 
   const profile = { ...saved, ...draft }
   const lengthy = (['profileMd', 'memoryMd'] as const).some(key =>

@@ -3,11 +3,12 @@ import { refreshServerModels, useChats } from './chatStore'
 import { defaultReasoningForProvider, groupServerModels, pickVariantForGroup } from './modelCatalog'
 import { SelectMenu } from './SelectMenu'
 
-export function ServerModelSelect({ model, reasoning, unavailable, disabled, onChangeModel, onChangeReasoning }: {
+export function ServerModelSelect({ model, reasoning, unavailable, disabled, placement = 'auto', onChangeModel, onChangeReasoning }: {
   model: string
   reasoning?: string | undefined
   unavailable: boolean
   disabled: boolean
+  placement?: 'auto' | 'top' | 'bottom'
   onChangeModel: (id: string) => void
   onChangeReasoning: (reasoning: string) => void
 }) {
@@ -44,6 +45,7 @@ export function ServerModelSelect({ model, reasoning, unavailable, disabled, onC
         className={unavailable ? 'model-unavailable' : ''}
         value={modelValue}
         disabled={disabled}
+        placement={placement}
         options={modelOptions}
         onChange={nextKey => {
           if (nextKey === 'default') {
@@ -64,6 +66,7 @@ export function ServerModelSelect({ model, reasoning, unavailable, disabled, onC
           ariaLabel="Рассуждения"
           value={model}
           disabled={disabled || unavailable || activeGroup.variants.length <= 1}
+          placement={placement}
           options={activeGroup.variants.map(v => ({ value: v.id, label: v.reasoning }))}
           onChange={onChangeModel}
         />
@@ -72,6 +75,7 @@ export function ServerModelSelect({ model, reasoning, unavailable, disabled, onC
           ariaLabel="Рассуждения"
           value={nonVariantEfforts.length ? (reasoning ?? '') : ''}
           disabled={disabled || unavailable || nonVariantEfforts.length === 0}
+          placement={placement}
           options={[{ value: '', label: 'По умолчанию' }, ...nonVariantEfforts]}
           onChange={onChangeReasoning}
         />

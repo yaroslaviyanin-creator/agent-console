@@ -1,0 +1,108 @@
+:root {
+  color-scheme: dark;
+
+  /* App & safe-area layout */
+  --app-height: 100dvh;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --macos-traffic-height: 36px;
+  --macos-traffic-width: 84px;
+
+  /* Deep dark surfaces & glassmorphism */
+  --bg-base: #07080d;
+  --bg-surface: #0d1017;
+  --bg-surface-solid: #0f131c;
+  --bg-panel: rgba(13, 16, 23, 0.72);
+  --bg-panel-strong: rgba(13, 16, 23, 0.86);
+  --bg-popover: rgba(16, 20, 30, 0.88);
+  --bg-glass-subtle: rgba(255, 255, 255, 0.04);
+  --bg-glass: rgba(255, 255, 255, 0.06);
+  --bg-glass-elevated: rgba(255, 255, 255, 0.09);
+  --bg-glass-hover: rgba(255, 255, 255, 0.08);
+  --bg-glass-active: rgba(255, 255, 255, 0.11);
+  --bg-input: rgba(7, 8, 13, 0.56);
+
+  /* Hairline borders & specular highlights */
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-default: rgba(255, 255, 255, 0.11);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --highlight-top: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  --shadow-card: 0 10px 28px rgba(0, 0, 0, 0.32), var(--highlight-top);
+  --shadow-glass: 0 24px 60px rgba(0, 0, 0, 0.58), var(--highlight-top);
+  --shadow-popover: 0 18px 44px rgba(0, 0, 0, 0.65), var(--highlight-top);
+
+  /* Typography & contrast hierarchy */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", sans-serif;
+  --font-mono: "SFMono-Regular", ui-monospace, Menlo, Monaco, Consolas, monospace;
+  --text-primary: rgba(255, 255, 255, 0.92);
+  --text-secondary: rgba(255, 255, 255, 0.58);
+  --text-muted: rgba(255, 255, 255, 0.38);
+  --tracking-tight: -0.022em;
+  --tracking-display: -0.032em;
+  --tracking-label: 0.07em;
+
+  /* Semantic accents */
+  --accent: #7ab3ff;
+  --accent-soft: rgba(122, 179, 255, 0.14);
+  --accent-border: rgba(122, 179, 255, 0.32);
+  --mint: #8ee3bb;
+  --mint-soft: rgba(142, 227, 187, 0.14);
+  --mint-border: rgba(142, 227, 187, 0.32);
+  --amber: #f0cf85;
+  --amber-soft: rgba(240, 207, 133, 0.14);
+  --amber-border: rgba(240, 207, 133, 0.28);
+  --danger: #f39b95;
+  --danger-soft: rgba(243, 155, 149, 0.14);
+  --danger-border: rgba(243, 155, 149, 0.28);
+
+  /* Motion */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --duration-fast: 160ms;
+  --duration-base: 240ms;
+  --duration-slow: 360ms;
+
+  /* Blur & radii */
+  --blur-surface: 20px;
+  --blur-popover: 24px;
+  --ambient-orb-blur: 112px;
+  --ambient-noise-opacity: 0.035;
+  --radius-sm: 7px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+
+  /* Compatibility aliases for existing rules */
+  --canvas: var(--bg-base);
+  --side: var(--bg-panel);
+  --border: var(--border-subtle);
+  --muted: var(--text-secondary);
+  --mono: var(--font-mono);
+
+  font-family: var(--font-sans);
+  font-size: 14px;
+  color: var(--text-primary);
+  background-color: var(--bg-base);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+:root[data-telegram] {
+  --app-height: min(100dvh, var(--tg-viewport-stable-height, 100dvh));
+  --safe-top: calc(max(env(safe-area-inset-top, 0px), var(--tg-safe-area-inset-top, 0px)) + var(--tg-content-safe-area-inset-top, 0px));
+  --safe-right: calc(max(env(safe-area-inset-right, 0px), var(--tg-safe-area-inset-right, 0px)) + var(--tg-content-safe-area-inset-right, 0px));
+  --safe-bottom: calc(max(env(safe-area-inset-bottom, 0px), var(--tg-safe-area-inset-bottom, 0px)) + var(--tg-content-safe-area-inset-bottom, 0px));
+  --safe-left: calc(max(env(safe-area-inset-left, 0px), var(--tg-safe-area-inset-left, 0px)) + var(--tg-content-safe-area-inset-left, 0px));
+  --ambient-orb-blur: 48px;
+  --blur-surface: 14px;
+  --blur-popover: 16px;
+}
+
+@media (max-width: 760px) {
+  :root {
+    --ambient-orb-blur: 52px;
+    --blur-surface: 14px;
+    --blur-popover: 18px;
+  }
+}
