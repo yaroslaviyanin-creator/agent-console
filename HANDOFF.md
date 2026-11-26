@@ -14,13 +14,15 @@
 
 ## Запуск из корня проекта
 
+Запускайте `agent-server` с реальными CLI-провайдерами (`codex`, `antigravity`, `claude`) только через `docker compose`. Запуск через `go run` или бинарник на macOS/Windows допускается только для `stub`. Флаг `ALLOW_HOST_CLI_EXECUTION=true` зарезервирован для явно согласованного аварийного запуска.
+
 ```sh
-(cd server && go run ./cmd/server create-user --username demo --password 'demo-password')
-(cd server && SERVER_ADDR=127.0.0.1:8080 PROVIDER=stub go run ./cmd/server)
-# Для Antigravity CLI (agy):
-(cd server && SERVER_ADDR=127.0.0.1:8080 PROVIDER=antigravity ANTIGRAVITY_BIN=agy ANTIGRAVITY_MODEL=gemini-3.8-flash-high go run ./cmd/server)
-# Для настоящего Codex и собственного индекса вместо StubProvider:
-(cd server && SERVER_ADDR=127.0.0.1:8080 PROVIDER=codex CODEX_HISTORY_USERNAME=demo go run ./cmd/server)
+docker compose up -d --build
+docker compose exec -it backend /app/agent-server create-user --username demo --password 'demo-password'
+# Для Codex:
+INSTALL_CODEX=true PROVIDER=codex docker compose up -d --build
+# Для Antigravity:
+PROVIDER=antigravity docker compose up -d --build
 npm ci
 npm run dev
 npm run build
@@ -30,7 +32,7 @@ npm test
 npm run tauri -- build --debug --bundles app
 ```
 
-Фронтенд: http://127.0.0.1:1420/ → «Сервер» → http://127.0.0.1:8080. Codex или Antigravity должны быть установлены и авторизованы на машине сервера. Для Telegram нужен доступный HTTPS-бэкенд и CORS_ORIGIN с точным origin Mini App. Настройки и права подробно описаны в AGENTS.md.
+В Docker веб-клиент доступен на http://127.0.0.1:3000/, бэкенд на http://127.0.0.1:8080. Авторизуйте CLI внутри контейнера. Для Telegram нужен доступный HTTPS-бэкенд и CORS_ORIGIN с точным origin Mini App. Настройки и права подробно описаны в AGENTS.md.
 
 ## Исправления истории Codex
 
@@ -39,7 +41,7 @@ npm run tauri -- build --debug --bundles app
 
 ## Администрирование аккаунтов
 
-- Роль `admin` выдаётся через `go run ./cmd/server set-role --username ИМЯ --role admin` из `server/` с тем же `DB_PATH`, что у запущенного сервера.
+- Роль `admin` выдаётся через `docker compose exec backend /app/agent-server set-role --username ИМЯ --role admin`.
 - После входа администратору доступна «Админка». Через неё можно создавать и блокировать аккаунты, менять роли, сбрасывать пароли и отзывать устройства.
 
 ## Устройства и WebSocket
@@ -54,10 +56,12 @@ npm run tauri -- build --debug --bundles app
 
 ## Docker
 
-- Локальный запуск (Windows / macOS / Linux): `cp .env.example .env && docker compose up -d --build` (веб-клиент на `http://127.0.0.1:3000`, бэкенд на `http://127.0.0.1:8080`). На Apple Silicon (ARM64) для работы с анлокером раскомментируйте `platform: linux/amd64` в `docker-compose.yml` или соберите нативный ARM64-образ со `stub`/другими провайдерами через `--build-arg INSTALL_AG_UNLOCKER=false`.
+- Локальный запуск (Windows / macOS / Linux): `cp .env.example .env && docker compose up -d --build` (веб-клиент на `http://127.0.0.1:3000`, бэкенд на `http://127.0.0.1:8080`). На Apple Silicon (ARM64) для работы с анлокером раскомментируйте `platform: linux/amd64` в `docker-compose.yml` или соберите нативный ARM64-образ со `stub` или Codex, указав `INSTALL_AG_UNLOCKER=false AG_UNLOCKER_ENABLED=false` перед командой Compose.
 - Встроенный Antigravity Unlocker (`AG_UNLOCKER_ENABLED=true`, зафиксированная версия `AG_UNLOCKER_VERSION=v2.35.0`) используется как локально, так и в продакшене (VPS в Австрии): при старте контейнера `backend` автоматически патчит `agy` (`ineligible` → `inexigible`, `https_proxy` → `AG_LS_PROXY`), запускает `ag_unlocker --proxy` в supervisor-цикле на `127.0.0.1:53129` (с пересылкой `SIGTERM`/`SIGINT` и проверкой порта в `healthcheck`) и экспортирует `AG_LS_PROXY`. При `PROVIDER=antigravity` и `AG_UNLOCKER_ENABLED=true` ошибка патча или запуска прокси завершает контейнер с ненулевым кодом.
 - Код прокси из Telegram (`t.me/nova_txt`): при необходимости задайте `AG_UNLOCKER_CODE=agk1....` в `.env` (не коммитя `.env` в Git) и выполните `docker compose up -d backend`. Настройки анлокера сохраняются в volume `ag_unlocker_data` (`/home/app/.local/share/agunlocker`).
 - При переезде на другой компьютер или сервер: ключ `agk1....` привязан к `machine-id`/UUID хоста; получите новый код для новой машины в Telegram-группе/боте, обновите `AG_UNLOCKER_CODE` в `.env` и перезапустите `docker compose up -d backend`.
+- Для Codex используйте `docker compose exec -e CODEX_HOME=/home/app/.codex-chat -it backend codex login --device-auth`. При первом запуске из прежнего тома `cli_codex` переносится только `auth.json`. Чатовые сессии и сгенерированная конфигурация хранятся в `cli_codex_chat`.
+- Codex и Antigravity запускают новые чатовые сессии из `/workspace`. История старых чатов остаётся в Agent Console. После обновления первый запрос в старом чате начинает новую сессию CLI, затем продолжение снова работает штатно.
 - Одноразовая авторизация Antigravity CLI (`agy`) внутри контейнера (данные сохраняются в volume `agy_auth`): `docker compose exec -it backend agy`.
 - Горячий бэкап SQLite из volume:
   ```sh

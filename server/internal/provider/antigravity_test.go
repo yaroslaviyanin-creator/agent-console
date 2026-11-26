@@ -17,7 +17,14 @@ func TestAntigravityArgs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	expected := []string{"--settings", agyChatOnlySettings, "--output-format", "stream-json", "--model", "gemini-3.8-flash-high", "--print", "Hello agy"}
+	expected := []string{
+		"--settings", agyChatOnlySettings,
+		"--agent", antigravityAgent,
+		"--mode", "plan", "--sandbox", "--disable-slash-commands",
+		"--output-format", "stream-json",
+		"--model", "gemini-3.8-flash-high",
+		"--print=Hello agy",
+	}
 	if !slices.Equal(args, expected) {
 		t.Fatalf("args mismatch:\nexpected: %v\ngot:      %v", expected, args)
 	}
@@ -158,37 +165,57 @@ func TestParseAgyJSONL_DeniedActions(t *testing.T) {
 	}
 }
 
-func TestWriteAntigravityInstructionsRemovesStaleGeminiMD(t *testing.T) {
-	dir := t.TempDir()
-	geminiPath := filepath.Join(dir, "GEMINI.md")
-	agentsPath := filepath.Join(dir, "AGENTS.md")
-	if err := os.WriteFile(geminiPath, []byte("Old name"), 0600); err != nil {
-		t.Fatal(err)
-	}
+func TestWriteAntigravityAgent(t *testing.T) {
+	home := t.TempDir()
+	agentPath := filepath.Join(home, ".gemini", "config", "agents", antigravityAgent+".md")
 
-	if err := writeAntigravityInstructions(dir, "New name: Ivan"); err != nil {
+	if err := writeAntigravityAgent(home, "New name: Ivan"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(geminiPath); !os.IsNotExist(err) {
-		t.Fatalf("expected stale GEMINI.md to be removed, stat err: %v", err)
-	}
-	got, err := os.ReadFile(agentsPath)
+	got, err := os.ReadFile(agentPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(got), agyChatOnlyInstructions) || !strings.Contains(string(got), "New name: Ivan") {
-		t.Fatalf("unexpected AGENTS.md content: %q", string(got))
+		t.Fatalf("unexpected agent content: %q", string(got))
 	}
 
-	if err := writeAntigravityInstructions(dir, ""); err != nil {
+	if err := writeAntigravityAgent(home, ""); err != nil {
 		t.Fatal(err)
 	}
-	gotEmpty, err := os.ReadFile(agentsPath)
+	gotEmpty, err := os.ReadFile(agentPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(gotEmpty) != agyChatOnlyInstructions {
-		t.Fatalf("expected AGENTS.md to contain only chat-only instructions when empty, got: %q", string(gotEmpty))
+		t.Fatalf("expected agent file to contain only chat-only instructions when empty, got: %q", string(gotEmpty))
+	}
+}
+
+func TestAntigravityNoToolsConfig(t *testing.T) {
+	for _, want := range []string{
+		`commandExecutionPolicy: "off"`,
+		`tools: []`,
+		`skills: []`,
+	} {
+		if !strings.Contains(agyChatOnlyInstructions, want) {
+			t.Fatalf("agyChatOnlyInstructions missing no-tools directive %q", want)
+		}
+	}
+	for _, want := range []string{
+		`"toolPermission":"strict"`,
+		`"allowNonWorkspaceAccess":false`,
+		`"command(*)"`,
+		`"unsandboxed(*)"`,
+		`"write_file(*)"`,
+		`"read_file(*)"`,
+		`"read_url(*)"`,
+		`"execute_url(*)"`,
+		`"mcp(*)"`,
+	} {
+		if !strings.Contains(agyChatOnlySettings, want) {
+			t.Fatalf("agyChatOnlySettings missing no-tools directive %q", want)
+		}
 	}
 }
 
@@ -208,7 +235,6 @@ func TestAntigravityEnvironmentForwardsProxyVars(t *testing.T) {
 		}
 	}
 }
-
 
 func TestAntigravityListModelsFallbackPreservesDefaultReadableName(t *testing.T) {
 	t.Setenv("ANTIGRAVITY_MODELS", "")

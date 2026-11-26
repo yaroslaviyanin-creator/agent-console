@@ -63,16 +63,47 @@ func TestParseSessionIDVariantAndInvalidStreams(t *testing.T) {
 
 func TestCodexArgs(t *testing.T) {
 	args, err := codexArgs(Request{Model: "default", Prompt: "--dangerously-bypass-approvals-and-sandbox"})
-	if err != nil || slices.Contains(args, "--dangerously-bypass-approvals-and-sandbox") ||
-		!slices.Contains(args, `sandbox_mode="read-only"`) || !slices.Contains(args, "shell_tool") ||
-		!slices.Equal(args[len(args)-1:], []string{"-"}) {
-		t.Fatalf("unsafe or incorrect arguments: %q %v", args, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	args, err = codexArgs(Request{Model: "test-model", SessionID: testSessionID})
-	if err != nil || !slices.Contains(args, "--model=test-model") || !slices.Equal(args[len(args)-3:], []string{"resume", testSessionID, "-"}) {
-		t.Fatalf("incorrect resume arguments: %q %v", args, err)
+	if slices.Contains(args, "--dangerously-bypass-approvals-and-sandbox") {
+		t.Fatalf("prompt leaked into args: %q", args)
 	}
+	expected := []string{"exec", "--strict-config", "--ignore-rules", "--skip-git-repo-check", "--json", "-"}
+	if !slices.Equal(args, expected) {
+		t.Fatalf("args mismatch:\nexpected: %q\ngot:      %q", expected, args)
+	}
+
+	args, err = codexArgs(Request{
+		Model:              "test-model",
+		Reasoning:          "High",
+		SystemInstructions: "Only chat",
+		Ephemeral:          true,
+		SessionID:          testSessionID,
+	})
+	if err != nil {
+		t.Fatalf("unexpected resume error: %v", err)
+	}
+	for _, want := range []string{
+		"--strict-config",
+		"--ignore-rules",
+		`developer_instructions="Only chat"`,
+		"--ephemeral",
+		"--model=test-model",
+		`model_reasoning_effort="high"`,
+	} {
+		if !slices.Contains(args, want) {
+			t.Fatalf("expected %q in args: %q", want, args)
+		}
+	}
+	if !slices.Equal(args[len(args)-3:], []string{"resume", testSessionID, "-"}) {
+		t.Fatalf("incorrect resume arguments: %q", args)
+	}
+
 	if _, err := codexArgs(Request{SessionID: "--last"}); err == nil {
 		t.Fatal("accepted an option as a session ID")
+	}
+	if _, err := codexArgs(Request{Reasoning: "invalid"}); err == nil {
+		t.Fatal("accepted an invalid reasoning effort")
 	}
 }

@@ -80,7 +80,7 @@ type indexedThread struct {
 func (p CodexCliProvider) ListIndexedChats(ctx context.Context) ([]IndexedChat, error) {
 	chats := []IndexedChat{}
 	seen := make(map[string]bool)
-	err := p.withAppServer(ctx, 8*time.Second, func(rpc appRPC) error {
+	err := p.withAppServer(ctx, 8*time.Second, false, func(rpc appRPC) error {
 		for _, archived := range []bool{false, true} {
 			params := map[string]any{
 				"limit": 100, "sortKey": "updated_at", "modelProviders": []string{}, "archived": archived,
@@ -134,7 +134,7 @@ func (p CodexCliProvider) ReadIndexedTurns(ctx context.Context, id string) ([]In
 		return nil, errors.New("invalid indexed chat ID")
 	}
 	turns := []IndexedTurn{}
-	err := p.withAppServer(ctx, 8*time.Second, func(rpc appRPC) error {
+	err := p.withAppServer(ctx, 8*time.Second, false, func(rpc appRPC) error {
 		params := map[string]any{"threadId": id, "itemsView": "full", "sortDirection": "asc", "limit": 20}
 		return appPages(rpc, "thread/turns/list", params, func(turn indexedTurn) {
 			mapped := splitIndexedTurn(turn)

@@ -13,11 +13,19 @@ import (
 
 type appRPC func(method string, params any) (json.RawMessage, error)
 
-func (p CodexCliProvider) withAppServer(ctx context.Context, timeout time.Duration, use func(appRPC) error) error {
+func (p CodexCliProvider) withAppServer(ctx context.Context, timeout time.Duration, chatConfig bool, use func(appRPC) error) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, p.Bin, "app-server", "--listen", "stdio://")
 	cmd.Env = cliEnvironment()
+	if chatConfig {
+		if p.home == "" || p.workspace == "" {
+			return fmt.Errorf("Codex chat environment is not configured")
+		}
+		cmd = exec.CommandContext(ctx, p.Bin, "app-server", "--strict-config", "--listen", "stdio://")
+		cmd.Dir = p.workspace
+		cmd.Env = codexChatEnvironment(p.home)
+	}
 	var stderr stderrTail
 	cmd.Stderr = &stderr
 	cmd.WaitDelay = 3 * time.Second

@@ -44,9 +44,13 @@ func New(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.L
 	case "stub":
 		backend = provider.StubProvider{Delay: 100 * time.Millisecond}
 	case "codex":
-		backend = provider.CodexCliProvider{Bin: cfg.CodexBin, WorkspaceRoot: "./data/workspaces"}
+		codex, err := provider.NewCodexCliProvider(ctx, cfg.CodexBin)
+		if err != nil {
+			return nil, fmt.Errorf("configure Codex chat: %w", err)
+		}
+		backend = codex
 	case "antigravity":
-		backend = provider.AntigravityCliProvider{Bin: cfg.AntigravityBin, DefaultModel: cfg.AntigravityDefaultModel, WorkspaceRoot: "./data/workspaces"}
+		backend = provider.AntigravityCliProvider{Bin: cfg.AntigravityBin, DefaultModel: cfg.AntigravityDefaultModel}
 	case "claude", "paid_api":
 		return nil, fmt.Errorf("provider %q is not implemented yet", cfg.Provider)
 	default:

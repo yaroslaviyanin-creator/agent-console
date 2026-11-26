@@ -432,10 +432,14 @@ func TestProfileEndpoints(t *testing.T) {
 
 func TestNewRejectsUnimplementedProviders(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	for _, valid := range []string{"stub", "codex", "antigravity"} {
+	for _, valid := range []string{"stub", "antigravity"} {
 		if _, err := New(t.Context(), nil, config.Config{Provider: valid, CORSOrigin: "*"}, logger); err != nil {
 			t.Fatalf("New(%q) unexpected error: %v", valid, err)
 		}
+	}
+	cfg := config.Config{Provider: "codex", CodexBin: filepath.Join(t.TempDir(), "missing-codex"), CORSOrigin: "*"}
+	if _, err := New(t.Context(), nil, cfg, logger); err == nil || !strings.Contains(err.Error(), "configure Codex chat") {
+		t.Fatalf("expected startup to fail when Codex is unavailable, got: %v", err)
 	}
 	for _, bad := range []string{"claude", "paid_api"} {
 		if _, err := New(t.Context(), nil, config.Config{Provider: bad, CORSOrigin: "*"}, logger); err == nil || !strings.Contains(err.Error(), "not implemented") {

@@ -19,12 +19,13 @@ RUN apt-get update \
 ARG INSTALL_CODEX=false
 ARG INSTALL_CLAUDE=false
 
-RUN if [ "$INSTALL_CODEX" = "true" ]; then npm install -g @openai/codex; fi \
+RUN if [ "$INSTALL_CODEX" = "true" ]; then npm install -g @openai/codex@0.172.0; fi \
     && if [ "$INSTALL_CLAUDE" = "true" ]; then npm install -g @anthropic-ai/claude-code; fi \
     && if [ "$INSTALL_CODEX" = "true" ] || [ "$INSTALL_CLAUDE" = "true" ]; then npm cache clean --force; fi
 
 RUN useradd -m -d /home/app -s /bin/bash app \
-    && mkdir -p /app/data /home/app/.local/bin /home/app/.local/share/agunlocker /home/app/.gemini /home/app/.codex /home/app/.claude \
+    && install -d -m 0555 /workspace \
+    && mkdir -p /app/data /home/app/.codex-chat /home/app/.local/bin /home/app/.local/share/agunlocker /home/app/.gemini /home/app/.codex /home/app/.claude \
     && chown -R app:app /app /home/app
 
 ARG INSTALL_AG_UNLOCKER=true
@@ -58,15 +59,17 @@ RUN if [ "$INSTALL_AG_UNLOCKER" = "true" ]; then \
         echo "Skipping ag_unlocker installation (INSTALL_AG_UNLOCKER=$INSTALL_AG_UNLOCKER)" >&2; \
     fi
 
-COPY --from=go-builder --chown=app:app /out/agent-server /app/agent-server
 COPY --chown=app:app --chmod=0755 deploy/entrypoint.sh /app/entrypoint.sh
 
 USER app
 WORKDIR /app
 
+ENV RUNNING_IN_DOCKER=true
 ENV PATH="/home/app/.local/bin:${PATH}"
 
 RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
+
+COPY --from=go-builder --chown=app:app /out/agent-server /app/agent-server
 
 EXPOSE 8080
 

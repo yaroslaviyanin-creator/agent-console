@@ -12,18 +12,16 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 )
 
 type CodexCliProvider struct {
-	Bin           string
-	WorkspaceRoot string
+	Bin       string
+	home      string
+	workspace string
 }
 
 var (
-	// Keep the context file stable for the lifetime of each CLI subprocess.
-	workspaceLocks sync.Map
 	userIDPattern  = regexp.MustCompile(`^[a-f0-9]{32}$`)
 	sessionPattern = regexp.MustCompile(`^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$`)
 )
@@ -32,47 +30,27 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 	if !userIDPattern.MatchString(req.UserID) {
 		return nil, errors.New("invalid workspace user ID")
 	}
+	if p.home == "" || p.workspace == "" {
+		return nil, errors.New("Codex chat environment is not configured")
+	}
+	req.SessionID = chatSessionID(req.SessionID)
 	args, err := codexArgs(req)
 	if err != nil {
 		return nil, err
 	}
-	root, err := filepath.Abs(filepath.Join(p.WorkspaceRoot, req.UserID))
-	if err != nil {
-		return nil, err
-	}
-	lock, _ := workspaceLocks.LoadOrStore(root, make(chan struct{}, 1))
-	slot := lock.(chan struct{})
-	select {
-	case slot <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	started := false
-	defer func() {
-		if !started {
-			<-slot
-		}
-	}()
-	if err := os.MkdirAll(root, 0700); err != nil {
-		return nil, err
-	}
-	if err := writeUserContext(root, req.SystemInstructions); err != nil {
-		return nil, err
-	}
-	bin := p.Bin
-	if strings.ContainsAny(bin, "/\\") && !filepath.IsAbs(bin) {
-		bin, err = filepath.Abs(bin)
-		if err != nil {
-			return nil, err
-		}
-	}
-	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Dir = root
+	catalog, _ := json.Marshal(filepath.Join(p.home, "chat-models.json"))
+	instructions, _ := json.Marshal(filepath.Join(p.home, "chat-instructions.md"))
+	args = append([]string{
+		"-c", "model_catalog_json=" + string(catalog),
+		"-c", "model_instructions_file=" + string(instructions),
+	}, args...)
+	cmd := exec.CommandContext(ctx, p.Bin, args...)
+	cmd.Dir = p.workspace
 	cmd.Stdin = strings.NewReader(req.Prompt)
 	var stderr stderrTail
 	cmd.Stderr = &stderr
 	cmd.WaitDelay = 3 * time.Second
-	cmd.Env = cliEnvironment()
+	cmd.Env = codexChatEnvironment(p.home)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -80,7 +58,6 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 	if err := cmd.Start(); err != nil {
 		return nil, stderr.wrap("start codex exec", err)
 	}
-	started = true
 	out := make(chan Event)
 	go func() {
 		defer close(out)
@@ -92,7 +69,6 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 			_ = cmd.Process.Kill()
 		}
 		waitErr := cmd.Wait()
-		<-slot
 		switch {
 		case ctx.Err() != nil:
 			return
@@ -103,31 +79,12 @@ func (p CodexCliProvider) Stream(ctx context.Context, req Request) (<-chan Event
 		case waitErr != nil:
 			terminal = Event{Type: Error, Err: stderr.wrap("codex exec", waitErr)}
 		}
+		if terminal.Type == Done && terminal.SessionID != "" {
+			terminal.SessionID = chatSessionPrefix + terminal.SessionID
+		}
 		send(ctx, out, terminal)
 	}()
 	return out, nil
-}
-
-// Replace the file atomically with a new private inode, including when
-// upgrading a workspace that already has a file with broader permissions.
-func writeUserContext(root, instructions string) error {
-	path := filepath.Join(root, "USER_CONTEXT.md")
-	if instructions == "" {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		return nil
-	}
-	file, err := os.CreateTemp(root, ".user-context-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
-	_, writeErr := file.WriteString(instructions)
-	if err := errors.Join(writeErr, file.Close()); err != nil {
-		return err
-	}
-	return os.Rename(file.Name(), path)
 }
 
 // os/exec writes stderr from one goroutine. Read the tail after Wait.
@@ -158,14 +115,7 @@ func (t *stderrTail) wrap(operation string, err error) error {
 }
 
 func codexArgs(req Request) ([]string, error) {
-	args := []string{
-		"exec", "--ignore-user-config", "--skip-git-repo-check", "--json",
-		"-c", `sandbox_mode="read-only"`, "-c", `approval_policy="never"`,
-		"-c", `web_search="disabled"`, "--disable", "shell_tool",
-		"--disable", "plugins", "--disable", "multi_agent", "--disable", "multi_agent_v2",
-	}
-	// Codex CLI accepts developer_instructions with --ignore-user-config.
-	// Supply it as a config string so the original prompt stays on stdin.
+	args := []string{"exec", "--strict-config", "--ignore-rules", "--skip-git-repo-check", "--json"}
 	if req.SystemInstructions != "" {
 		instructions, err := json.Marshal(req.SystemInstructions)
 		if err != nil {

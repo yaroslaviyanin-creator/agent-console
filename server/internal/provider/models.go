@@ -19,7 +19,7 @@ type Model struct {
 // ListModels asks the installed Codex for the catalog visible to its account.
 func (p CodexCliProvider) ListModels(ctx context.Context) ([]Model, error) {
 	var models []Model
-	err := p.withAppServer(ctx, 7*time.Second, func(rpc appRPC) error {
+	err := p.withAppServer(ctx, 7*time.Second, true, func(rpc appRPC) error {
 		var err error
 		models, err = listModels(rpc)
 		return err

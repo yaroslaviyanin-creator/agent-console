@@ -43,6 +43,9 @@ func Load() (Config, error) {
 		CORSOrigin:              strings.TrimSpace(value("CORS_ORIGIN", "*")),
 		CodexHistoryUsername:    strings.TrimSpace(os.Getenv("CODEX_HISTORY_USERNAME")),
 	}
+	if cfg.Provider != "stub" && !isRunningInDocker() && !isEnvTrue("ALLOW_HOST_CLI_EXECUTION") {
+		return Config{}, errors.New("refusing to run CLI provider outside Docker; use docker compose")
+	}
 	switch cfg.Provider {
 	case "stub", "codex", "antigravity":
 	case "claude", "paid_api":
@@ -85,6 +88,20 @@ func Load() (Config, error) {
 		return Config{}, errors.New("MEMORY_MIN_NEW_MESSAGES must be an integer >= 2")
 	}
 	return cfg, nil
+}
+
+var dockerenvPath = "/.dockerenv"
+
+func isRunningInDocker() bool {
+	if isEnvTrue("RUNNING_IN_DOCKER") {
+		return true
+	}
+	_, err := os.Stat(dockerenvPath)
+	return err == nil
+}
+
+func isEnvTrue(key string) bool {
+	return os.Getenv(key) == "true"
 }
 
 func value(key, fallback string) string {

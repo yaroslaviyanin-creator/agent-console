@@ -15,40 +15,42 @@ import (
 )
 
 type AntigravityCliProvider struct {
-	Bin           string
-	DefaultModel  string
-	WorkspaceRoot string
+	Bin          string
+	DefaultModel string
 }
 
 func (p AntigravityCliProvider) Stream(ctx context.Context, req Request) (<-chan Event, error) {
 	if !userIDPattern.MatchString(req.UserID) {
 		return nil, errors.New("invalid workspace user ID")
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	workspace, err := chatWorkspace(filepath.Join(home, ".agent-console-agy"))
+	if err != nil {
+		return nil, err
+	}
+	if workspace != "/workspace" {
+		home = filepath.Dir(workspace)
+	}
+	req.SessionID = chatSessionID(req.SessionID)
 	args, err := antigravityArgs(req, p.DefaultModel)
 	if err != nil {
 		return nil, err
 	}
-	root, err := filepath.Abs(filepath.Join(p.WorkspaceRoot, req.UserID))
-	if err != nil {
-		return nil, err
-	}
-	lock, _ := workspaceLocks.LoadOrStore(root, make(chan struct{}, 1))
-	slot := lock.(chan struct{})
 	select {
-	case slot <- struct{}{}:
+	case antigravityChatSlot <- struct{}{}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 	started := false
 	defer func() {
 		if !started {
-			<-slot
+			<-antigravityChatSlot
 		}
 	}()
-	if err := os.MkdirAll(root, 0700); err != nil {
-		return nil, err
-	}
-	if err := writeAntigravityInstructions(root, req.SystemInstructions); err != nil {
+	if err := writeAntigravityAgent(home, req.SystemInstructions); err != nil {
 		return nil, err
 	}
 	bin := p.Bin
@@ -62,11 +64,11 @@ func (p AntigravityCliProvider) Stream(ctx context.Context, req Request) (<-chan
 		}
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Dir = root
+	cmd.Dir = workspace
 	var stderr stderrTail
 	cmd.Stderr = &stderr
 	cmd.WaitDelay = 3 * time.Second
-	cmd.Env = antigravityEnvironment()
+	cmd.Env = append(antigravityEnvironment(), "HOME="+home)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -88,7 +90,7 @@ func (p AntigravityCliProvider) Stream(ctx context.Context, req Request) (<-chan
 			_ = cmd.Process.Kill()
 		}
 		waitErr := cmd.Wait()
-		<-slot
+		<-antigravityChatSlot
 		switch {
 		case ctx.Err() != nil:
 			return
@@ -99,38 +101,46 @@ func (p AntigravityCliProvider) Stream(ctx context.Context, req Request) (<-chan
 		case waitErr != nil:
 			terminal = Event{Type: Error, Err: stderr.wrap("antigravity exec", waitErr)}
 		}
+		if terminal.Type == Done && terminal.SessionID != "" {
+			terminal.SessionID = chatSessionPrefix + terminal.SessionID
+		}
 		send(ctx, out, terminal)
 	}()
 	return out, nil
 }
 
-const agyChatOnlyInstructions = "Режим работы: «Только чат» (chat-only). Все инструменты работы с файлами, терминалом, браузером, поиском и MCP отключены политикой песочницы. Не пытайся вызывать инструменты и не ссылайся на локальные файлы проекта; если пользователь просит прочитать/изменить файлы или выполнить команду, сразу объясни текстом, что в этом режиме у тебя нет доступа к инструментам, и предложи прислать код/текст прямо в чат."
+// The custom agent definition stays fixed for the life of the subprocess.
+var antigravityChatSlot = make(chan struct{}, 1)
 
-func writeAntigravityInstructions(root, instructions string) error {
-	// Remove stale GEMINI.md (e.g. left over from GeminiCliProvider) so
-	// Antigravity only reads the active AGENTS.md context in this workspace.
-	staleGemini := filepath.Join(root, "GEMINI.md")
-	if err := os.Remove(staleGemini); err != nil && !errors.Is(err, os.ErrNotExist) {
+const antigravityAgent = "agent-console-chat"
+
+const agyChatOnlyInstructions = `---
+name: agent-console-chat
+description: Conversation without external tools
+mainAgent: true
+subagent: false
+commandExecutionPolicy: "off"
+tools: []
+skills: []
+---
+# Core instructions
+
+Отвечай в режиме «Только чат». Сообщай, что внешние инструменты, файлы и приложения недоступны, если для запроса нужен доступ к ним.
+`
+
+func writeAntigravityAgent(home, instructions string) error {
+	dir := filepath.Join(home, ".gemini", "config", "agents")
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
 	content := agyChatOnlyInstructions
 	if instructions != "" {
-		content += "\n\n" + instructions
+		content += "\n" + instructions
 	}
-	path := filepath.Join(root, "AGENTS.md")
-	file, err := os.CreateTemp(root, ".agy-instructions-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
-	_, writeErr := file.WriteString(content)
-	if err := errors.Join(writeErr, file.Close()); err != nil {
-		return err
-	}
-	return os.Rename(file.Name(), path)
+	return writePrivateFile(filepath.Join(dir, antigravityAgent+".md"), []byte(content))
 }
 
-const agyChatOnlySettings = `{"permissions":{"deny":["command(*)","unsandboxed(*)","write_file(*)","read_file(*)","read_url(*)","execute_url(*)","mcp(*)","browser(*)","subagent(*)"]}}`
+const agyChatOnlySettings = `{"toolPermission":"strict","allowNonWorkspaceAccess":false,"permissions":{"allow":[],"ask":[],"deny":["command(*)","unsandboxed(*)","write_file(*)","read_file(*)","read_url(*)","execute_url(*)","mcp(*)"]}}`
 
 func antigravityArgs(req Request, defaultModel string) ([]string, error) {
 	model := req.Model
@@ -145,6 +155,8 @@ func antigravityArgs(req Request, defaultModel string) ([]string, error) {
 	}
 	args := []string{
 		"--settings", agyChatOnlySettings,
+		"--agent", antigravityAgent,
+		"--mode", "plan", "--sandbox", "--disable-slash-commands",
 		"--output-format", "stream-json",
 		"--model", model,
 	}
@@ -154,13 +166,13 @@ func antigravityArgs(req Request, defaultModel string) ([]string, error) {
 		}
 		args = append(args, "--conversation", req.SessionID)
 	}
-	return append(args, "--print", req.Prompt), nil
+	return append(args, "--print="+req.Prompt), nil
 }
 
 func antigravityEnvironment() []string {
 	var env []string
 	for _, key := range []string{
-		"PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+		"PATH",
 		"SYSTEMROOT", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
 		"AGY_ACCOUNT", "AGY_LOG", "AGY_API_KEY",
 		"GEMINI_API_KEY", "GOOGLE_API_KEY",
@@ -381,7 +393,7 @@ func (p AntigravityCliProvider) ListModels(ctx context.Context) ([]Model, error)
 		bin = "agy"
 	}
 	cmd := exec.CommandContext(ctx, bin, "models")
-	cmd.Env = antigravityEnvironment()
+	cmd.Env = append(antigravityEnvironment(), "HOME="+os.Getenv("HOME"))
 	out, err := cmd.Output()
 	if err == nil {
 		models := parseAgyModelsOutput(string(out), defaultModel)
