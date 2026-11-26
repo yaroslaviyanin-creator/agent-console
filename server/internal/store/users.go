@@ -132,12 +132,14 @@ func (s *Store) SetUserRole(ctx context.Context, username, role string) error {
 }
 
 type DirectoryUser struct {
-	ID       string `json:"id"`
-	Username string `json:"username"`
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"displayName,omitempty"`
+	AvatarData  string `json:"avatarData,omitempty"`
 }
 
 func (s *Store) DirectoryUsers(ctx context.Context) ([]DirectoryUser, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,username FROM users
+	rows, err := s.db.QueryContext(ctx, `SELECT id,username,display_name,avatar_data FROM users
 		WHERE is_active=1 AND role IN ('user','admin') ORDER BY username`)
 	if err != nil {
 		return nil, err
@@ -146,7 +148,7 @@ func (s *Store) DirectoryUsers(ctx context.Context) ([]DirectoryUser, error) {
 	users := []DirectoryUser{}
 	for rows.Next() {
 		var user DirectoryUser
-		if err := rows.Scan(&user.ID, &user.Username); err != nil {
+		if err := rows.Scan(&user.ID, &user.Username, &user.DisplayName, &user.AvatarData); err != nil {
 			return nil, err
 		}
 		users = append(users, user)

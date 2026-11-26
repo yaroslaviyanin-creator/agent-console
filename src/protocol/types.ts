@@ -84,7 +84,7 @@ export interface TransportAdapter {
 }
 
 export interface LoginRequest { connection: string; login: string; password: string; deviceName: string }
-export interface Member { id: string; name: string; role?: UserRole; isActive?: boolean }
+export interface Member { id: string; name: string; displayName?: string; avatarData?: string; role?: UserRole; isActive?: boolean }
 export interface Device { id: string; ownerId: string; name: string; online: boolean; lastSeenAt?: number }
 export interface Grant { userId: string; access: ShareAccess; trustedDeviceId?: string }
 export interface ChatAccess {
@@ -136,7 +136,7 @@ export interface ServerQuota extends Subscription {
   fiveHour: ServerQuotaWindow
   sevenDay: ServerQuotaWindow
 }
-export interface ServerDirectoryUser { id: string; username: string }
+export interface ServerDirectoryUser { id: string; username: string; displayName?: string; avatarData?: string }
 export interface ServerUser extends ServerDirectoryUser, Partial<Subscription> { role?: UserRole; isActive?: boolean }
 export interface AdminUser extends ServerUser {
   role: UserRole
@@ -204,6 +204,7 @@ export interface ServerError { code: string; message: string }
 
 export interface UserProfile {
   displayName: string
+  avatarData: string
   profileMd: string
   memoryMd: string
   memoryEnabled: boolean

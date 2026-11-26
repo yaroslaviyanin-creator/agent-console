@@ -12,6 +12,7 @@ import (
 
 type UserProfile struct {
 	DisplayName     string `json:"displayName"`
+	AvatarData      string `json:"avatarData"`
 	ProfileMD       string `json:"profileMd"`
 	MemoryMD        string `json:"memoryMd"`
 	MemoryEnabled   bool   `json:"memoryEnabled"`
@@ -20,11 +21,11 @@ type UserProfile struct {
 
 var ErrInvalidProfile = errors.New("invalid profile fields")
 
-const profileColumns = "display_name,profile_md,memory_md,memory_enabled,memory_updated_at"
+const profileColumns = "display_name,avatar_data,profile_md,memory_md,memory_enabled,memory_updated_at"
 
 func readUserProfile(db rowQuerier, ctx context.Context, query string, args ...any) (UserProfile, error) {
 	var p UserProfile
-	err := db.QueryRowContext(ctx, query, args...).Scan(&p.DisplayName, &p.ProfileMD, &p.MemoryMD, &p.MemoryEnabled, &p.MemoryUpdatedAt)
+	err := db.QueryRowContext(ctx, query, args...).Scan(&p.DisplayName, &p.AvatarData, &p.ProfileMD, &p.MemoryMD, &p.MemoryEnabled, &p.MemoryUpdatedAt)
 	return p, err
 }
 
@@ -36,10 +37,27 @@ func validProfileText(value string) bool {
 	return len(value) <= 4096 && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
 }
 
-func (s *Store) UpdateUserProfile(ctx context.Context, userID string, displayName, profileMD, memoryMD *string, memoryEnabled *bool) (UserProfile, error) {
+func validAvatarData(value string) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) > 131072 || !utf8.ValidString(value) || strings.ContainsFunc(value, unicode.IsSpace) || strings.ContainsRune(value, 0) {
+		return false
+	}
+	return strings.HasPrefix(value, "data:image/png;base64,") ||
+		strings.HasPrefix(value, "data:image/jpeg;base64,") ||
+		strings.HasPrefix(value, "data:image/webp;base64,")
+}
+
+func (s *Store) UpdateUserProfile(ctx context.Context, userID string, displayName, profileMD, memoryMD *string, memoryEnabled *bool, avatarData ...*string) (UserProfile, error) {
+	var avatar *string
+	if len(avatarData) > 0 {
+		avatar = avatarData[0]
+	}
 	if displayName != nil && (!utf8.ValidString(*displayName) || utf8.RuneCountInString(*displayName) > 80 ||
 		strings.ContainsFunc(*displayName, func(r rune) bool { return unicode.IsControl(r) || r == '\u2028' || r == '\u2029' })) ||
-		profileMD != nil && !validProfileText(*profileMD) || memoryMD != nil && !validProfileText(*memoryMD) {
+		profileMD != nil && !validProfileText(*profileMD) || memoryMD != nil && !validProfileText(*memoryMD) ||
+		avatar != nil && !validAvatarData(*avatar) {
 		return UserProfile{}, ErrInvalidProfile
 	}
 	if displayName != nil {
@@ -51,9 +69,10 @@ func (s *Store) UpdateUserProfile(ctx context.Context, userID string, displayNam
 	return readUserProfile(s.db, ctx, `UPDATE users SET
   display_name=COALESCE(?2,display_name), profile_md=COALESCE(?3,profile_md),
   memory_md=COALESCE(?4,memory_md), memory_enabled=COALESCE(?5,memory_enabled),
+  avatar_data=COALESCE(?7,avatar_data),
   memory_updated_at=CASE WHEN ?4 IS NOT NULL OR (?5 IS NOT NULL AND ?5 != memory_enabled)
     THEN MAX(memory_updated_at+1,?6) ELSE memory_updated_at END
-  WHERE id=?1 RETURNING `+profileColumns, userID, displayName, profileMD, memoryMD, memoryEnabled, time.Now().UnixMilli())
+  WHERE id=?1 RETURNING `+profileColumns, userID, displayName, profileMD, memoryMD, memoryEnabled, time.Now().UnixMilli(), avatar)
 }
 
 func (s *Store) SaveUserMemory(ctx context.Context, userID, memoryMD string, updatedAt int64) error {

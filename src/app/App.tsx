@@ -5,7 +5,7 @@ import { Incoming, LimitActions, Quotas, ServerQuotas } from './Quotas'
 import { AuthScene } from './AuthScene'
 import { WorkspaceDialog } from './WorkspaceDialog'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Hourglass, Image as ImageIcon, Laptop, Menu, PanelLeft, Paperclip, Settings2, Share2, Square, Terminal } from 'lucide-react'
+import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Hourglass, Image as ImageIcon, Laptop, Menu, PanelLeft, Paperclip, Share2, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
 import { demoPrompt, availableDevices, models, providerLabels, checkAccountStatus, logout, newChat, retryAnswer, retryHistory, sendPrompt, stopChat, updateChat, useChats } from './chatStore'
@@ -18,6 +18,7 @@ import { ToolCard } from './ToolCard'
 import { RichText } from './Markdown'
 import { AdminDialog } from './AdminDialog'
 import { AmbientBackground } from './AmbientBackground'
+import { UserAvatar } from './UserAvatar'
 
 const mcpExamples = [
   ['Список файлов', 'Покажи файлы проекта'],
@@ -43,13 +44,15 @@ function progressLabel(durationMs?: number) {
 function Transcript({ turn, chatId, writable, busy, retry, demo }: { turn: Turn; chatId: string; writable: boolean; busy: boolean; retry: (modelId: string) => void; demo: boolean }) {
   const w = useChats(s => s.workspace)!
   const authorId = turn.authorId ?? w.chats.find(c => c.id === chatId)?.ownerId
-  const author = authorId === w.user.id ? 'Вы' : w.users.find(u => u.id === authorId)?.name ?? 'Участник'
+  const authorMember = authorId === w.user.id ? w.user : w.users.find(u => u.id === authorId)
+  const author = authorId === w.user.id ? 'Вы' : authorMember?.displayName?.trim() || authorMember?.name || 'Участник'
+  const avatarName = authorMember?.displayName?.trim() || authorMember?.name || author
   const isSelf = authorId === w.user.id
   return <article className="turn">
     {(turn.prompt || !!turn.attachments?.length) && (
       <div className={'user-turn-block' + (isSelf ? ' is-self' : '')}>
         <div className="person user-person">
-          <span className="person-avatar">{author === 'Вы' ? 'Я' : author[0]}</span>
+          <UserAvatar name={avatarName} avatarData={authorMember?.avatarData} className="person-avatar" />
           <strong>{author}</strong>
           <time>{clock.format(turn.time)}</time>
         </div>
@@ -427,8 +430,7 @@ function Connected() {
     <dialog ref={drawer} onClose={() => setDrawerOpen(false)} className="drawer" aria-label="Список чатов" onClick={e => { if (e.target === drawer.current) drawer.current.close() }}><Sidebar openBilling={() => { drawer.current?.close(); setView('billing') }} openSettings={() => { drawer.current?.close(); setPanel('devices') }} close={() => { drawer.current?.close(); setView('chat') }}/></dialog>
     <main className="main"><div className="topbar" data-tauri-drag-region><button className="icon-btn desk-toggle" aria-label="Переключить боковую панель" onClick={() => setCollapsed(!collapsed)}><PanelLeft size={17}/></button><button className="icon-btn mobile" aria-label="Открыть список чатов" onClick={() => { drawer.current?.showModal(); setDrawerOpen(true) }}><Menu size={18}/></button>
       <span className="crumb" data-tauri-drag-region>Рабочее пространство</span><ChevronRight className="crumb-arrow" size={13} aria-hidden="true"/><span className="topbar-section" data-tauri-drag-region>{view === 'billing' ? 'Биллинг API' : chat?.indexedCodex ? 'Чаты Codex' : (!chat || chat.access === 'owner') ? 'Мои чаты' : 'Доступные мне'}</span>{remote ? <ServerQuotas menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> : <Quotas userId={w.user.id} menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> }
-      {isAdmin && <button className="alt-action admin-entry" onClick={() => setPanel('admin')}>Админка</button>}
-      <button className="account-button" title="Настройки и устройства" aria-label="Настройки и устройства" onClick={() => setPanel('devices')}><Settings2 size={15}/><span>{'@' + (remote ? w.user.name : w.user.id)}</span></button></div>
+      {isAdmin && <button className="alt-action admin-entry" onClick={() => setPanel('admin')}>Админка</button>}</div>
       {connectionError && <p className="notice connection-error" role="alert">{connectionError}</p>}
       {!remote && incoming && <Incoming key={incoming.requestId} request={incoming}/>}
       {view === 'billing' ? <Billing back={() => setView('chat')}/> : chat ? <Conversation key={chat.id} chat={chat} billing={() => setView('billing')} share={() => setPanel('share')}/> : <div className="empty empty-hero thread"><div className="empty-squircle" aria-hidden="true"><CodeXml size={26} strokeWidth={2.1}/></div><h2>Пока нет чатов</h2><p>Создайте первый диалог, чтобы начать работу с агентом.</p><button onClick={() => void newChat()}>Создать чат</button></div>}

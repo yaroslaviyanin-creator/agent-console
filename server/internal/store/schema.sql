@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS users (
     bypass_5h_limit INTEGER NOT NULL DEFAULT 0 CHECK (bypass_5h_limit IN (0, 1)),
     subscription_until INTEGER NOT NULL DEFAULT 0 CHECK (subscription_until >= 0),
     display_name TEXT NOT NULL DEFAULT '',
+    avatar_data TEXT NOT NULL DEFAULT '',
     profile_md TEXT NOT NULL DEFAULT '',
     memory_md TEXT NOT NULL DEFAULT '',
     memory_enabled INTEGER NOT NULL DEFAULT 1 CHECK (memory_enabled IN (0, 1)),

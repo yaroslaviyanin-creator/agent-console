@@ -131,8 +131,19 @@ export class RemoteTransport implements TransportAdapter {
     return this.request<UserProfile>('/api/profile')
   }
 
-  updateProfile(patch: UserProfilePatch) {
-    return this.request<UserProfile>('/api/profile', patch, undefined, 'PATCH')
+  async updateProfile(patch: UserProfilePatch) {
+    const profile = await this.request<UserProfile>('/api/profile', patch, undefined, 'PATCH')
+    if (this.session) {
+      this.session = {
+        ...this.session,
+        user: {
+          ...this.session.user,
+          displayName: profile.displayName,
+          avatarData: profile.avatarData,
+        },
+      }
+    }
+    return profile
   }
 
   subscribeAccount() { return () => {} }
@@ -274,9 +285,26 @@ export class RemoteTransport implements TransportAdapter {
     if (!this.session) throw Error('Сессия закончилась. Войдите снова.')
     const { user, device } = this.session
     const deviceId = this.devices.find(entry => entry.isCurrent)?.id ?? device.id
-    const member = { id: user.id, name: user.username, role: user.role ?? 'user', isActive: user.isActive ?? true }
+    const member = {
+      id: user.id,
+      name: user.username,
+      ...(user.displayName ? { displayName: user.displayName } : {}),
+      ...(user.avatarData ? { avatarData: user.avatarData } : {}),
+      role: user.role ?? 'user',
+      isActive: user.isActive ?? true,
+    }
     return {
-      user: member, deviceId, users: [member, ...this.users.filter(u => u.id !== user.id).map(u => ({ id: u.id, name: u.username }))],
+      user: member,
+      deviceId,
+      users: [
+        member,
+        ...this.users.filter(u => u.id !== user.id).map(u => ({
+          id: u.id,
+          name: u.username,
+          ...(u.displayName ? { displayName: u.displayName } : {}),
+          ...(u.avatarData ? { avatarData: u.avatarData } : {}),
+        })),
+      ],
       devices: this.devices.map(entry => ({
         id: entry.id, ownerId: entry.userId, name: entry.name, online: entry.id === deviceId, lastSeenAt: entry.lastSeenAt,
       })),

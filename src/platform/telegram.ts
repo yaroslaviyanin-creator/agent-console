@@ -3,6 +3,11 @@ import type WebApp from '@twa-dev/sdk'
 
 let backButton: typeof WebApp.BackButton | undefined
 let backAction: (() => void) | undefined
+let telegramUserId: string | null = null
+
+export function getTelegramUserId(): string | null {
+  return telegramUserId
+}
 
 function syncBackButton() {
   if (backAction) backButton?.show()
@@ -30,6 +35,8 @@ export async function initializeTelegram(): Promise<void> {
   try {
     const { default: webApp } = await import('@twa-dev/sdk')
     document.documentElement.dataset.telegram = 'true'
+    const tgId = webApp.initDataUnsafe?.user?.id
+    if (tgId) telegramUserId = String(tgId)
     if (webApp.isVersionAtLeast('6.1')) {
       backButton = webApp.BackButton
       backButton.onClick(() => backAction?.())

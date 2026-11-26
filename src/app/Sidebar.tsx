@@ -2,7 +2,14 @@ import { Receipt, CodeXml, Eye, GitFork, MessageSquare, Plus, Radio, RefreshCw, 
 import { newChat, refreshCodexIndex, selectChat, useChats } from './chatStore'
 import type { Chat } from './chatStore'
 import { useAccountStore } from './accountStore'
-import { dollars, quotaPercent } from './Quotas'
+import { UserAvatar } from './UserAvatar'
+
+const planBadges = {
+  none: 'FREE',
+  pro: 'PRO',
+  '2x_pro': '2xPRO',
+  unlimited: 'UNLIMITED',
+} as const
 
 export function Sidebar({
   close,
@@ -15,7 +22,6 @@ export function Sidebar({
 }) {
   const { chats, activeId, mode, connected, codexIndex, workspace } = useChats()
   const serverQuota = useAccountStore(s => s.serverQuota)
-  const paidApiQuota = useAccountStore(s => s.quotas.paid_api)
   const online = mode === 'demo' || connected
 
   function row(c: Chat) {
@@ -37,17 +43,14 @@ export function Sidebar({
 
   const shared = chats.filter(c => c.access !== 'owner' && !c.indexedCodex)
   const handle = workspace ? '@' + (mode === 'server' ? workspace.user.name : workspace.user.id) : ''
-  const quotaBadge = mode === 'server'
+  const profileDisplayName = workspace ? (workspace.user.displayName?.trim() || workspace.user.name) : ''
+  const planBadge = mode === 'server'
     ? serverQuota
-      ? serverQuota.bypass5hLimit
-        ? 'Без лимита'
-        : serverQuota.planTier === 'unlimited'
-          ? '5ч ∞'
-          : '5ч ' + quotaPercent(serverQuota.fiveHour.usedPercent)
-      : null
-    : paidApiQuota?.provider === 'paid_api'
-      ? 'API ' + dollars(Math.round(paidApiQuota.spentUsd * 100))
-      : null
+      ? { label: planBadges[serverQuota.planTier], tone: serverQuota.planTier }
+      : workspace?.user.role === 'admin'
+        ? { label: 'ADMIN', tone: 'unlimited' }
+        : null
+    : { label: 'DEMO', tone: 'demo' }
 
   return (
     <div className="sidebar-inner">
@@ -95,9 +98,9 @@ export function Sidebar({
         <div className="side-status-card">
           {handle && (
             <button type="button" className="side-profile-btn" onClick={openSettings} title="Настройки и устройства">
-              <span className="side-profile-avatar">{handle.slice(1, 2).toUpperCase()}</span>
+              <UserAvatar name={profileDisplayName} avatarData={workspace?.user.avatarData} className="side-profile-avatar" />
               <span className="side-profile-handle">{handle}</span>
-              {quotaBadge && <small className="side-quota-pill">{quotaBadge}</small>}
+              {planBadge && <small className="side-plan-badge" data-plan={planBadge.tone}>{planBadge.label}</small>}
               <Settings2 size={13} className="side-profile-gear" aria-hidden="true" />
             </button>
           )}

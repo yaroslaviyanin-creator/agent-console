@@ -21,18 +21,19 @@ func (a *API) getProfile(w http.ResponseWriter, r *http.Request, s session) {
 func (a *API) patchProfile(w http.ResponseWriter, r *http.Request, s session) {
 	var patch struct {
 		DisplayName   *string `json:"displayName"`
+		AvatarData    *string `json:"avatarData"`
 		ProfileMD     *string `json:"profileMd"`
 		MemoryMD      *string `json:"memoryMd"`
 		MemoryEnabled *bool   `json:"memoryEnabled"`
 	}
-	// JSON escapes can expand every byte of the two text fields to six bytes.
-	if !decodeLimit(w, r, &patch, 64<<10) {
+	// JSON escapes can expand every byte of the text/avatar fields.
+	if !decodeLimit(w, r, &patch, 256<<10) {
 		return
 	}
-	profile, err := a.db.UpdateUserProfile(r.Context(), s.User.ID, patch.DisplayName, patch.ProfileMD, patch.MemoryMD, patch.MemoryEnabled)
+	profile, err := a.db.UpdateUserProfile(r.Context(), s.User.ID, patch.DisplayName, patch.ProfileMD, patch.MemoryMD, patch.MemoryEnabled, patch.AvatarData)
 	switch {
 	case errors.Is(err, store.ErrInvalidProfile):
-		fail(w, http.StatusBadRequest, "invalid_profile", "Имя должно занимать до 80 символов, а каждый текст — до 4096 байт.")
+		fail(w, http.StatusBadRequest, "invalid_profile", "Имя должно занимать до 80 символов, аватар — до 128 КБ, а каждый текст — до 4096 байт.")
 	case err != nil:
 		a.internal(w, r, err)
 	default:

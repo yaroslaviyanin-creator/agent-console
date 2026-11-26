@@ -140,6 +140,25 @@ function loadWorkspace(w: Workspace | null, preferred?: string) {
   const id = preferred ?? useChats.getState().activeId
   useChats.setState({ workspace: w, chats, activeId: chats.some(c => c.id === id) ? id : chats[0]?.id ?? '' })
 }
+export function updateSelfProfileMember(patch: { displayName?: string; avatarData?: string }) {
+  useChats.setState(state => {
+    const w = state.workspace
+    if (!w) return state
+    const nextUser = {
+      ...w.user,
+      ...(patch.displayName !== undefined ? { displayName: patch.displayName } : {}),
+      ...(patch.avatarData !== undefined ? { avatarData: patch.avatarData } : {}),
+    }
+    return {
+      workspace: {
+        ...w,
+        user: nextUser,
+        users: w.users.map(u => (u.id === w.user.id ? { ...u, ...nextUser } : u)),
+      },
+    }
+  })
+}
+
 export function setConnectionMode(mode: ConnectionMode) {
   if (mode === useChats.getState().mode) return
   logout()

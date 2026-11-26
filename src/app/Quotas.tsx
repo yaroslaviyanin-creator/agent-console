@@ -1,4 +1,5 @@
-import { type Ref, useEffect, useState } from 'react'
+import { type ReactNode, type Ref, useCallback, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Activity, ArrowLeftRight } from 'lucide-react'
 import type { MeteredProvider, Provider, Transfer, Workspace } from '../protocol/types'
 import { useAccountStore, blockReason } from './accountStore'
@@ -34,38 +35,128 @@ function ProviderQuotas() {
     })}
   </section>
 }
+function QuotaPopover({
+  open,
+  summaryRef,
+  detailsRef,
+  ariaLabel,
+  onClose,
+  children,
+}: {
+  open: boolean
+  summaryRef: React.RefObject<HTMLElement | null>
+  detailsRef: React.RefObject<HTMLDetailsElement | null>
+  ariaLabel?: string
+  onClose: () => void
+  children: ReactNode
+}) {
+  const popoverRef = useRef<HTMLElement>(null)
+  const [pos, setPos] = useState<{ top: number; right: number }>({ top: 52, right: 12 })
+
+  const updatePos = useCallback(() => {
+    const rect = summaryRef.current?.getBoundingClientRect()
+    if (!rect) return
+    setPos({
+      top: Math.round(rect.bottom + 8),
+      right: Math.max(10, Math.round(window.innerWidth - rect.right)),
+    })
+  }, [summaryRef])
+
+  useEffect(() => {
+    if (!open) return
+    updatePos()
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node
+      if (!detailsRef.current?.contains(target) && !popoverRef.current?.contains(target)) {
+        onClose()
+      }
+    }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('resize', updatePos)
+    window.addEventListener('pointerdown', onPointerDown)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('resize', updatePos)
+      window.removeEventListener('pointerdown', onPointerDown)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [open, updatePos, detailsRef, onClose])
+
+  if (!open) return null
+  return createPortal(
+    <section
+      ref={popoverRef}
+      className="quota-popover-portal"
+      aria-label={ariaLabel}
+      style={{ top: `${pos.top}px`, right: `${pos.right}px` }}
+    >
+      {children}
+    </section>,
+    document.body,
+  )
+}
+
+function assignDetailsRef(
+  external: Ref<HTMLDetailsElement>,
+  local: React.MutableRefObject<HTMLDetailsElement | null>,
+  node: HTMLDetailsElement | null,
+) {
+  local.current = node
+  if (typeof external === 'function') external(node)
+  else if (external && typeof external === 'object') (external as React.MutableRefObject<HTMLDetailsElement | null>).current = node
+}
+
 export function Quotas({ userId, menuRef, onOpenChange }: { userId: string; menuRef: Ref<HTMLDetailsElement>; onOpenChange: (open: boolean) => void }) {
   const { quotas, requests } = useAccountStore()
   const api = quotas.paid_api
-  return <details className="quota-menu" ref={menuRef} onToggle={e => onOpenChange(e.currentTarget.open)}><summary><Activity size={14}/>Лимиты{api?.provider === 'paid_api' && <small>API {dollars(Math.round(api.spentUsd * 100))}</small>}</summary>
-    <section><ProviderQuotas/>
-    {requests.length > 0 && <div className="transfer-log"><h3>Обмен лимитами</h3>{requests.slice(-5).reverse().map(r => <p key={r.requestId}>{r.from.id === userId ? 'Запрос к ' + r.to.name : 'Запрос от ' + r.from.name} · {r.percent}% {label[r.provider]} · {transferState[r.status]}</p>)}</div>}
-    </section></details>
+  const detailsRef = useRef<HTMLDetailsElement | null>(null)
+  const summaryRef = useRef<HTMLElement | null>(null)
+  const [open, setOpen] = useState(false)
+  return <details className="quota-menu" ref={node => assignDetailsRef(menuRef, detailsRef, node)} onToggle={e => {
+    const next = e.currentTarget.open
+    setOpen(next)
+    onOpenChange(next)
+  }}>
+    <summary ref={summaryRef}><Activity size={14}/>Лимиты{api?.provider === 'paid_api' && <small>API {dollars(Math.round(api.spentUsd * 100))}</small>}</summary>
+    <QuotaPopover open={open} summaryRef={summaryRef} detailsRef={detailsRef} onClose={() => { if (detailsRef.current) detailsRef.current.open = false }}>
+      <ProviderQuotas/>
+      {requests.length > 0 && <div className="transfer-log"><h3>Обмен лимитами</h3>{requests.slice(-5).reverse().map(r => <p key={r.requestId}>{r.from.id === userId ? 'Запрос к ' + r.to.name : 'Запрос от ' + r.from.name} · {r.percent}% {label[r.provider]} · {transferState[r.status]}</p>)}</div>}
+    </QuotaPopover>
+  </details>
 }
 
 export function ServerQuotas({ menuRef, onOpenChange }: { menuRef: Ref<HTMLDetailsElement>; onOpenChange: (open: boolean) => void }) {
   const quota = useAccountStore(s => s.serverQuota)
   const [now, setNow] = useState(Date.now)
+  const detailsRef = useRef<HTMLDetailsElement | null>(null)
+  const summaryRef = useRef<HTMLElement | null>(null)
+  const [open, setOpen] = useState(false)
   useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 10_000); return () => clearInterval(timer) }, [])
   const windows = quota ? [
     { name: '5ч', window: quota.fiveHour, bypass: quota.bypass5hLimit },
     { name: '7д', window: quota.sevenDay, bypass: false },
   ] : []
-  return <details className="quota-menu server-quotas" ref={menuRef} onToggle={e => onOpenChange(e.currentTarget.open)}>
-    <summary aria-label="Лимиты за 5 часов и 7 дней">
+  return <details className="quota-menu server-quotas" ref={node => assignDetailsRef(menuRef, detailsRef, node)} onToggle={e => {
+    const next = e.currentTarget.open
+    setOpen(next)
+    onOpenChange(next)
+  }}>
+    <summary ref={summaryRef} aria-label="Лимиты за 5 часов и 7 дней">
       <Activity size={14} aria-hidden="true"/>
       {windows.length ? windows.map(({ name, window, bypass }) =>
         <span key={name}>{name} <b>{bypass ? 'Отключён' : quota?.planTier === 'unlimited' ? '∞' : quotaPercent(window.usedPercent)}</b></span>
       ) : 'Лимиты'}
     </summary>
-    <section aria-label="Расход по тарифу">
+    <QuotaPopover open={open} summaryRef={summaryRef} detailsRef={detailsRef} ariaLabel="Расход по тарифу" onClose={() => { if (detailsRef.current) detailsRef.current.open = false }}>
       {!quota && <p>Данные о лимитах пока недоступны.</p>}
       {windows.map(({ name, window, bypass }) => <div className="server-quota-window" key={name}>
         <strong>{name}</strong><span>{dollars(window.usedCents)}{window.limitCents > 0 && ' / ' + limitDollars(window.limitCents)}</span>
         {window.limitCents > 0 && !bypass && <progress aria-label={'Расход за ' + name} value={window.usedPercent} max={100}/>}
         <small>{bypass ? 'Лимит отключён' : quota?.planTier === 'unlimited' ? 'Без ограничений' : quota?.planTier === 'none' ? 'Без тарифа' : window.resetsAt > now ? 'Ближайшее снижение расхода через ' + remaining(window.resetsAt, now) : ''}</small>
       </div>)}
-    </section>
+    </QuotaPopover>
   </details>
 }
 

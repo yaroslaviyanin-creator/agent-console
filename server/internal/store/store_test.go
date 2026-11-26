@@ -68,7 +68,7 @@ func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 		t.Fatalf("auth after reopening DB failed: %v", err)
 	}
 	var version int
-	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 12 {
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 13 {
 		t.Fatalf("schema version %d: %v", version, err)
 	}
 	if currentDevice.LastSeenAt != device.LastSeenAt {
@@ -434,6 +434,7 @@ func TestProfileMigrationAndMemoryIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err = db.db.ExecContext(ctx, `ALTER TABLE users DROP COLUMN display_name;
+  ALTER TABLE users DROP COLUMN avatar_data;
   ALTER TABLE users DROP COLUMN profile_md;
   ALTER TABLE users DROP COLUMN memory_md;
   ALTER TABLE users DROP COLUMN memory_enabled;
@@ -459,6 +460,14 @@ func TestProfileMigrationAndMemoryIsolation(t *testing.T) {
 	profile, err := db.UpdateUserProfile(ctx, owner, &name, &preference, nil, nil)
 	if err != nil || profile.DisplayName != name || profile.ProfileMD != preference || !profile.MemoryEnabled {
 		t.Fatalf("profile update error: %v", err)
+	}
+	validAvatar := "data:image/webp;base64,UklGRh4AAABXRUJQVlA4TBEAAAAvAAAAAAfQ//73v/+BiOh/AAA="
+	if profile, err = db.UpdateUserProfile(ctx, owner, nil, nil, nil, nil, &validAvatar); err != nil || profile.AvatarData != validAvatar {
+		t.Fatalf("avatar update error: %v", err)
+	}
+	invalidAvatar := "javascript:alert(1)"
+	if _, err := db.UpdateUserProfile(ctx, owner, nil, nil, nil, nil, &invalidAvatar); !errors.Is(err, ErrInvalidProfile) {
+		t.Fatalf("expected invalid avatar rejection, got: %v", err)
 	}
 	overlong := name + "!"
 	tooManyBytes := preference + "!"

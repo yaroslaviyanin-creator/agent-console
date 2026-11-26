@@ -24,10 +24,12 @@ var initialSchema string
 type Store struct{ db *sql.DB }
 
 type User struct {
-	ID       string `json:"id"`
-	Username string `json:"username"`
-	Role     string `json:"role"`
-	IsActive bool   `json:"isActive"`
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"displayName,omitempty"`
+	AvatarData  string `json:"avatarData,omitempty"`
+	Role        string `json:"role"`
+	IsActive    bool   `json:"isActive"`
 	Subscription
 }
 
@@ -131,7 +133,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version == 12 {
+	if version == 13 {
 		return nil
 	}
 	// SQLite requires disabling foreign keys outside the transaction on this connection.
@@ -148,7 +150,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	switch version {
 	case 0:
-		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=12;"); err != nil {
+		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=13;"); err != nil {
 			return err
 		}
 	case 1:
@@ -353,7 +355,13 @@ func (s *Store) migrate(ctx context.Context) error {
 		case !errors.Is(err, sql.ErrNoRows):
 			return err
 		}
+		fallthrough
 	case 12:
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE users ADD COLUMN avatar_data TEXT NOT NULL DEFAULT '';
+		PRAGMA user_version=13;`); err != nil {
+			return err
+		}
+	case 13:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}
@@ -380,8 +388,8 @@ func (s *Store) Credentials(ctx context.Context, username string) (User, []byte,
 	var user User
 	var hash []byte
 	err := s.db.QueryRowContext(ctx,
-		"SELECT id, username, role, is_active, plan_tier, bypass_5h_limit, subscription_until, password_hash FROM users WHERE username=?", username).
-		Scan(&user.ID, &user.Username, &user.Role, &user.IsActive, &user.PlanTier, &user.Bypass5hLimit, &user.SubscriptionUntil, &hash)
+		"SELECT id, username, display_name, avatar_data, role, is_active, plan_tier, bypass_5h_limit, subscription_until, password_hash FROM users WHERE username=?", username).
+		Scan(&user.ID, &user.Username, &user.DisplayName, &user.AvatarData, &user.Role, &user.IsActive, &user.PlanTier, &user.Bypass5hLimit, &user.SubscriptionUntil, &hash)
 	return user, hash, err
 }
 
@@ -457,9 +465,9 @@ func activeDevice(ctx context.Context, db rowQuerier, predicate string, now int6
 	var device Device
 	args = append(args, now)
 	err := db.QueryRowContext(ctx, `SELECT d.id,d.user_id,d.name,d.last_seen_at,d.created_at,
-  u.username,u.role,u.is_active,u.plan_tier,u.bypass_5h_limit,u.subscription_until FROM devices d JOIN users u ON u.id=d.user_id
+  u.username,u.display_name,u.avatar_data,u.role,u.is_active,u.plan_tier,u.bypass_5h_limit,u.subscription_until FROM devices d JOIN users u ON u.id=d.user_id
   WHERE `+predicate+` AND (d.expires_at=0 OR d.expires_at>?)`, args...).
-		Scan(&device.ID, &device.UserID, &device.Name, &device.LastSeenAt, &device.CreatedAt, &user.Username, &user.Role, &user.IsActive, &user.PlanTier, &user.Bypass5hLimit, &user.SubscriptionUntil)
+		Scan(&device.ID, &device.UserID, &device.Name, &device.LastSeenAt, &device.CreatedAt, &user.Username, &user.DisplayName, &user.AvatarData, &user.Role, &user.IsActive, &user.PlanTier, &user.Bypass5hLimit, &user.SubscriptionUntil)
 	user.ID = device.UserID
 	if err == nil && !user.IsActive {
 		err = ErrInactiveUser

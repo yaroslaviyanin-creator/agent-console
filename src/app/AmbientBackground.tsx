@@ -1,10 +1,13 @@
 import { useId } from 'react'
+import { useAppearance } from './appearanceStore'
 
 /**
  * Ambient mesh gradient background with three GPU-animated orbs and anti-banding noise.
  */
 export function AmbientBackground({ dimmed = false }: { dimmed?: boolean }) {
+  const ambientGradient = useAppearance(s => s.ambientGradient)
   const filterId = useId()
+  if (!ambientGradient) return null
   return (
     <div className="ambient-bg" data-mode={dimmed ? 'workspace' : 'auth'} aria-hidden="true">
       <div className="ambient-orb ambient-orb-blue" />
