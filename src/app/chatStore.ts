@@ -1,10 +1,10 @@
 import { historyUntil, previousTurn } from './runHistory'
 import { create } from 'zustand'
-import type { LoginRequest, MessageAttachment, Workspace, PermissionDecision, Provider, RunEvent, ServerMessage, ServerModel, ShareAccess, Target, ToolCall } from '../protocol/types'
+import type { LoginRequest, MessageAttachment, Workspace, PermissionDecision, Provider, RunEvent, ServerMessage, ServerModel, ServerProvider, ServerProviderInfo, ShareAccess, Target, ToolCall } from '../protocol/types'
 import { useAccountStore, blockReason } from './accountStore'
 import { readConnection, saveConnection, setTransport, transport } from './runtime'
 import type { ConnectionMode } from './runtime'
-import { RemoteError, RemoteTransport, normalizeServerAddress } from '../transport/RemoteTransport'
+import { RemoteError, RemoteTransport, fallbackProviders, normalizeServerAddress } from '../transport/RemoteTransport'
 
 export const providerLabels = { antigravity: 'Antigravity', codex: 'Codex', claude: 'Claude', paid_api: 'Paid API' } satisfies Record<Provider, string>
 export const models = [
@@ -59,8 +59,11 @@ export interface Chat {
   id: string
   title: string
   access: ShareAccess | 'owner'
+  provider?: ServerProvider
+  serverProvider?: ServerProvider
   model: string
   reasoning?: string | undefined
+  modelByProvider?: Partial<Record<ServerProvider, { model: string; reasoning?: string | undefined }>>
   target: Target
   draft: string
   turns: Turn[]
@@ -98,13 +101,20 @@ export const useChats = create<{
   restoring: boolean
   connected: boolean
   connectionError: string
-  serverModels: ServerModel[]
-  modelsLoading: boolean
-  modelsError: string
+  serverProviders: ServerProviderInfo[]
+  defaultServerProvider: ServerProvider | null
+  providersLoaded: boolean
+  serverModelsByProvider: Partial<Record<ServerProvider, ServerModel[]>>
+  modelsLoadingByProvider: Partial<Record<ServerProvider, boolean>>
+  modelsErrorByProvider: Partial<Record<ServerProvider, string>>
+  lastModelByProvider: Partial<Record<ServerProvider, { model: string; reasoning?: string | undefined }>>
   codexIndex: 'hidden' | 'loading' | 'ready' | 'error'
 }>(() => ({
   activeId: '', chats: [], workspace: null, mode: savedConnection.mode, address: savedConnection.address,
-  remote: null, restoring: false, connected: false, connectionError: '', serverModels: [], modelsLoading: false, codexIndex: 'hidden', modelsError: '',
+  remote: null, restoring: false, connected: false, connectionError: '',
+  serverProviders: [], defaultServerProvider: null, providersLoaded: false,
+  serverModelsByProvider: {}, modelsLoadingByProvider: {}, modelsErrorByProvider: {}, lastModelByProvider: {},
+  codexIndex: 'hidden',
 }))
 
 // The mock server and transcripts live for this app launch. Drafts belong to the signed-in user.
@@ -221,7 +231,12 @@ function clearSession() {
   for (const id of runs.keys()) stopChat(id)
   if (remote) {
     setTransport()
-    useChats.setState({ remote: null, workspace: null, chats: [], activeId: '', connected: false, connectionError: '', serverModels: [], modelsLoading: false, codexIndex: 'hidden', modelsError: '' })
+    useChats.setState({
+      remote: null, workspace: null, chats: [], activeId: '', connected: false, connectionError: '',
+      serverProviders: [], defaultServerProvider: null, providersLoaded: false,
+      serverModelsByProvider: {}, modelsLoadingByProvider: {}, modelsErrorByProvider: {}, lastModelByProvider: {},
+      codexIndex: 'hidden',
+    })
   } else {
     loadWorkspace(null)
   }
@@ -281,42 +296,140 @@ export async function checkAccountStatus() {
   applyRemoteWorkspace(remote, workspace)
   useChats.setState({ connectionError: '' })
   if (workspace.user.role !== 'pending') startRemote(remote)
-  else useChats.setState({ connected: false, serverModels: [], codexIndex: 'hidden' })
+  else useChats.setState({
+    connected: false,
+    serverProviders: [], defaultServerProvider: null, providersLoaded: false,
+    serverModelsByProvider: {}, modelsLoadingByProvider: {}, modelsErrorByProvider: {},
+    codexIndex: 'hidden',
+  })
+}
+
+const modelLoadSeq = new WeakMap<RemoteTransport, Partial<Record<ServerProvider, number>>>()
+
+function isServerProviderAvailable(state: ReturnType<typeof useChats.getState>, provider: ServerProvider) {
+  if (!state.providersLoaded) return true
+  return state.serverProviders.some(p => p.id === provider && p.available)
+}
+
+function ensureChatModels(remote: RemoteTransport, chatId: string) {
+  const state = useChats.getState()
+  if (state.remote !== remote || state.workspace?.user.role === 'pending') return
+  const targetChat = state.chats.find(c => c.id === chatId)
+  if (!targetChat || targetChat.indexedCodex) return
+  const provider = targetChat.provider ?? state.defaultServerProvider ?? remote.provider
+  if (provider === 'stub') return
+  if (state.serverModelsByProvider[provider] !== undefined || state.modelsLoadingByProvider[provider]) return
+  if (!isServerProviderAvailable(state, provider)) return
+  void refreshServerModels(provider, false, remote)
 }
 
 function startRemote(remote: RemoteTransport) {
   void remote.connect()
+  void refreshServerProviders(remote)
+  if (remote.provider !== 'stub') {
+    void refreshServerModels(remote.provider, false, remote)
+  }
   if (remote.provider === 'codex') {
-    void refreshServerModels()
     void refreshCodexIndex()
-  } else if (remote.provider === 'antigravity') {
-    void refreshServerModels()
   }
 }
 
-export async function refreshServerModels() {
-  const { remote, modelsLoading } = useChats.getState()
-  if (!remote || (remote.provider !== 'codex' && remote.provider !== 'antigravity') || modelsLoading || useChats.getState().workspace?.user.role === 'pending') return
-  useChats.setState({ modelsLoading: true, modelsError: '' })
+export async function refreshServerProviders(targetRemote = useChats.getState().remote) {
+  if (!targetRemote || useChats.getState().workspace?.user.role === 'pending') return
   try {
-    const serverModels = await remote.models()
-    if (useChats.getState().remote === remote) {
-      useChats.setState({ serverModels, modelsError: serverModels.length ? '' : (remote.provider === 'antigravity' ? 'Antigravity не вернул доступных моделей.' : 'Codex не вернул доступных моделей.') })
+    const res = await targetRemote.providers()
+    if (useChats.getState().remote !== targetRemote) return
+    useChats.setState({
+      defaultServerProvider: res.defaultProvider,
+      serverProviders: res.providers,
+      providersLoaded: true,
+    })
+    const state = useChats.getState()
+    const activeChat = state.chats.find(c => c.id === state.activeId)
+    const toLoad = new Set<ServerProvider>()
+    if (res.defaultProvider !== 'stub' && res.providers.some(p => p.id === res.defaultProvider && p.available)) {
+      toLoad.add(res.defaultProvider)
     }
+    const activeProvider = activeChat?.provider
+    if (activeProvider && activeProvider !== 'stub' && res.providers.some(p => p.id === activeProvider && p.available)) {
+      toLoad.add(activeProvider)
+    }
+    for (const p of toLoad) {
+      if (state.serverModelsByProvider[p] === undefined && !state.modelsLoadingByProvider[p]) {
+        void refreshServerModels(p, false, targetRemote)
+      }
+    }
+    if (res.providers.some(p => p.id === 'codex' && p.available) && state.codexIndex === 'hidden') {
+      void refreshCodexIndex()
+    }
+  } catch {
+    if (useChats.getState().remote !== targetRemote) return
+    const fallback = fallbackProviders(targetRemote.provider)
+    useChats.setState(state => state.providersLoaded ? state : {
+      defaultServerProvider: fallback.defaultProvider,
+      serverProviders: fallback.providers,
+      providersLoaded: true,
+    })
+  }
+}
+
+export async function refreshServerModels(
+  provider?: ServerProvider,
+  force = true,
+  targetRemote = useChats.getState().remote,
+) {
+  const state = useChats.getState()
+  const remote = targetRemote
+  if (!remote || state.workspace?.user.role === 'pending') return
+  const activeChat = state.chats.find(c => c.id === state.activeId)
+  const resolvedProvider = provider ?? activeChat?.provider ?? state.defaultServerProvider ?? remote.provider
+  if (resolvedProvider === 'stub') return
+  if (!force && state.serverModelsByProvider[resolvedProvider] !== undefined) return
+  if (state.modelsLoadingByProvider[resolvedProvider] && !force) return
+
+  const seqMap = modelLoadSeq.get(remote) ?? {}
+  const seq = (seqMap[resolvedProvider] ?? 0) + 1
+  seqMap[resolvedProvider] = seq
+  modelLoadSeq.set(remote, seqMap)
+
+  useChats.setState(s => ({
+    modelsLoadingByProvider: { ...s.modelsLoadingByProvider, [resolvedProvider]: true },
+    modelsErrorByProvider: { ...s.modelsErrorByProvider, [resolvedProvider]: '' },
+  }))
+  const label = providerLabels[resolvedProvider] ?? resolvedProvider
+  try {
+    const serverModels = await remote.models(resolvedProvider)
+    if (useChats.getState().remote !== remote || modelLoadSeq.get(remote)?.[resolvedProvider] !== seq) return
+    useChats.setState(s => ({
+      serverModelsByProvider: { ...s.serverModelsByProvider, [resolvedProvider]: serverModels },
+      modelsErrorByProvider: {
+        ...s.modelsErrorByProvider,
+        [resolvedProvider]: serverModels.length ? '' : `${label} не вернул доступных моделей.`,
+      },
+    }))
   } catch (error) {
-    if (useChats.getState().remote === remote) {
-      useChats.setState({ modelsError: error instanceof RemoteError && error.status === 404
-        ? 'Обновите сервер, чтобы загрузить список моделей.'
-        : (remote.provider === 'antigravity' ? 'Не удалось загрузить список моделей Antigravity.' : 'Не удалось загрузить список моделей Codex.') })
-    }
+    if (useChats.getState().remote !== remote || modelLoadSeq.get(remote)?.[resolvedProvider] !== seq) return
+    useChats.setState(s => ({
+      modelsErrorByProvider: {
+        ...s.modelsErrorByProvider,
+        [resolvedProvider]: error instanceof RemoteError && error.status === 404
+          ? 'Обновите сервер, чтобы загрузить список моделей.'
+          : `Не удалось загрузить список моделей ${label}.`,
+      },
+    }))
   } finally {
-    if (useChats.getState().remote === remote) useChats.setState({ modelsLoading: false })
+    if (useChats.getState().remote === remote && modelLoadSeq.get(remote)?.[resolvedProvider] === seq) {
+      useChats.setState(s => ({
+        modelsLoadingByProvider: { ...s.modelsLoadingByProvider, [resolvedProvider]: false },
+      }))
+    }
   }
 }
 
 export async function refreshCodexIndex() {
-  const { remote, codexIndex } = useChats.getState()
-  if (remote?.provider !== 'codex' || codexIndex === 'loading' || useChats.getState().workspace?.user.role === 'pending') return
+  const { remote, codexIndex, serverProviders, providersLoaded } = useChats.getState()
+  const codexAvailable = remote?.provider === 'codex' || (providersLoaded && serverProviders.some(p => p.id === 'codex' && p.available))
+  if (!remote || !codexAvailable || codexIndex === 'loading' || useChats.getState().workspace?.user.role === 'pending') return
   useChats.setState({ codexIndex: 'loading' })
   try {
     const workspace = await remote.refreshCodexIndex()
@@ -335,18 +448,39 @@ function applyRemoteWorkspace(remote: RemoteTransport, workspace: Workspace, pre
   const accessById = new Map(workspace.chats.map(c => [c.id, c.access]))
   const chats = remote.chats.map(item => {
     const previous = existing.get(item.id)
-    const model = remote.provider === 'stub' || item.model === 'codex' || item.model === 'antigravity' ? 'default' : item.model
+    const serverProvider = item.provider ?? remote.provider
+    const serverModel = serverProvider === 'stub' || item.model === 'codex' || item.model === 'antigravity' ? 'default' : item.model
     if ('archived' in item && typeof item.archived === 'boolean') {
-      return { ...(previous ?? chat(item.id, item.title, 'read')), title: item.title, model, indexedCodex: true, archived: item.archived }
+      return { ...(previous ?? chat(item.id, item.title, 'read')), title: item.title, provider: serverProvider, serverProvider, model: serverModel, indexedCodex: true, archived: item.archived }
     }
     const access = accessById.get(item.id) ?? 'read'
-    return previous ? { ...previous, title: item.title, access } : { ...chat(item.id, item.title, access), model }
+    if (!previous) {
+      return { ...chat(item.id, item.title, access), provider: serverProvider, serverProvider, model: serverModel }
+    }
+    const prevServerProvider = previous.serverProvider ?? serverProvider
+    const hasLocalProviderOverride = previous.provider != null && previous.provider !== prevServerProvider
+    const serverChanged = serverProvider !== prevServerProvider
+    if (hasLocalProviderOverride && !serverChanged) {
+      return { ...previous, title: item.title, access, serverProvider }
+    }
+    const externalProviderChange = serverChanged && previous.provider !== serverProvider
+    return {
+      ...previous,
+      title: item.title,
+      access,
+      provider: serverProvider,
+      serverProvider,
+      ...(externalProviderChange ? { model: serverModel, reasoning: undefined } : {}),
+    }
   })
   for (const id of runs.keys()) if (!accessById.has(id)) stopChat(id)
   const selected = preferred ?? state.activeId
   const activeId = chats.some(c => c.id === selected) ? selected : chats[0]?.id ?? ''
   useChats.setState({ workspace, chats, activeId })
-  if (activeId !== state.activeId && activeId) void loadRemoteHistory(remote, activeId)
+  if (activeId !== state.activeId && activeId) {
+    void loadRemoteHistory(remote, activeId)
+    ensureChatModels(remote, activeId)
+  }
 }
 
 function receiveRemoteRun(remote: RemoteTransport, event: RunEvent) {
@@ -357,10 +491,13 @@ function receiveRemoteRun(remote: RemoteTransport, event: RunEvent) {
   updateChat(event.chatId, c => {
     const previous = c.turns.find(t => t.id === event.messageId)
     if (previous && (previous.seq > 0 || previous.state === 'completed')) return c
-    const label = useChats.getState().serverModels.find(m => m.id === event.model)?.name
+    const chatProvider = c.provider ?? remote.provider
+    const catalog = useChats.getState().serverModelsByProvider[chatProvider] ?? []
+    const label = catalog.find(m => m.id === event.model)?.name
+    const fallbackLabel = chatProvider === 'stub' ? 'StubProvider' : providerLabels[chatProvider]
     const turn: Turn = {
       id: event.messageId, prompt: event.prompt, time: event.createdAt, parts: [], seq: event.seq,
-      model: remote.provider === 'stub' ? 'StubProvider' : label ?? 'Codex', state: 'running',
+      model: label ?? fallbackLabel, state: 'running',
     }
     const turns = previous ? c.turns.map(t => t.id === turn.id ? turn : t) : [...c.turns, turn]
     return { ...c, turns }
@@ -410,7 +547,11 @@ async function loadRemoteHistory(remote: RemoteTransport, id: string) {
   try {
     const messages = await remote.messages(id, controller.signal)
     if (controller.signal.aborted || useChats.getState().remote !== remote) return
-    updateChat(id, c => ({ ...c, historyLoaded: true, turns: restoreTurns(messages, c.turns, remote.provider === 'stub' ? 'StubProvider' : providerLabels[remote.provider]) }))
+    updateChat(id, c => {
+      const chatProvider = c.provider ?? remote.provider
+      const label = chatProvider === 'stub' ? 'StubProvider' : providerLabels[chatProvider]
+      return { ...c, historyLoaded: true, turns: restoreTurns(messages, c.turns, label) }
+    })
   } catch (error) {
     if (!controller.signal.aborted && useChats.getState().remote === remote) {
       updateChat(id, c => ({ ...c, historyError: error instanceof Error ? error.message : 'Не удалось загрузить историю.' }))
@@ -534,7 +675,106 @@ export function selectChat(id: string) {
   if (active !== id) {
     if (!remote && runs.has(active)) stopChat(active)
     useChats.setState({ activeId: id })
-    if (remote) void loadRemoteHistory(remote, id)
+    if (remote) {
+      void loadRemoteHistory(remote, id)
+      ensureChatModels(remote, id)
+    }
+  }
+}
+function resolveProviderModel(
+  source: Chat | undefined,
+  provider: ServerProvider,
+  catalog: readonly ServerModel[] | undefined,
+  lastByProvider: Partial<Record<ServerProvider, { model: string; reasoning?: string | undefined }>>,
+): { model: string; reasoning?: string | undefined } {
+  if (provider === 'stub') return { model: 'default' }
+  const preferred = source?.modelByProvider?.[provider] ?? lastByProvider[provider]
+  if (preferred) {
+    if (preferred.model === 'default') return { model: 'default', reasoning: preferred.reasoning }
+    if (!catalog || catalog.some(m => m.id === preferred.model)) {
+      return { model: preferred.model, reasoning: preferred.reasoning }
+    }
+  }
+  const defaultModel = catalog?.find(m => m.isDefault)?.id ?? catalog?.[0]?.id ?? 'default'
+  return { model: defaultModel }
+}
+
+export function selectChatModel(chatId: string, model: string) {
+  useChats.setState(s => {
+    const target = s.chats.find(c => c.id === chatId)
+    if (!target) return s
+    const activeProvider = s.remote ? (target.provider ?? s.defaultServerProvider ?? s.remote.provider) : undefined
+    const entry = { model, ...(target.reasoning ? { reasoning: target.reasoning } : {}) }
+    return {
+      ...(activeProvider ? { lastModelByProvider: { ...s.lastModelByProvider, [activeProvider]: entry } } : {}),
+      chats: s.chats.map(c => c.id === chatId ? {
+        ...c,
+        model,
+        ...(activeProvider ? { modelByProvider: { ...c.modelByProvider, [activeProvider]: entry } } : {}),
+      } : c),
+    }
+  })
+}
+
+export function selectChatReasoning(chatId: string, reasoning: string) {
+  const normalized = reasoning || undefined
+  useChats.setState(s => {
+    const target = s.chats.find(c => c.id === chatId)
+    if (!target) return s
+    const activeProvider = s.remote ? (target.provider ?? s.defaultServerProvider ?? s.remote.provider) : undefined
+    const entry = { model: target.model, ...(normalized ? { reasoning: normalized } : {}) }
+    return {
+      ...(activeProvider ? { lastModelByProvider: { ...s.lastModelByProvider, [activeProvider]: entry } } : {}),
+      chats: s.chats.map(c => c.id === chatId ? {
+        ...c,
+        reasoning: normalized,
+        ...(activeProvider ? { modelByProvider: { ...c.modelByProvider, [activeProvider]: entry } } : {}),
+      } : c),
+    }
+  })
+}
+
+export async function switchChatProvider(chatId: string, nextProvider: ServerProvider) {
+  const state = useChats.getState()
+  const { remote, chats, serverProviders, providersLoaded, serverModelsByProvider, lastModelByProvider } = state
+  if (!remote) return
+  const source = chats.find(c => c.id === chatId)
+  if (!source || source.access !== 'owner' || source.indexedCodex) return
+  if (source.turns.some(t => t.state === 'running')) return
+  const currentProvider = source.provider ?? state.defaultServerProvider ?? remote.provider
+  if (nextProvider === currentProvider || nextProvider === 'paid_api') return
+  if (providersLoaded && !serverProviders.some(p => p.id === nextProvider && p.available)) return
+
+  const savedCurrent = { model: source.model, ...(source.reasoning ? { reasoning: source.reasoning } : {}) }
+  const existingCatalog = serverModelsByProvider[nextProvider]
+  const immediate = resolveProviderModel(source, nextProvider, existingCatalog, lastModelByProvider)
+
+  useChats.setState(s => ({
+    connectionError: '',
+    lastModelByProvider: { ...s.lastModelByProvider, [currentProvider]: savedCurrent },
+    chats: s.chats.map(c => c.id === chatId ? {
+      ...c,
+      provider: nextProvider,
+      serverProvider: c.serverProvider ?? currentProvider,
+      model: immediate.model,
+      reasoning: immediate.reasoning,
+      modelByProvider: { ...c.modelByProvider, [currentProvider]: savedCurrent },
+    } : c),
+  }))
+
+  if (nextProvider !== 'stub' && existingCatalog === undefined) {
+    await refreshServerModels(nextProvider, false, remote)
+    const latest = useChats.getState()
+    if (latest.remote !== remote) return
+    const updatedChat = latest.chats.find(c => c.id === chatId)
+    if (!updatedChat || updatedChat.provider !== nextProvider) return
+    const loadedCatalog = latest.serverModelsByProvider[nextProvider]
+    if (loadedCatalog && (updatedChat.model === 'default' || !loadedCatalog.some(m => m.id === updatedChat.model))) {
+      const resolved = resolveProviderModel(updatedChat, nextProvider, loadedCatalog, latest.lastModelByProvider)
+      if (resolved.model !== updatedChat.model || resolved.reasoning !== updatedChat.reasoning) {
+        updateChat(chatId, c => c.provider === nextProvider ? { ...c, model: resolved.model, reasoning: resolved.reasoning } : c)
+      }
+    }
   }
 }
 let creatingIn: RemoteTransport | null = null
@@ -572,17 +812,20 @@ export function retryAnswer(chatId: string, turnId: string, modelId: string) {
   return startRun(chatId, '', { turnId, modelId })
 }
 async function startRun(id: string, input: string, retry?: { turnId: string; modelId: string }) {
-  const { workspace, chats, remote, connected, serverModels } = useChats.getState()
+  const { workspace, chats, remote, connected, serverModelsByProvider, serverProviders, providersLoaded } = useChats.getState()
   const c = chats.find(item => item.id === id)
   if (remote && (!connected || !c?.historyLoaded || retry)) return
   if (!workspace || !c || runs.has(id) || (c.access !== 'owner' && c.access !== 'write')) return
   const index = retry ? c.turns.findIndex(t => t.id === retry.turnId) : -1
   const source = c.turns[index]
-  const serverModel = serverModels.find(m => m.id === c.model)
+  const chatProvider: ServerProvider = remote ? (c.provider ?? remote.provider) : 'claude'
+  if (remote && providersLoaded && !serverProviders.some(p => p.id === chatProvider && p.available)) return
+  const catalog = remote ? (serverModelsByProvider[chatProvider] ?? []) : []
+  const serverModel = catalog.find(m => m.id === c.model)
   if (remote && c.model !== 'default' && !serverModel) return
-  const remoteProvider: Provider = remote?.provider === 'stub' || !remote ? 'codex' : remote.provider
+  const remoteProvider: Provider = chatProvider === 'stub' ? 'codex' : chatProvider
   const model = remote
-    ? { id: c.model, provider: remoteProvider, label: serverModel?.name ?? providerLabels[remoteProvider] }
+    ? { id: c.model, provider: remoteProvider, label: serverModel?.name ?? (chatProvider === 'stub' ? 'StubProvider' : providerLabels[remoteProvider]) }
     : models.find(m => m.id === (retry?.modelId ?? c.model))
   if (!model || (retry && (!source || source.state === 'running' || source.model === model.label))) return
   const prompt = source?.prompt ?? input.trim()
@@ -592,12 +835,12 @@ async function startRun(id: string, input: string, retry?: { turnId: string; mod
   const target = source?.target ?? (source ? { mode: 'chat' } as const : c.target)
   const retryFields = source ? { retryOf: source.id } : {}
   const turn: Turn = { ...retryFields, parentId, target, id: crypto.randomUUID(), time: Date.now(), authorId: workspace.user.id,
-    prompt, model: remote?.provider === 'stub' ? 'StubProvider' : model.label, seq: 0, state: 'running', parts: [] }
+    prompt, model: remote && chatProvider === 'stub' ? 'StubProvider' : model.label, seq: 0, state: 'running', parts: [] }
   const controller = new AbortController()
   runs.set(id, controller)
   updateChat(id, value => ({ ...value, title: !remote && value.title === 'Новый чат' ? prompt : value.title, draft: source ? value.draft : '', model: model.id, target, turns: [...value.turns, turn] }))
   try {
-    for await (const event of transport.stream({ chatId: id, messageId: turn.id, model: { id: model.id, provider: model.provider }, ...(c.reasoning ? { reasoning: c.reasoning } : {}), target, prompt, ...(history ? { history } : {}), ...retryFields }, controller.signal)) {
+    for await (const event of transport.stream({ chatId: id, messageId: turn.id, ...(remote ? { provider: chatProvider } : {}), model: { id: model.id, provider: model.provider }, ...(c.reasoning ? { reasoning: c.reasoning } : {}), target, prompt, ...(history ? { history } : {}), ...retryFields }, controller.signal)) {
       if (controller.signal.aborted) break
       if (event.chatId === id && event.messageId === turn.id) {
         updateTurn(id, turn.id, t => applyEvent(t, event))

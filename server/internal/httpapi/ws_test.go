@@ -11,8 +11,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"agent-console/server/internal/config"
 	"agent-console/server/internal/provider"
@@ -619,5 +621,271 @@ func TestRevokedWriterCannotProvidePrivateContextToOwner(t *testing.T) {
 	}
 	if session, _, err := db.ChatRunContext(ctx, chat.ID); session != "" || err != nil {
 		t.Fatalf("saved session from revoked writer: %q %v", session, err)
+	}
+}
+
+type switchCaptureProvider struct {
+	name     string
+	seq      *atomic.Int64
+	requests chan<- capturedProviderCall
+}
+
+type capturedProviderCall struct {
+	provider string
+	req      provider.Request
+}
+
+func (p switchCaptureProvider) Stream(ctx context.Context, req provider.Request) (<-chan provider.Event, error) {
+	n := p.seq.Add(1)
+	sessionID := p.name + "-sess-" + string(rune('0'+n))
+	reply := "Ответ от " + p.name + " #" + string(rune('0'+n))
+	p.requests <- capturedProviderCall{provider: p.name, req: req}
+	out := make(chan provider.Event, 2)
+	go func() {
+		defer close(out)
+		out <- provider.Event{Type: provider.Text, Delta: reply}
+		out <- provider.Event{Type: provider.Done, SessionID: sessionID}
+	}()
+	return out, nil
+}
+
+func TestWebSocketInChatProviderSwitchAndHandoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	db, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	createUser := func(name string) (string, string) {
+		t.Helper()
+		u, err := db.CreateUserWithRole(ctx, name, []byte("hash"), "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, tok, err := db.IssueDevice(ctx, u.ID, "browser")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u.ID, tok
+	}
+	aliceID, aliceToken := createUser("alice")
+	bobID, bobToken := createUser("bob")
+
+	aliceProfile := "PRIVATE PROFILE"
+	aliceMemory := "PRIVATE MEMORY"
+	if _, err := db.UpdateUserProfile(ctx, aliceID, nil, &aliceProfile, &aliceMemory, nil); err != nil {
+		t.Fatal(err)
+	}
+	bobProfile := "BOB PRIVATE PROFILE"
+	bobMemory := "BOB PRIVATE MEMORY"
+	if _, err := db.UpdateUserProfile(ctx, bobID, nil, &bobProfile, &bobMemory, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	chat, err := db.CreateChat(ctx, aliceID, "Multi", "codex", "gpt-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	captured := make(chan capturedProviderCall, 10)
+	var codexSeq, claudeSeq atomic.Int64
+	cfg := config.Config{
+		Provider:             "codex",
+		EnabledProviders:     []string{"codex", "claude"},
+		DefaultProvider:      "codex",
+		MemoryProvider:       "codex",
+		CORSOrigin:           "*",
+		MaxConcurrentStreams: 2,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := newRegistryHandler(ctx, db, cfg, logger, map[string]provider.Provider{
+		"codex":  switchCaptureProvider{name: "codex", seq: &codexSeq, requests: captured},
+		"claude": switchCaptureProvider{name: "claude", seq: &claudeSeq, requests: captured},
+	})
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	dialWS := func(token string) *websocket.Conn {
+		t.Helper()
+		req, _ := http.NewRequest("POST", srv.URL+"/api/ws/ticket", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil || res.StatusCode != 200 {
+			t.Fatalf("ticket err=%v res=%v", err, res)
+		}
+		var body struct{ Ticket string }
+		_ = json.NewDecoder(res.Body).Decode(&body)
+		res.Body.Close()
+		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?ticket=" + url.QueryEscape(body.Ticket)
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		return conn
+	}
+	aliceWS := dialWS(aliceToken)
+	bobWS := dialWS(bobToken)
+
+	sendAndWaitDone := func(ws *websocket.Conn, msgID, prov, modelID, prompt string) {
+		t.Helper()
+		payload := map[string]any{
+			"chatId":    chat.ID,
+			"messageId": msgID,
+			"prompt":    prompt,
+			"model":     map[string]string{"provider": prov, "id": modelID},
+			"target":    map[string]string{"mode": "chat"},
+		}
+		if prov != "" {
+			payload["provider"] = prov
+		}
+		if err := ws.WriteJSON(payload); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			_ = ws.SetReadDeadline(time.Now().Add(3 * time.Second))
+			var ev runEvent
+			if err := ws.ReadJSON(&ev); err != nil {
+				t.Fatal(err)
+			}
+			if ev.MessageID != msgID {
+				continue
+			}
+			if ev.Type == "error" {
+				t.Fatalf("unexpected error for %s: %+v", msgID, ev)
+			}
+			if ev.Type == "done" {
+				return
+			}
+		}
+	}
+	nextCall := func() capturedProviderCall {
+		t.Helper()
+		select {
+		case c := <-captured:
+			return c
+		case <-time.After(3 * time.Second):
+			t.Fatal("missing provider call")
+			return capturedProviderCall{}
+		}
+	}
+
+	// 1. First turn on provider A (codex).
+	sendAndWaitDone(aliceWS, "m1", "codex", "gpt-5", "Запомни секретное число 42.")
+	c1 := nextCall()
+	if c1.provider != "codex" || c1.req.SessionID != "" || c1.req.Prompt != "Запомни секретное число 42." {
+		t.Fatalf("turn 1 call: %+v", c1)
+	}
+	sess1, prov1, sessProv1, _, err := db.ChatRunSessionState(ctx, chat.ID)
+	if err != nil || prov1 != "codex" || sessProv1 != "codex" || sess1 != "codex-sess-1" {
+		t.Fatalf("post turn 1 state: (%q, %q, %q, %v)", sess1, prov1, sessProv1, err)
+	}
+
+	// 2. Switch to provider B (claude) in the same chat: no codex session ID, SQLite history handoff included.
+	sendAndWaitDone(aliceWS, "m2", "claude", "sonnet", "Какое число я назвал?")
+	c2 := nextCall()
+	if c2.provider != "claude" || c2.req.SessionID != "" {
+		t.Fatalf("turn 2 must not reuse codex session: %+v", c2)
+	}
+	if !strings.Contains(c2.req.Prompt, "Пользователь: Запомни секретное число 42.") ||
+		!strings.Contains(c2.req.Prompt, "Ассистент: Ответ от codex #1") ||
+		!strings.Contains(c2.req.Prompt, "Какое число я назвал?") ||
+		strings.Count(c2.req.Prompt, "Какое число я назвал?") != 1 {
+		t.Fatalf("turn 2 handoff prompt invalid: %q", c2.req.Prompt)
+	}
+	sess2, prov2, sessProv2, _, err := db.ChatRunSessionState(ctx, chat.ID)
+	if err != nil || prov2 != "claude" || sessProv2 != "claude" || sess2 != "claude-sess-1" {
+		t.Fatalf("post turn 2 state: (%q, %q, %q, %v)", sess2, prov2, sessProv2, err)
+	}
+
+	// 3. Follow-up turn on B (claude): resumes claude-sess-1 WITHOUT repeating handoff.
+	sendAndWaitDone(aliceWS, "m3", "claude", "opus", "Уточни подробнее")
+	c3 := nextCall()
+	if c3.provider != "claude" || c3.req.SessionID != "claude-sess-1" || c3.req.Prompt != "Уточни подробнее" {
+		t.Fatalf("turn 3 should resume B cleanly without handoff: %+v", c3)
+	}
+	if sess3, _, sessProv3, _, err := db.ChatRunSessionState(ctx, chat.ID); err != nil || sess3 != "claude-sess-2" || sessProv3 != "claude" {
+		t.Fatalf("post turn 3 state: (%q, %q, %v)", sess3, sessProv3, err)
+	}
+
+	// 4. Switch back from B to A (codex): fresh codex session with updated history including claude replies.
+	sendAndWaitDone(aliceWS, "m4", "codex", "gpt-5", "Подведи итог")
+	c4 := nextCall()
+	if c4.provider != "codex" || c4.req.SessionID != "" {
+		t.Fatalf("turn 4 back to A must start fresh session: %+v", c4)
+	}
+	if !strings.Contains(c4.req.Prompt, "Пользователь: Какое число я назвал?") ||
+		!strings.Contains(c4.req.Prompt, "Ассистент: Ответ от claude #1") ||
+		!strings.Contains(c4.req.Prompt, "Ассистент: Ответ от claude #2") ||
+		!strings.Contains(c4.req.Prompt, "Подведи итог") {
+		t.Fatalf("turn 4 handoff missing B replies: %q", c4.req.Prompt)
+	}
+	if sess4, prov4, sessProv4, _, err := db.ChatRunSessionState(ctx, chat.ID); err != nil || prov4 != "codex" || sessProv4 != "codex" || sess4 != "codex-sess-2" {
+		t.Fatalf("post turn 4 state: (%q, %q, %q, %v)", sess4, prov4, sessProv4, err)
+	}
+
+	// 5. Attempt to switch existing chat to paid_api (or disabled antigravity) fails cleanly without mutating state.
+	for _, bad := range []string{"paid_api", "antigravity"} {
+		badID := "bad-" + bad
+		if err := aliceWS.WriteJSON(map[string]any{
+			"chatId": chat.ID, "messageId": badID, "provider": bad, "prompt": "Test",
+			"model": map[string]string{"provider": bad, "id": "default"}, "target": map[string]string{"mode": "chat"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_ = aliceWS.SetReadDeadline(time.Now().Add(3 * time.Second))
+		var ev runEvent
+		if err := aliceWS.ReadJSON(&ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev.Type != "error" || ev.Code != "provider_unavailable" {
+			t.Fatalf("expected provider_unavailable for %s, got %+v", bad, ev)
+		}
+	}
+	if sess, prov, sessProv, _, err := db.ChatRunSessionState(ctx, chat.ID); err != nil || prov != "codex" || sessProv != "codex" || sess != "codex-sess-2" {
+		t.Fatalf("failed switch mutated state: (%q, %q, %q, %v)", sess, prov, sessProv, err)
+	}
+
+	// 6. Shared chat handoff preserves isolation (never includes private profile_md / memory_md).
+	if err := db.SetChatShare(ctx, aliceID, chat.ID, bobID, "write"); err != nil {
+		t.Fatal(err)
+	}
+	sendAndWaitDone(bobWS, "m5", "claude", "sonnet", "Вопрос участника")
+	c5 := nextCall()
+	if c5.provider != "claude" || c5.req.SessionID != "" {
+		t.Fatalf("shared handoff call: %+v", c5)
+	}
+	if strings.Contains(c5.req.SystemInstructions, bobProfile) || strings.Contains(c5.req.SystemInstructions, bobMemory) ||
+		strings.Contains(c5.req.SystemInstructions, aliceProfile) || strings.Contains(c5.req.SystemInstructions, aliceMemory) {
+		t.Fatalf("shared chat leaked private profile/memory: %q", c5.req.SystemInstructions)
+	}
+	if !strings.Contains(c5.req.Prompt, "Ассистент: Ответ от codex #2") {
+		t.Fatalf("shared handoff missing history: %q", c5.req.Prompt)
+	}
+}
+
+func TestBuildHandoffPromptTruncationValidUTF8(t *testing.T) {
+	oldMsg := store.Message{Role: "user", Content: "СТАРОЕ_СООБЩЕНИЕ_" + strings.Repeat("ж", 1000)}
+	midMsg := store.Message{Role: "assistant", Content: strings.Repeat("Привет мир 🚀 ", 1200)}
+	recentUser := store.Message{Role: "user", Content: "Свежий вопрос про тест"}
+	recentBot := store.Message{Role: "assistant", Content: "Свежий ответ с деталями"}
+
+	out := buildHandoffPrompt([]store.Message{oldMsg, midMsg, recentUser, recentBot}, "Текущий промпт")
+	if !utf8.ValidString(out) {
+		t.Fatal("handoff output is not valid UTF-8")
+	}
+	if !strings.Contains(out, "[Более ранние сообщения чата были сокращены из-за ограничения размера.]") {
+		t.Fatalf("missing truncation notice in: %q", out[:min(len(out), 300)])
+	}
+	if strings.Contains(out, "СТАРОЕ_СООБЩЕНИЕ_") {
+		t.Fatal("expected oldest message to be dropped")
+	}
+	if !strings.Contains(out, "Свежий вопрос про тест") || !strings.Contains(out, "Свежий ответ с деталями") || !strings.Contains(out, "Текущий промпт") {
+		t.Fatal("missing recent messages or current prompt")
+	}
+	if len(out) > handoffTranscriptBudget+1024 {
+		t.Fatalf("handoff exceeded budget: %d", len(out))
 	}
 }

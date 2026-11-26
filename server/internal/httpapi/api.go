@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"agent-console/server/internal/config"
@@ -24,13 +23,16 @@ import (
 )
 
 type API struct {
-	db      *store.Store
-	config  config.Config
-	logger  *slog.Logger
-	live    *liveRuns
-	catalog modelCatalog
-	index   indexedHistory
-	logins  loginLimiter
+	defaultProvider string
+	memoryProvider  string
+	db              *store.Store
+	config          config.Config
+	logger          *slog.Logger
+	live            *liveRuns
+	catalog         modelCatalog
+	index           indexedHistory
+	logins          *rateLimiter
+	uploads         *rateLimiter
 }
 
 type session struct {
@@ -39,30 +41,64 @@ type session struct {
 }
 
 func New(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.Logger) (http.Handler, error) {
-	switch cfg.Provider {
-	case "stub", "codex", "antigravity":
-	case "claude", "paid_api":
-		return nil, fmt.Errorf("provider %q is not implemented yet", cfg.Provider)
-	default:
-		return nil, fmt.Errorf("unsupported provider %q", cfg.Provider)
+	defaultID := cfg.DefaultProvider
+	if defaultID == "" {
+		defaultID = cfg.Provider
 	}
-	var backend provider.Provider
-	if cfg.RunnerURL != "" {
-		remote, err := provider.NewRemoteRunnerProvider(cfg.RunnerURL, cfg.RunnerSharedSecret)
-		if err != nil {
-			return nil, fmt.Errorf("configure runner: %w", err)
+	enabled := cfg.EnabledProviders
+	if len(enabled) == 0 {
+		enabled = []string{defaultID}
+	}
+	registry := make(map[string]provider.Provider, len(enabled))
+	var remote *provider.RemoteRunnerProvider
+	for _, id := range enabled {
+		if id == "paid_api" {
+			return nil, fmt.Errorf("provider %q is not implemented yet", id)
 		}
-		backend = remote
-	} else if cfg.Provider == "stub" {
-		backend = provider.StubProvider{Delay: 100 * time.Millisecond}
-	} else {
-		return nil, errors.New("RUNNER_URL is required for CLI providers")
+		if !config.IsCanonicalProvider(id) {
+			return nil, fmt.Errorf("unsupported provider %q", id)
+		}
+		if cfg.RunnerURL != "" {
+			if remote == nil {
+				var err error
+				remote, err = provider.NewRemoteRunnerProvider(cfg.RunnerURL, cfg.RunnerSharedSecret)
+				if err != nil {
+					return nil, fmt.Errorf("configure runner: %w", err)
+				}
+			}
+			registry[id] = remote.ForProvider(id)
+		} else if id == "stub" {
+			registry[id] = provider.StubProvider{Delay: 100 * time.Millisecond}
+		} else {
+			return nil, errors.New("RUNNER_URL is required for CLI providers")
+		}
 	}
-	return newHandler(ctx, db, cfg, logger, backend), nil
+	if registry[defaultID] == nil || (cfg.MemoryProvider != "" && registry[cfg.MemoryProvider] == nil) {
+		return nil, errors.New("default and memory providers must be enabled")
+	}
+	cfg.DefaultProvider = defaultID
+	return newRegistryHandler(ctx, db, cfg, logger, registry), nil
 }
 
 func newHandler(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.Logger, backend provider.Provider) http.Handler {
-	api := &API{db: db, config: cfg, logger: logger, live: newLiveRuns(ctx, backend, max(1, cfg.MaxConcurrentStreams))}
+	if cfg.DefaultProvider == "" {
+		cfg.DefaultProvider = cfg.Provider
+		if cfg.DefaultProvider == "" {
+			cfg.DefaultProvider = "stub"
+		}
+	}
+	return newRegistryHandler(ctx, db, cfg, logger, map[string]provider.Provider{cfg.DefaultProvider: backend})
+}
+
+func newRegistryHandler(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.Logger, registry map[string]provider.Provider) http.Handler {
+	memoryID := cfg.MemoryProvider
+	if memoryID == "" {
+		memoryID = cfg.DefaultProvider
+	}
+	api := &API{db: db, config: cfg, logger: logger, defaultProvider: cfg.DefaultProvider, memoryProvider: memoryID,
+		live:    newLiveRunsWithProviders(ctx, cfg.DefaultProvider, registry, max(1, cfg.MaxConcurrentStreams)),
+		logins:  newRateLimiter(),
+		uploads: newRateLimiter()}
 	api.live.db = db
 	api.live.logger = logger
 	if db != nil && cfg.MemoryAutoUpdate && cfg.MemoryCheckInterval > 0 {
@@ -72,6 +108,7 @@ func newHandler(ctx context.Context, db *store.Store, cfg config.Config, logger 
 	mux.HandleFunc("GET /api/health", api.health)
 	mux.HandleFunc("POST /api/auth/login", api.login)
 	mux.HandleFunc("POST /api/auth/register", api.register)
+	mux.HandleFunc("POST /api/auth/telegram/verify", api.verifyTelegramInitData)
 	mux.HandleFunc("GET /api/auth/me", api.withPendingAuth(api.me))
 	mux.HandleFunc("POST /api/auth/logout", api.withPendingAuth(api.logout))
 	mux.HandleFunc("GET /api/devices", api.withPendingAuth(api.devices))
@@ -89,6 +126,7 @@ func newHandler(ctx context.Context, db *store.Store, cfg config.Config, logger 
 	mux.HandleFunc("GET /api/profile", api.withAuth(api.getProfile))
 	mux.HandleFunc("PATCH /api/profile", api.withAuth(api.patchProfile))
 	mux.HandleFunc("GET /api/models", api.withAuth(api.models))
+	mux.HandleFunc("GET /api/providers", api.withAuth(api.providers))
 	mux.HandleFunc("GET /api/users", api.withAuth(api.directoryUsers))
 	mux.HandleFunc("GET /api/chats", api.withAuth(api.chats))
 	mux.HandleFunc("POST /api/chats", api.withAuth(api.createChat))
@@ -102,6 +140,7 @@ func newHandler(ctx context.Context, db *store.Store, cfg config.Config, logger 
 
 func (a *API) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Add("Vary", "Origin")
 		if origin := r.Header.Get("Origin"); origin != "" {
@@ -137,41 +176,8 @@ func (a *API) allowsOrigin(origin string) bool {
 	return false
 }
 
-type loginLimiter struct {
-	mu          sync.Mutex
-	attempts    map[string][]time.Time
-	nextCleanup time.Time
-}
-
-func (l *loginLimiter) allow(key string, limit int) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := time.Now()
-	cutoff := now.Add(-time.Minute)
-	if l.attempts == nil {
-		l.attempts = make(map[string][]time.Time)
-	}
-	if !now.Before(l.nextCleanup) {
-		for key, times := range l.attempts {
-			if !times[len(times)-1].After(cutoff) {
-				delete(l.attempts, key)
-			}
-		}
-		l.nextCleanup = now.Add(time.Minute)
-	}
-	times := l.attempts[key]
-	for len(times) > 0 && !times[0].After(cutoff) {
-		times = times[1:]
-	}
-	if len(times) >= limit {
-		return false
-	}
-	l.attempts[key] = append(times, now)
-	return true
-}
-
 func (a *API) health(w http.ResponseWriter, _ *http.Request) {
-	reply(w, http.StatusOK, map[string]string{"status": "ok", "provider": a.config.Provider})
+	reply(w, http.StatusOK, map[string]string{"status": "ok", "provider": a.defaultProvider})
 }
 
 var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("dummy login hash"), bcrypt.DefaultCost)
@@ -473,10 +479,26 @@ func (a *API) chats(w http.ResponseWriter, r *http.Request, s session) {
 	reply(w, http.StatusOK, chats)
 }
 
+func (a *API) providers(w http.ResponseWriter, _ *http.Request, _ session) {
+	type entry struct {
+		ID        string `json:"id"`
+		Available bool   `json:"available"`
+	}
+	items := make([]entry, 0, 5)
+	for _, id := range []string{"antigravity", "codex", "claude", "paid_api"} {
+		items = append(items, entry{id, a.live.hasProvider(id)})
+	}
+	if a.live.hasProvider("stub") {
+		items = append(items, entry{"stub", true})
+	}
+	reply(w, http.StatusOK, map[string]any{"defaultProvider": a.defaultProvider, "providers": items})
+}
+
 func (a *API) createChat(w http.ResponseWriter, r *http.Request, s session) {
 	var req struct {
-		Title string `json:"title"`
-		Model string `json:"model"`
+		Title    string `json:"title"`
+		Model    string `json:"model"`
+		Provider string `json:"provider"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -493,7 +515,15 @@ func (a *API) createChat(w http.ResponseWriter, r *http.Request, s session) {
 		fail(w, http.StatusBadRequest, "invalid_chat", "Invalid chat title or model.")
 		return
 	}
-	c, err := a.db.CreateChat(r.Context(), s.User.ID, req.Title, a.config.Provider, req.Model)
+	providerID := strings.ToLower(strings.TrimSpace(req.Provider))
+	if providerID == "" {
+		providerID = a.defaultProvider
+	}
+	if !a.live.hasProvider(providerID) {
+		fail(w, http.StatusUnprocessableEntity, "provider_unavailable", "Requested provider is not available.")
+		return
+	}
+	c, err := a.db.CreateChat(r.Context(), s.User.ID, req.Title, providerID, req.Model)
 	if err != nil {
 		a.internal(w, r, err)
 		return

@@ -1,4 +1,14 @@
 :80 {
+	request_body {
+		max_size 5MB
+	}
+
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https: wss: http: ws:; object-src 'none'; base-uri 'self'; form-action 'self'"
+	}
+
 	handle /api/* {
 		reverse_proxy core:8080
 	}

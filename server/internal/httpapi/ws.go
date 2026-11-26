@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"agent-console/server/internal/provider"
 	"agent-console/server/internal/store"
@@ -26,6 +27,7 @@ type runRequest struct {
 	MessageID string `json:"messageId"`
 	Prompt    string `json:"prompt"`
 	Reasoning string `json:"reasoning,omitempty"`
+	Provider  string `json:"provider,omitempty"`
 	Model     struct {
 		Provider string `json:"provider"`
 		ID       string `json:"id"`
@@ -62,7 +64,8 @@ var modelID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$`)
 
 type liveRuns struct {
 	ctx               context.Context
-	backend           provider.Provider
+	defaultProvider   string
+	providers         map[string]provider.Provider
 	db                *store.Store
 	logger            *slog.Logger
 	mu                sync.Mutex
@@ -91,11 +94,35 @@ type socket struct {
 }
 
 func newLiveRuns(ctx context.Context, backend provider.Provider, concurrency int) *liveRuns {
+	return newLiveRunsWithProviders(ctx, "stub", map[string]provider.Provider{"stub": backend}, concurrency)
+}
+
+func newLiveRunsWithProviders(ctx context.Context, defaultProvider string, providers map[string]provider.Provider, concurrency int) *liveRuns {
+	copied := make(map[string]provider.Provider, len(providers))
+	for k, v := range providers {
+		if v != nil {
+			copied[k] = v
+		}
+	}
 	return &liveRuns{
-		ctx: ctx, backend: backend, clients: make(map[string]map[*socket]bool),
-		chats: make(map[string]activeRun), slots: make(chan struct{}, concurrency),
+		ctx: ctx, defaultProvider: defaultProvider, providers: copied,
+		clients: make(map[string]map[*socket]bool),
+		chats:   make(map[string]activeRun), slots: make(chan struct{}, concurrency),
 		tickets: make(map[string]wsTicket),
 	}
+}
+
+func (r *liveRuns) provider(id string) (provider.Provider, bool) {
+	if r == nil {
+		return nil, false
+	}
+	p, ok := r.providers[id]
+	return p, ok && p != nil
+}
+
+func (r *liveRuns) hasProvider(id string) bool {
+	_, ok := r.provider(id)
+	return ok
 }
 
 func (a *API) issueWSTicket(w http.ResponseWriter, r *http.Request, s session) {
@@ -358,23 +385,8 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 			return
 		}
 	}
-	// The stub accepts any model family supported by the client protocol.
-	switch req.Model.Provider {
-	case "antigravity", "codex", "claude", "paid_api":
-	default:
-		reject("unsupported_model", "Unknown model provider.", false)
-		return
-	}
-	if a.config.Provider == "codex" && req.Model.Provider != "codex" {
-		reject("unsupported_model", "Select a Codex model for this server.", false)
-		return
-	}
-	if a.config.Provider == "antigravity" && req.Model.Provider != "antigravity" {
-		reject("unsupported_model", "Select an Antigravity model for this server.", false)
-		return
-	}
-	// Resolve the workspace and check write access before revealing whether the chat is busy.
-	ownerID, err := a.db.ChatOwner(a.live.ctx, userID, req.ChatID)
+	// Resolve the workspace and check write access before provider routing or revealing busy state.
+	ownerID, chatProvider, err := a.db.ChatDispatchInfo(a.live.ctx, userID, req.ChatID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			reject("chat_not_found", "Chat not found.", false)
@@ -382,6 +394,38 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 			reject("storage_error", "Could not open the chat.", true)
 		}
 		return
+	}
+	reqProvider := strings.ToLower(strings.TrimSpace(req.Provider))
+	modelProvider := strings.ToLower(strings.TrimSpace(req.Model.Provider))
+	if reqProvider == "paid_api" || modelProvider == "paid_api" {
+		reject("provider_unavailable", "Paid API provider is not available.", false)
+		return
+	}
+	targetProvider := chatProvider
+	if reqProvider != "" {
+		targetProvider = reqProvider
+	}
+	switch targetProvider {
+	case "antigravity", "codex", "claude", "stub":
+	default:
+		reject("unsupported_model", "Unknown model provider.", false)
+		return
+	}
+	if !a.live.hasProvider(targetProvider) {
+		reject("provider_unavailable", "The selected provider is not available.", false)
+		return
+	}
+	if modelProvider != "" {
+		switch modelProvider {
+		case "antigravity", "codex", "claude", "stub":
+		default:
+			reject("unsupported_model", "Unknown model provider.", false)
+			return
+		}
+		if modelProvider != targetProvider && !(targetProvider == "stub" && modelProvider == "codex") {
+			reject("provider_mismatch", "Selected model provider does not match this chat's provider.", false)
+			return
+		}
 	}
 	ctx, cancel := context.WithCancel(a.live.ctx)
 	release, code := a.live.acquire(userID, req.ChatID, client, cancel)
@@ -393,7 +437,7 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 		reject(code, "Another response is running. Try again later.", true)
 		return
 	}
-	if err := a.startRun(ctx, cancel, userID, client.deviceID, ownerID, req, release); err != nil {
+	if err := a.startRun(ctx, cancel, userID, client.deviceID, ownerID, targetProvider, req, release); err != nil {
 		cancel()
 		release(nil)
 		var denied store.RunDenied
@@ -402,6 +446,10 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 			reject(string(denied), runDeniedMessages[denied], false)
 		case errors.Is(err, sql.ErrNoRows):
 			reject("chat_not_found", "Chat not found.", false)
+		case errors.Is(err, store.ErrProviderUnavailable):
+			reject("provider_unavailable", "The selected provider is not available.", false)
+		case errors.Is(err, store.ErrProviderMismatch):
+			reject("provider_mismatch", "Selected model provider does not match this chat's provider.", false)
 		case errors.Is(err, store.ErrDuplicateRun):
 			reject("duplicate_run", "This message ID has already been used.", false)
 		default:
@@ -420,8 +468,8 @@ var runDeniedMessages = map[store.RunDenied]string{
 	"five_hour_limit_reached": "Достигнут лимит расхода за 5 часов.",
 }
 
-func (a *API) startRun(ctx context.Context, cancel context.CancelFunc, userID, deviceID, ownerID string, req runRequest, release func(*runEvent)) error {
-	_, err := a.db.BeginRunForDevice(ctx, userID, deviceID, req.ChatID, req.MessageID, req.Prompt, a.config.Provider, req.Model.ID)
+func (a *API) startRun(ctx context.Context, cancel context.CancelFunc, userID, deviceID, ownerID, targetProvider string, req runRequest, release func(*runEvent)) error {
+	_, err := a.db.BeginRunForDevice(ctx, userID, deviceID, req.ChatID, req.MessageID, req.Prompt, targetProvider, req.Model.ID)
 	if err != nil {
 		return err
 	}
@@ -431,13 +479,17 @@ func (a *API) startRun(ctx context.Context, cancel context.CancelFunc, userID, d
 	})
 	go func() {
 		defer cancel()
-		terminal := a.streamRun(ctx, userID, ownerID, req)
+		terminal := a.streamRunForProvider(ctx, userID, ownerID, targetProvider, req)
 		release(&terminal)
 	}()
 	return nil
 }
 
 func (a *API) streamRun(ctx context.Context, userID, ownerID string, req runRequest) runEvent {
+	return a.streamRunForProvider(ctx, userID, ownerID, strings.ToLower(strings.TrimSpace(req.Provider)), req)
+}
+
+func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetProvider string, req runRequest) runEvent {
 	seq := 1
 	failure := func(code, message string, err error) runEvent {
 		a.logger.Error("stream response", "chatId", req.ChatID, "code", code, "error", err)
@@ -466,9 +518,12 @@ func (a *API) streamRun(ctx context.Context, userID, ownerID string, req runRequ
 	}
 	runCtx, runCancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer runCancel()
-	sessionID, shared, err := a.db.ChatRunContext(runCtx, req.ChatID)
+	sessionID, chatProvider, sessionProvider, shared, err := a.db.ChatRunSessionState(runCtx, req.ChatID)
 	if err != nil {
 		return failure("storage_error", "Could not open the chat.", err)
+	}
+	if targetProvider == "" {
+		targetProvider = chatProvider
 	}
 	// A queued collaborator can lose access before a slot opens. Never
 	// apply their private profile to somebody else's chat.
@@ -483,12 +538,27 @@ func (a *API) streamRun(ctx context.Context, userID, ownerID string, req runRequ
 			return failure("storage_error", "Could not open the chat.", err)
 		}
 	}
+	backend, ok := a.live.provider(targetProvider)
+	if !ok {
+		return req.failure(seq+1, "provider_unavailable", "The provider for this chat is not available.", false)
+	}
+	resumeSessionID := ""
+	prompt := req.Prompt
+	if targetProvider == sessionProvider {
+		resumeSessionID = sessionID
+	} else {
+		prior, err := a.db.ChatPriorMessages(runCtx, req.ChatID, req.MessageID)
+		if err != nil {
+			return failure("storage_error", "Could not load chat history.", err)
+		}
+		prompt = buildHandoffPrompt(prior, req.Prompt)
+	}
 	instructions, err := a.userInstructions(runCtx, userID, shared)
 	if err != nil {
 		return failure("storage_error", "Could not load your profile.", err)
 	}
 	started := time.Now()
-	events, err := a.live.backend.Stream(runCtx, provider.Request{UserID: ownerID, Model: req.Model.ID, Reasoning: req.Reasoning, Prompt: req.Prompt, SessionID: sessionID, SystemInstructions: instructions})
+	events, err := backend.Stream(runCtx, provider.Request{UserID: ownerID, Model: req.Model.ID, Reasoning: req.Reasoning, Prompt: prompt, SessionID: resumeSessionID, SystemInstructions: instructions})
 	if err != nil {
 		return failure("provider_error", "Could not start the provider.", err)
 	}
@@ -521,7 +591,7 @@ func (a *API) streamRun(ctx context.Context, userID, ownerID string, req runRequ
 				wire.Delta = event.Delta
 			case provider.Done:
 				durationMs := time.Since(started).Milliseconds()
-				if err := a.finishStream(runCtx, userID, req, text.String(), thinking.String(), event, durationMs, shared); err != nil {
+				if err := a.finishStream(runCtx, userID, targetProvider, req, text.String(), thinking.String(), event, durationMs, shared); err != nil {
 					return failure("storage_error", "Could not save the response.", err)
 				}
 				wire.Reason = "completed"
@@ -540,7 +610,7 @@ func (a *API) streamRun(ctx context.Context, userID, ownerID string, req runRequ
 	}
 }
 
-func (a *API) finishStream(ctx context.Context, userID string, req runRequest, text, thinking string, event provider.Event, durationMs int64, shared bool) error {
+func (a *API) finishStream(ctx context.Context, userID, targetProvider string, req runRequest, text, thinking string, event provider.Event, durationMs int64, shared bool) error {
 	// Access revocation can make a running shared chat private. Do not
 	// restore a session that the sharing transition already invalidated.
 	a.live.mu.Lock()
@@ -552,7 +622,101 @@ func (a *API) finishStream(ctx context.Context, userID string, req runRequest, t
 	if shared != currentlyShared {
 		event.SessionID = ""
 	}
-	return a.db.FinishRun(ctx, userID, req.ChatID, req.MessageID, text, thinking, event.SessionID, durationMs, event.Usage)
+	return a.db.FinishRunWithProvider(ctx, userID, req.ChatID, req.MessageID, targetProvider, req.Model.ID, text, thinking, event.SessionID, durationMs, event.Usage)
+}
+
+const handoffTranscriptBudget = 24 << 10
+
+func tailValidUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	start := len(s) - maxBytes
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
+}
+
+func buildHandoffPrompt(messages []store.Message, currentPrompt string) string {
+	const truncationNotice = "[Более ранние сообщения чата были сокращены из-за ограничения размера.]\n\n"
+	type entry struct {
+		prefix  string
+		content string
+	}
+	entries := make([]entry, 0, len(messages))
+	for _, m := range messages {
+		content := strings.TrimSpace(strings.ToValidUTF8(m.Content, ""))
+		if content == "" {
+			continue
+		}
+		var label string
+		switch m.Role {
+		case "user":
+			label = "Пользователь"
+		case "assistant":
+			label = "Ассистент"
+		default:
+			continue
+		}
+		entries = append(entries, entry{prefix: label + ": ", content: content})
+	}
+	if len(entries) == 0 {
+		return currentPrompt
+	}
+
+	parts := make([]string, 0, len(entries))
+	used := 0
+	truncated := false
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		part := e.prefix + e.content + "\n\n"
+		if used+len(part) <= handoffTranscriptBudget {
+			parts = append(parts, part)
+			used += len(part)
+			continue
+		}
+		truncated = true
+		if len(parts) == 0 {
+			avail := handoffTranscriptBudget - len(truncationNotice) - len(e.prefix) - 2
+			clipped := tailValidUTF8(e.content, avail)
+			if clipped != "" {
+				parts = append(parts, e.prefix+clipped+"\n\n")
+				used += len(e.prefix) + len(clipped) + 2
+			}
+		}
+		break
+	}
+	if truncated {
+		for used+len(truncationNotice) > handoffTranscriptBudget && len(parts) > 1 {
+			used -= len(parts[len(parts)-1])
+			parts = parts[:len(parts)-1]
+		}
+		if used+len(truncationNotice) > handoffTranscriptBudget && len(parts) == 1 {
+			last := parts[0]
+			if idx := strings.Index(last, ": "); idx >= 0 {
+				prefix := last[:idx+2]
+				body := strings.TrimSuffix(last[idx+2:], "\n\n")
+				avail := handoffTranscriptBudget - len(truncationNotice) - len(prefix) - 2
+				parts[0] = prefix + tailValidUTF8(body, avail) + "\n\n"
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("Ниже история предыдущей переписки в этом чате. Продолжи диалог с учётом этого контекста, не повторяй эту инструкцию и не комментируй переключение провайдера.\n\n")
+	if truncated {
+		b.WriteString(truncationNotice)
+	}
+	for i := len(parts) - 1; i >= 0; i-- {
+		b.WriteString(parts[i])
+	}
+	b.WriteString("Новый запрос пользователя:\n")
+	b.WriteString(currentPrompt)
+	return b.String()
 }
 
 func (req runRequest) failure(seq int, code, message string, retryable bool) runEvent {

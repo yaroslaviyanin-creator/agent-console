@@ -435,7 +435,7 @@ func TestNewRejectsUnimplementedProviders(t *testing.T) {
 	if _, err := New(t.Context(), nil, config.Config{Provider: "stub", CORSOrigin: "*"}, logger); err != nil {
 		t.Fatalf("local stub: %v", err)
 	}
-	for _, cli := range []string{"codex", "antigravity"} {
+	for _, cli := range []string{"codex", "antigravity", "claude"} {
 		cfg := config.Config{Provider: cli, CORSOrigin: "*"}
 		if _, err := New(t.Context(), nil, cfg, logger); err == nil || !strings.Contains(err.Error(), "RUNNER_URL") {
 			t.Fatalf("expected %s to require an isolated runner, got: %v", cli, err)
@@ -446,10 +446,8 @@ func TestNewRejectsUnimplementedProviders(t *testing.T) {
 			t.Fatalf("remote %s: %v", cli, err)
 		}
 	}
-	for _, bad := range []string{"claude", "paid_api"} {
-		if _, err := New(t.Context(), nil, config.Config{Provider: bad, CORSOrigin: "*"}, logger); err == nil || !strings.Contains(err.Error(), "not implemented") {
-			t.Fatalf("New(%q) expected not implemented error, got: %v", bad, err)
-		}
+	if _, err := New(t.Context(), nil, config.Config{Provider: "paid_api", CORSOrigin: "*"}, logger); err == nil || !strings.Contains(err.Error(), "not implemented") {
+		t.Fatalf("New(\"paid_api\") expected not implemented error, got: %v", err)
 	}
 	for _, unsupported := range []string{"", "unknown"} {
 		if _, err := New(t.Context(), nil, config.Config{Provider: unsupported, CORSOrigin: "*"}, logger); err == nil {

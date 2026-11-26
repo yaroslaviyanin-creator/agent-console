@@ -1,6 +1,6 @@
 import { Check, ChevronLeft, ChevronRight, Laptop, RefreshCw, RotateCcw, Sparkles, Terminal, Zap } from 'lucide-react'
 import { useState } from 'react'
-import type { Device } from '../protocol/types'
+import type { Device, ServerProvider } from '../protocol/types'
 import { refreshServerModels, useChats } from './chatStore'
 import { defaultReasoningForProvider, groupServerModels, pickVariantForGroup } from './modelCatalog'
 import type { ProviderOption } from './ProviderSelect'
@@ -84,6 +84,8 @@ export function ModelPopover({
   reasoning,
   unavailableModel,
   disabled,
+  canChangeProvider = true,
+  providerDisabled = false,
   demoModelGroups,
   activeDemoGroup,
   hasDemoVariantReasoning,
@@ -99,6 +101,8 @@ export function ModelPopover({
   reasoning?: string | undefined
   unavailableModel: boolean
   disabled: boolean
+  canChangeProvider?: boolean
+  providerDisabled?: boolean
   demoModelGroups: readonly DemoModelGroup[]
   activeDemoGroup: DemoModelGroup | undefined
   hasDemoVariantReasoning: boolean
@@ -108,7 +112,10 @@ export function ModelPopover({
   onSelectReasoning: (reasoning: string) => void
 }) {
   const [subview, setSubview] = useState<'main' | 'provider' | 'model'>('main')
-  const { remote, serverModels, modelsLoading, modelsError } = useChats()
+  const serverProvider = provider as ServerProvider
+  const serverModels = useChats(s => s.serverModelsByProvider[serverProvider]) ?? []
+  const modelsLoading = useChats(s => Boolean(s.modelsLoadingByProvider[serverProvider]))
+  const modelsError = useChats(s => s.modelsErrorByProvider[serverProvider] ?? '')
 
   const groups = remoteMode ? groupServerModels(serverModels) : []
   const activeGroup = remoteMode && model !== 'default'
@@ -116,10 +123,10 @@ export function ModelPopover({
     : undefined
   const currentVariant = activeGroup?.variants.find(v => v.id === model)
   const currentServerModel = remoteMode ? serverModels.find(m => m.id === model) : undefined
-  const nonVariantEfforts = remoteMode && activeGroup && !activeGroup.hasVariantReasoning && remote
-    ? defaultReasoningForProvider(remote.provider, currentServerModel)
-    : remoteMode && model === 'default' && remote?.provider === 'codex'
-      ? defaultReasoningForProvider('codex')
+  const nonVariantEfforts = remoteMode && activeGroup && !activeGroup.hasVariantReasoning
+    ? defaultReasoningForProvider(serverProvider, currentServerModel)
+    : remoteMode && model === 'default' && (serverProvider === 'codex' || serverProvider === 'claude')
+      ? defaultReasoningForProvider(serverProvider)
       : []
 
   const reasoningSteps: ReasoningStep[] = remoteMode
@@ -171,12 +178,12 @@ export function ModelPopover({
           <div className="popover-codex-head">
             <span className="popover-head-icon" aria-hidden="true"><Zap size={14} /></span>
             <span className="popover-reasoning-title">{activeReasoningLabel}</span>
-            {remoteMode && (remote?.provider === 'codex' || remote?.provider === 'antigravity') ? (
+            {remoteMode && serverProvider !== 'stub' && !providerDisabled ? (
               <button
                 type="button"
                 className="popover-head-action"
                 disabled={modelsLoading}
-                onClick={() => void refreshServerModels()}
+                onClick={() => void refreshServerModels(serverProvider)}
                 aria-label="Обновить список моделей"
                 title="Обновить список моделей"
               >
@@ -200,17 +207,17 @@ export function ModelPopover({
             <button
               type="button"
               className="popover-nav-row"
-              disabled={disabled || providerOptions.filter(p => p.available).length <= 1}
+              disabled={disabled || !canChangeProvider || !providerOptions.some(p => p.available && p.id !== provider)}
               onClick={() => setSubview('provider')}
             >
               <span className="popover-nav-kicker">Провайдер</span>
-              <span className="popover-nav-val">{providerLabel}</span>
+              <span className={`popover-nav-val${providerDisabled ? ' is-muted' : ''}`}>{providerLabel}</span>
               <ChevronRight size={14} className="popover-nav-chevron" />
             </button>
             <button
               type="button"
               className="popover-nav-row"
-              disabled={disabled}
+              disabled={disabled || providerDisabled}
               onClick={() => setSubview('model')}
             >
               <span className="popover-nav-kicker">Модель</span>
@@ -219,9 +226,13 @@ export function ModelPopover({
             </button>
           </div>
 
-          {(modelsLoading || modelsError || unavailableModel) && (
+          {(providerDisabled || modelsLoading || modelsError || unavailableModel) && (
             <p className="popover-status-note" role="status">
-              {modelsLoading ? 'Загружаю модели…' : modelsError || 'Выберите доступную модель.'}
+              {providerDisabled
+                ? 'Провайдер недоступен на сервере.'
+                : modelsLoading
+                  ? 'Загружаю модели…'
+                  : modelsError || 'Выберите доступную модель.'}
             </p>
           )}
 
@@ -229,7 +240,7 @@ export function ModelPopover({
             <SteppedSlider
               steps={reasoningSteps}
               value={reasoningValue}
-              disabled={disabled || unavailableModel}
+              disabled={disabled || providerDisabled || unavailableModel}
               onChange={handleReasoningChange}
             />
           ) : (
@@ -251,7 +262,7 @@ export function ModelPopover({
                 type="button"
                 role="option"
                 aria-selected={opt.id === provider}
-                disabled={disabled || !opt.available}
+                disabled={disabled || !canChangeProvider || !opt.available}
                 className={`popover-list-item${opt.id === provider ? ' is-active' : ''}`}
                 onClick={() => {
                   if (opt.id !== provider) onSelectProvider(opt.id)

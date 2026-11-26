@@ -24,9 +24,10 @@ const (
 
 // RemoteRunnerProvider calls an isolated remote runner over authenticated HTTP.
 type RemoteRunnerProvider struct {
-	baseURL *url.URL
-	secret  string
-	client  *http.Client
+	baseURL  *url.URL
+	secret   string
+	client   *http.Client
+	provider string
 }
 
 var _ Provider = (*RemoteRunnerProvider)(nil)
@@ -108,12 +109,25 @@ func validateRunnerSecret(secret string) error {
 	return nil
 }
 
-func (p *RemoteRunnerProvider) endpointURL(endpointPath string) string {
-	return p.baseURL.JoinPath(strings.TrimPrefix(endpointPath, "/")).String()
+// ForProvider returns a handle bound to a specific runner provider ID while
+// sharing the underlying HTTP client and connection pool.
+func (p *RemoteRunnerProvider) ForProvider(providerName string) *RemoteRunnerProvider {
+	if p == nil {
+		return nil
+	}
+	bound := *p
+	bound.provider = strings.TrimSpace(providerName)
+	return &bound
 }
 
-func (p *RemoteRunnerProvider) newRequest(ctx context.Context, method, endpointPath string, body io.Reader) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, method, p.endpointURL(endpointPath), body)
+func (p *RemoteRunnerProvider) endpointURL(endpointPath, rawQuery string) string {
+	u := p.baseURL.JoinPath(strings.TrimPrefix(endpointPath, "/"))
+	u.RawQuery = rawQuery
+	return u.String()
+}
+
+func (p *RemoteRunnerProvider) newRequest(ctx context.Context, method, endpointPath, rawQuery string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, p.endpointURL(endpointPath, rawQuery), body)
 	if err != nil {
 		return nil, errors.New("invalid remote runner request")
 	}
@@ -130,6 +144,7 @@ func (p *RemoteRunnerProvider) Stream(ctx context.Context, req Request) (<-chan 
 		return nil, err
 	}
 	wireReq := runnerwire.Request{
+		Provider:           p.provider,
 		UserID:             req.UserID,
 		Model:              req.Model,
 		Reasoning:          req.Reasoning,
@@ -145,7 +160,7 @@ func (p *RemoteRunnerProvider) Stream(ctx context.Context, req Request) (<-chan 
 	if len(payload) > runnerwire.MaxRequestBytes {
 		return nil, errors.New("remote runner request exceeds size limit")
 	}
-	httpReq, err := p.newRequest(ctx, http.MethodPost, runnerwire.StreamPath, bytes.NewReader(payload))
+	httpReq, err := p.newRequest(ctx, http.MethodPost, runnerwire.StreamPath, "", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -261,12 +276,21 @@ func mapWireEvent(wireEvent runnerwire.Event) (event Event, terminal bool, ok bo
 
 // ListModels fetches the model catalog from the remote runner.
 func (p *RemoteRunnerProvider) ListModels(ctx context.Context) ([]Model, error) {
-	return getRunnerSlice[Model](ctx, p, runnerwire.ModelsPath)
+	rawQuery := ""
+	if p != nil && p.provider != "" {
+		rawQuery = "provider=" + url.QueryEscape(p.provider)
+	}
+	return getRunnerSlice[Model](ctx, p, runnerwire.ModelsPath, rawQuery)
+}
+
+// ListProviders fetches the enabled providers and default provider from the remote runner.
+func (p *RemoteRunnerProvider) ListProviders(ctx context.Context) (runnerwire.ProvidersResponse, error) {
+	return getRunnerJSON[runnerwire.ProvidersResponse](ctx, p, runnerwire.ProvidersPath, "")
 }
 
 // ListIndexedChats fetches the indexed chat list from the remote runner.
 func (p *RemoteRunnerProvider) ListIndexedChats(ctx context.Context) ([]IndexedChat, error) {
-	return getRunnerSlice[IndexedChat](ctx, p, runnerwire.HistoryPath)
+	return getRunnerSlice[IndexedChat](ctx, p, runnerwire.HistoryPath, "")
 }
 
 // ReadIndexedTurns fetches the turns of a single indexed chat after validating its UUID.
@@ -274,15 +298,27 @@ func (p *RemoteRunnerProvider) ReadIndexedTurns(ctx context.Context, id string) 
 	if !sessionPattern.MatchString(id) {
 		return nil, errors.New("invalid indexed chat ID")
 	}
-	return getRunnerSlice[IndexedTurn](ctx, p, runnerwire.HistoryPath+"/"+id)
+	return getRunnerSlice[IndexedTurn](ctx, p, runnerwire.HistoryPath+"/"+id, "")
 }
 
-func getRunnerSlice[T any](ctx context.Context, p *RemoteRunnerProvider, endpointPath string) ([]T, error) {
+func getRunnerSlice[T any](ctx context.Context, p *RemoteRunnerProvider, endpointPath, rawQuery string) ([]T, error) {
+	items, err := getRunnerJSON[[]T](ctx, p, endpointPath, rawQuery)
+	if err != nil {
+		return nil, err
+	}
+	if items == nil {
+		items = []T{}
+	}
+	return items, nil
+}
+
+func getRunnerJSON[T any](ctx context.Context, p *RemoteRunnerProvider, endpointPath, rawQuery string) (T, error) {
+	var zero T
 	if p == nil || p.client == nil || p.baseURL == nil {
-		return nil, errors.New("remote runner is not configured")
+		return zero, errors.New("remote runner is not configured")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return zero, err
 	}
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
@@ -290,23 +326,23 @@ func getRunnerSlice[T any](ctx context.Context, p *RemoteRunnerProvider, endpoin
 		defer cancel()
 	}
 
-	httpReq, err := p.newRequest(ctx, http.MethodGet, endpointPath, nil)
+	httpReq, err := p.newRequest(ctx, http.MethodGet, endpointPath, rawQuery, nil)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 	httpReq.Header.Set("Accept", "application/json")
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return zero, ctxErr
 		}
-		return nil, errors.New("remote runner request failed")
+		return zero, errors.New("remote runner request failed")
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("remote runner returned status %d", resp.StatusCode)
+		return zero, fmt.Errorf("remote runner returned status %d", resp.StatusCode)
 	}
 
 	stopCancel := context.AfterFunc(ctx, func() {
@@ -317,20 +353,17 @@ func getRunnerSlice[T any](ctx context.Context, p *RemoteRunnerProvider, endpoin
 	data, err := io.ReadAll(io.LimitReader(resp.Body, runnerwire.MaxReplyBytes+1))
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return zero, ctxErr
 		}
-		return nil, errors.New("failed to read remote runner response")
+		return zero, errors.New("failed to read remote runner response")
 	}
 	if int64(len(data)) > runnerwire.MaxReplyBytes {
-		return nil, errors.New("remote runner response too large")
+		return zero, errors.New("remote runner response too large")
 	}
 
-	var items []T
-	if err := json.Unmarshal(data, &items); err != nil {
-		return nil, errors.New("malformed remote runner response")
+	var decoded T
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return zero, errors.New("malformed remote runner response")
 	}
-	if items == nil {
-		items = []T{}
-	}
-	return items, nil
+	return decoded, nil
 }

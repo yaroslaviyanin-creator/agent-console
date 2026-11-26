@@ -8,6 +8,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"agent-console/server/internal/uploads"
 )
 
 type UserProfile struct {
@@ -37,27 +39,18 @@ func validProfileText(value string) bool {
 	return len(value) <= 4096 && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
 }
 
-func validAvatarData(value string) bool {
-	if value == "" {
-		return true
-	}
-	if len(value) > 131072 || !utf8.ValidString(value) || strings.ContainsFunc(value, unicode.IsSpace) || strings.ContainsRune(value, 0) {
-		return false
-	}
-	return strings.HasPrefix(value, "data:image/png;base64,") ||
-		strings.HasPrefix(value, "data:image/jpeg;base64,") ||
-		strings.HasPrefix(value, "data:image/webp;base64,")
-}
-
 func (s *Store) UpdateUserProfile(ctx context.Context, userID string, displayName, profileMD, memoryMD *string, memoryEnabled *bool, avatarData ...*string) (UserProfile, error) {
 	var avatar *string
-	if len(avatarData) > 0 {
-		avatar = avatarData[0]
+	if len(avatarData) > 0 && avatarData[0] != nil {
+		cleanAvatar, err := uploads.SanitizeAvatarDataURL(*avatarData[0])
+		if err != nil {
+			return UserProfile{}, ErrInvalidProfile
+		}
+		avatar = &cleanAvatar
 	}
 	if displayName != nil && (!utf8.ValidString(*displayName) || utf8.RuneCountInString(*displayName) > 80 ||
 		strings.ContainsFunc(*displayName, func(r rune) bool { return unicode.IsControl(r) || r == '\u2028' || r == '\u2029' })) ||
-		profileMD != nil && !validProfileText(*profileMD) || memoryMD != nil && !validProfileText(*memoryMD) ||
-		avatar != nil && !validAvatarData(*avatar) {
+		profileMD != nil && !validProfileText(*profileMD) || memoryMD != nil && !validProfileText(*memoryMD) {
 		return UserProfile{}, ErrInvalidProfile
 	}
 	if displayName != nil {
@@ -161,9 +154,21 @@ func (s *Store) IsChatShared(ctx context.Context, chatID string) (bool, error) {
 
 // ChatRunContext reads the saved session and sharing state from the same snapshot.
 func (s *Store) ChatRunContext(ctx context.Context, chatID string) (string, bool, error) {
-	var sessionID string
-	var shared bool
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(provider_session_id,''),
-  EXISTS(SELECT 1 FROM chat_shares WHERE chat_id=c.id) FROM chats c WHERE id=?`, chatID).Scan(&sessionID, &shared)
+	sessionID, _, shared, err := s.ChatRunState(ctx, chatID)
 	return sessionID, shared, err
+}
+
+// ChatRunState reads the saved session, stored provider, and sharing state from the same snapshot.
+func (s *Store) ChatRunState(ctx context.Context, chatID string) (sessionID, provider string, shared bool, err error) {
+	sessionID, provider, _, shared, err = s.ChatRunSessionState(ctx, chatID)
+	return sessionID, provider, shared, err
+}
+
+// ChatRunSessionState reads the saved session, stored provider, session provider, and sharing state from the same snapshot.
+func (s *Store) ChatRunSessionState(ctx context.Context, chatID string) (sessionID, provider, sessionProvider string, shared bool, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT COALESCE(provider_session_id,''), provider,
+  CASE WHEN session_provider='' THEN provider ELSE session_provider END,
+  EXISTS(SELECT 1 FROM chat_shares WHERE chat_id=c.id) FROM chats c WHERE id=?`, chatID).
+		Scan(&sessionID, &provider, &sessionProvider, &shared)
+	return sessionID, provider, sessionProvider, shared, err
 }

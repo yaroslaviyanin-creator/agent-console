@@ -9,7 +9,20 @@ import (
 	"agent-console/server/internal/provider"
 )
 
-var ErrDuplicateRun = errors.New("run ID already used in this chat")
+var (
+	ErrDuplicateRun        = errors.New("run ID already used in this chat")
+	ErrProviderMismatch    = errors.New("chat provider mismatch")
+	ErrProviderUnavailable = errors.New("provider is not available")
+)
+
+func isRunnableProvider(id string) bool {
+	switch id {
+	case "antigravity", "codex", "claude", "stub":
+		return true
+	default:
+		return false
+	}
+}
 
 type RunDenied string
 
@@ -59,20 +72,20 @@ func (s *Store) BeginRunForDevice(ctx context.Context, userID, deviceID, chatID,
 }
 
 func (s *Store) beginRun(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string) (string, error) {
+	if !isRunnableProvider(backend) {
+		return "", ErrProviderUnavailable
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback()
 
-	var previousBackend string
+	var previousBackend, sessionProvider string
 	var session sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT provider,provider_session_id FROM chats c WHERE `+chatWriteAccess,
-		chatID, userID).Scan(&previousBackend, &session); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT provider, CASE WHEN session_provider='' THEN provider ELSE session_provider END, provider_session_id FROM chats c WHERE `+chatWriteAccess,
+		chatID, userID).Scan(&previousBackend, &sessionProvider, &session); err != nil {
 		return "", err
-	}
-	if previousBackend != backend {
-		session = sql.NullString{}
 	}
 
 	now := time.Now()
@@ -94,16 +107,38 @@ func (s *Store) beginRun(ctx context.Context, userID, deviceID, chatID, messageI
 	if count == 0 {
 		return "", ErrDuplicateRun
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE chats SET provider=?,model=?,provider_session_id=?,updated_at=MAX(updated_at,?),
-        title=CASE WHEN title='Новый чат' THEN substr(?,1,80) ELSE title END WHERE id=?`,
-		backend, model, session, now.UnixMilli(), prompt, chatID); err != nil {
+	if backend == previousBackend {
+		if _, err := tx.ExecContext(ctx, `UPDATE chats SET model=?,updated_at=MAX(updated_at,?),
+			title=CASE WHEN title='Новый чат' THEN substr(?,1,80) ELSE title END WHERE id=?`,
+			model, now.UnixMilli(), prompt, chatID); err != nil {
+			return "", err
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `UPDATE chats SET updated_at=MAX(updated_at,?),
+			title=CASE WHEN title='Новый чат' THEN substr(?,1,80) ELSE title END WHERE id=?`,
+			now.UnixMilli(), prompt, chatID); err != nil {
+			return "", err
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return "", err
 	}
-	return session.String, tx.Commit()
+	if backend != sessionProvider {
+		return "", nil
+	}
+	return session.String, nil
 }
 
 // FinishRun publishes a durable reply and resume session in a single transaction.
 func (s *Store) FinishRun(ctx context.Context, userID, chatID, messageID, text, thinking, sessionID string, durationMs int64, usage *provider.Usage) error {
+	return s.FinishRunWithProvider(ctx, userID, chatID, messageID, "", "", text, thinking, sessionID, durationMs, usage)
+}
+
+// FinishRunWithProvider publishes a durable reply and updates the chat's active provider, model, and session binding.
+func (s *Store) FinishRunWithProvider(ctx context.Context, userID, chatID, messageID, targetProvider, targetModel, text, thinking, sessionID string, durationMs int64, usage *provider.Usage) error {
+	if targetProvider != "" && !isRunnableProvider(targetProvider) {
+		return ErrProviderUnavailable
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -118,6 +153,12 @@ func (s *Store) FinishRun(ctx context.Context, userID, chatID, messageID, text, 
 	if err != nil {
 		return err
 	}
+	if targetProvider != "" {
+		backend = targetProvider
+	}
+	if targetModel != "" {
+		model = targetModel
+	}
 	counts, cents := priceUsage(usage, model, prompt, text, thinking)
 	now := time.Now().UnixMilli()
 	if _, err := tx.ExecContext(ctx, `INSERT INTO usage_events
@@ -130,11 +171,32 @@ func (s *Store) FinishRun(ctx context.Context, userID, chatID, messageID, text, 
 		VALUES (?,?,'assistant',?,?,?,?,?,?)`, randomHex(16), chatID, text, thinking, now, messageID, durationMs, memoryPrivate); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE chats SET provider_session_id=NULLIF(?,''),updated_at=MAX(updated_at,?) WHERE id=?`,
-		sessionID, now, chatID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE chats SET provider=?,model=?,session_provider=?,provider_session_id=NULLIF(?,''),updated_at=MAX(updated_at,?) WHERE id=?`,
+		backend, model, backend, sessionID, now, chatID); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// ChatPriorMessages loads ordered conversation messages in a chat before the specified run ID.
+func (s *Store) ChatPriorMessages(ctx context.Context, chatID, excludeRunID string) ([]Message, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,role,content,created_at FROM chat_messages
+		WHERE chat_id=?1 AND (?2='' OR COALESCE(run_id,'')!=?2)
+		ORDER BY created_at,rowid`, chatID, excludeRunID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var messages []Message
+	for rows.Next() {
+		var m Message
+		m.ChatID = chatID
+		if err := rows.Scan(&m.ID, &m.Role, &m.Content, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		messages = append(messages, m)
+	}
+	return messages, rows.Err()
 }
 
 func (s *Store) CheckChat(ctx context.Context, userID, chatID string) error {
@@ -155,4 +217,10 @@ func (s *Store) ChatOwner(ctx context.Context, userID, chatID string) (string, e
 	var ownerID string
 	err := s.db.QueryRowContext(ctx, "SELECT c.user_id FROM chats c WHERE "+chatWriteAccess, chatID, userID).Scan(&ownerID)
 	return ownerID, err
+}
+
+// ChatDispatchInfo verifies write access and returns the chat owner ID and stored provider.
+func (s *Store) ChatDispatchInfo(ctx context.Context, userID, chatID string) (ownerID string, provider string, err error) {
+	err = s.db.QueryRowContext(ctx, "SELECT c.user_id, c.provider FROM chats c WHERE "+chatWriteAccess, chatID, userID).Scan(&ownerID, &provider)
+	return ownerID, provider, err
 }

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"agent-console/server/internal/uploads"
 	_ "modernc.org/sqlite"
 )
 
@@ -47,15 +48,16 @@ type ChatGrant struct {
 }
 
 type Chat struct {
-	OwnerID   string      `json:"ownerId,omitempty"`
-	Access    string      `json:"access,omitempty"`
-	Grants    []ChatGrant `json:"grants,omitempty"`
-	ID        string      `json:"id"`
-	Title     string      `json:"title"`
-	Provider  string      `json:"provider"`
-	Model     string      `json:"model"`
-	CreatedAt int64       `json:"createdAt"`
-	UpdatedAt int64       `json:"updatedAt"`
+	OwnerID         string      `json:"ownerId,omitempty"`
+	Access          string      `json:"access,omitempty"`
+	Grants          []ChatGrant `json:"grants,omitempty"`
+	ID              string      `json:"id"`
+	Title           string      `json:"title"`
+	Provider        string      `json:"provider"`
+	SessionProvider string      `json:"-"`
+	Model           string      `json:"model"`
+	CreatedAt       int64       `json:"createdAt"`
+	UpdatedAt       int64       `json:"updatedAt"`
 }
 
 type Message struct {
@@ -133,7 +135,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version == 13 {
+	if version == 15 {
 		return nil
 	}
 	// SQLite requires disabling foreign keys outside the transaction on this connection.
@@ -150,7 +152,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	switch version {
 	case 0:
-		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=13;"); err != nil {
+		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=15;"); err != nil {
 			return err
 		}
 	case 1:
@@ -361,7 +363,30 @@ func (s *Store) migrate(ctx context.Context) error {
 		PRAGMA user_version=13;`); err != nil {
 			return err
 		}
+		fallthrough
 	case 13:
+		var exists bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chats') WHERE name='session_provider')").Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE chats ADD COLUMN session_provider TEXT NOT NULL DEFAULT '' CHECK (session_provider IN ('', 'antigravity', 'codex', 'claude', 'paid_api', 'stub'));`); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE chats SET session_provider=provider WHERE session_provider='';
+		PRAGMA user_version=14;`); err != nil {
+			return err
+		}
+		fallthrough
+	case 14:
+		if err := sanitizeStoredAvatars(ctx, tx); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=15;`); err != nil {
+			return err
+		}
+	case 15:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}
@@ -370,6 +395,44 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	_, err = conn.ExecContext(ctx, "PRAGMA foreign_keys=ON")
 	return err
+}
+
+func sanitizeStoredAvatars(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, "SELECT id, avatar_data FROM users WHERE avatar_data != ''")
+	if err != nil {
+		return err
+	}
+	type dirtyAvatar struct {
+		id  string
+		raw string
+	}
+	var items []dirtyAvatar
+	for rows.Next() {
+		var item dirtyAvatar
+		if err := rows.Scan(&item.id, &item.raw); err != nil {
+			rows.Close()
+			return err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	for _, item := range items {
+		clean, err := uploads.SanitizeAvatarDataURL(item.raw)
+		if err != nil {
+			clean = ""
+		}
+		if clean != item.raw {
+			if _, err := tx.ExecContext(ctx, "UPDATE users SET avatar_data=? WHERE id=?", clean, item.id); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 var (
@@ -477,15 +540,19 @@ func activeDevice(ctx context.Context, db rowQuerier, predicate string, now int6
 
 func (s *Store) CreateChat(ctx context.Context, userID, title, provider, model string) (Chat, error) {
 	now := time.Now().UnixMilli()
-	chat := Chat{ID: randomHex(16), OwnerID: userID, Access: "owner", Title: title, Provider: provider, Model: model, CreatedAt: now, UpdatedAt: now}
+	chat := Chat{ID: randomHex(16), OwnerID: userID, Access: "owner", Title: title, Provider: provider, SessionProvider: provider, Model: model, CreatedAt: now, UpdatedAt: now}
 	return chat, insertChat(ctx, s.db, chat)
 }
 
 func insertChat(ctx context.Context, db interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }, chat Chat) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO chats (id,user_id,title,provider,model,created_at,updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, chat.ID, chat.OwnerID, chat.Title, chat.Provider, chat.Model, chat.CreatedAt, chat.UpdatedAt)
+	sessionProvider := chat.SessionProvider
+	if sessionProvider == "" {
+		sessionProvider = chat.Provider
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO chats (id,user_id,title,provider,session_provider,model,created_at,updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, chat.ID, chat.OwnerID, chat.Title, chat.Provider, sessionProvider, chat.Model, chat.CreatedAt, chat.UpdatedAt)
 	return err
 }
 
@@ -596,6 +663,7 @@ func (s *Store) ForkChat(ctx context.Context, userID, sourceChatID string) (Chat
 		sourceChatID, userID).Scan(&c.Title, &c.Provider, &c.Model); err != nil {
 		return Chat{}, err
 	}
+	c.SessionProvider = c.Provider
 	c.Title += " · копия"
 	if err := insertChat(ctx, tx, c); err != nil {
 		return Chat{}, err

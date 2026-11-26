@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS chats (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     provider TEXT NOT NULL CHECK (provider IN ('antigravity', 'codex', 'claude', 'paid_api', 'stub')),
+    session_provider TEXT NOT NULL DEFAULT '' CHECK (session_provider IN ('', 'antigravity', 'codex', 'claude', 'paid_api', 'stub')),
     model TEXT NOT NULL,
     provider_session_id TEXT,
     created_at INTEGER NOT NULL,

@@ -5,7 +5,7 @@
 - React 19 / TypeScript / Vite / Zustand, Tauri v2 и опубликованный Telegram Mini App.
 - Go-сервер поддерживает вход с ограничением частоты запросов, REST, WebSocket и восстановление истории. SQLite работает в режиме WAL. `MAX_CONCURRENT_STREAMS` ограничивает число одновременных потоков ответов.
 - В режиме Server работает реальный `codex exec --json`, включая resume и динамический список моделей через `model/list`. Сквозной запрос из Telegram подтверждён.
-- Поддерживается серверный провайдер `PROVIDER=antigravity` через локальный Antigravity CLI (`ANTIGRAVITY_BIN=agy`, модель `ANTIGRAVITY_MODEL=gemini-3.8-flash-high`). Провайдер использует авторизованный аккаунт Antigravity и его квоты, поддерживает сохранение и продолжение сессий (`--conversation`), потоковый вывод `stream-json`, sandbox-режим «Только чат» и каталог моделей через `GET /api/models` (`agy models`). Неподдерживаемые/нереализованные провайдеры (`claude`, `paid_api`) отклоняются при старте (`config.Load` / `httpapi.New`) без фоллбэка на `StubProvider`.
+- Поддерживается серверный провайдер `PROVIDER=antigravity` через локальный Antigravity CLI (`ANTIGRAVITY_BIN=agy`, модель `ANTIGRAVITY_MODEL=gemini-3.8-flash-high`). Провайдер использует авторизованный аккаунт Antigravity и его квоты, поддерживает сохранение и продолжение сессий (`--conversation`), потоковый вывод `stream-json`, sandbox-режим «Только чат» и каталог моделей через `GET /api/models` (`agy models`). Серверный реестр поддерживает Codex, Antigravity и Claude. `paid_api` показан в интерфейсе как недоступный. Чат закреплён за провайдером при создании.
 - Поддерживаемые идентификаторы пользовательских провайдеров в протоколе и БД: `antigravity`, `codex`, `claude`, `paid_api` (плюс `stub` для dev/тестов).
 - Раздел «Чаты Codex» показывает локальные обычные и архивные чаты владельца через Codex App Server. Проверены 46 чатов, включая 2 архивных. Импортированная история доступна для чтения.
 - Для Telegram Mini App сервер доступен по постоянному HTTPS через Tailscale Funnel. [Agent Console Preview](https://t.me/AgentConsolePreview26Bot). Сборка для Sites размещена в отдельном checkout `telegram-demo-site/`.
@@ -14,7 +14,7 @@
 
 ## Запуск из корня проекта
 
-Создайте `.env` из `.env.example`, задайте случайный `RUNNER_SHARED_SECRET` командой `openssl rand -hex 32` и выберите `PROVIDER=stub`, `codex` или `antigravity`. Реальные CLI запускаются в `runner` через Docker Compose. Запуск Go API на хосте подходит для `stub`.
+Создайте `.env` из `.env.example`, задайте случайный `RUNNER_SHARED_SECRET` командой `openssl rand -hex 32` и задайте `ENABLED_PROVIDERS=codex,antigravity,claude`. В старой конфигурации `PROVIDER` включает одного провайдера. Реальные CLI запускаются в `runner` через Docker Compose. Запуск Go API на хосте подходит для `stub`.
 
 ```sh
 docker compose up -d --build
@@ -25,7 +25,7 @@ npm test
 (cd server && go test ./...)
 ```
 
-Веб-клиент доступен на http://127.0.0.1:3000/, прямой локальный адрес API — http://127.0.0.1:8080. При обновлении старого стека с `backend` один раз добавьте `--remove-orphans` к `docker compose up -d --build`. Имена существующих томов и формат сохранённых сессий сохранились. Для Telegram нужен доступный HTTPS-бэкенд и CORS с точным origin Mini App.
+Веб-клиент доступен на http://127.0.0.1:3000/, прямой локальный адрес API — http://127.0.0.1:8080. При локальном запуске стека на Mac для тестирования (включая Telegram Mini App) проверяйте `tailscale funnel status` и держите проброс `tailscale funnel --bg http://127.0.0.1:3000` на `https://macbook-pro.tail2aa739.ts.net` поверх порта Docker `web`, отдавая пользователю именно `https://macbook-pro.tail2aa739.ts.net`. При обновлении старого стека с `backend` один раз добавьте `--remove-orphans` к `docker compose up -d --build`. Имена существующих томов и формат сохранённых сессий сохранились. Для Telegram нужен доступный HTTPS-бэкенд и CORS с точным origin Mini App.
 
 ## Исправления истории Codex
 
@@ -42,9 +42,10 @@ npm test
 - «Мои устройства» обновляет список через `GET /api/devices`. Отзыв через `DELETE /api/devices/{id}` завершает выбранную сессию. Выход отзывает токен текущего устройства через `POST /api/auth/logout` и очищает локальную сессию даже при недоступном сервере.
 - Для каждого подключения клиент запрашивает одноразовый тикет через `POST /api/ws/ticket` с Bearer-токеном и передаёт тикет в `/ws?ticket=…`.
 
-## Профиль и память
+## Профиль, загрузки и память
 
-- «Настройки» → «Профиль и память» сохраняет имя, предпочтения и память через `GET/PATCH /api/profile`. В общие чаты передаётся имя автора сообщения.
+- «Настройки» → «Профиль и память» сохраняет имя, аватар, предпочтения и память через `GET/PATCH /api/profile`. В общие чаты передаётся имя автора сообщения (`avatarData` и метаданные файлов никогда не попадают в инструкции LLM).
+- Любая будущая загрузка файлов/картинок в чат обязана идти через переиспользуемый пакет `server/internal/uploads` (`AttachmentPolicy`, проверка magic bytes, лимиты размеров/пикселей, перекодирование изображений, запрет SVG/HTML/JS/исполняемых файлов и серверной распаковки архивов, безопасные заголовки отдачи).
 - Фоновое сжатие личных чатов через CLI регулируют `MEMORY_AUTO_UPDATE` (true), `MEMORY_MODEL` (default), `MEMORY_CHECK_INTERVAL` (5m) и `MEMORY_MIN_NEW_MESSAGES` (6). Запуски используют общий лимит потоков и не записываются в квоту клиента.
 
 ## Docker
@@ -53,7 +54,8 @@ npm test
 - **runner** запускает CLI из пустой `/workspace`. Корневая ФС и workspace доступны только для чтения, `/tmp` — временный. Тома хранят авторизацию и сессии CLI, включая существующий `cli_codex_chat`. У сервиса нет тома БД или файла `.env`. Внутренние HTTP-запросы авторизуются общим с `core` токеном. NDJSON передаёт дельты, usage и ID сессии, отмена HTTP-запроса останавливает генерацию. Непустой `mcp_endpoint` зарезервирован для будущего одноразового MCP-моста и пока отклоняется.
 - **unlocker** получает только относящиеся к нему настройки, включая `AG_UNLOCKER_CODE` и том `ag_unlocker_data`. Supervisor перезапускает `ag_unlocker --proxy` и его TCP-переадресацию с loopback в отдельную сеть Compose. Runner использует `AG_LS_PROXY=http://unlocker:53130`. Порт наружу не публикуется.
 - Локально `docker compose up -d --build` собирает `core` и `runner` нативно на Apple Silicon. Для Antigravity с прокси выполните `PROVIDER=antigravity AGY_USE_UNLOCKER=true AG_LS_PROXY=http://unlocker:53130 docker compose --profile antigravity up -d --build`. В этом профиле только `unlocker` работает как `linux/amd64`.
-- Для авторизации используйте `docker compose exec -e CODEX_HOME=/home/app/.codex-chat -it runner codex login --device-auth` или `docker compose exec -it runner agy`. `claude` установлен в runner, серверный провайдер Claude пока не реализован.
+- Для однократной авторизации CLI используйте `docker compose exec -e CODEX_HOME=/home/app/.codex-chat -it runner codex login --device-auth`, `docker compose exec -it runner agy` или `docker compose exec -it runner claude`. Сессии CLI хранятся в их Docker-томах.
+- `ENABLED_PROVIDERS` — список через запятую из `codex`, `antigravity`, `claude` и тестового `stub`. `DEFAULT_PROVIDER` по умолчанию берётся первым из списка, `MEMORY_PROVIDER` по умолчанию совпадает с `DEFAULT_PROVIDER`. Старый `PROVIDER` используется, когда список не задан. Реестр и выбор по умолчанию доступны в `GET /api/providers`, каталог — в `GET /api/models?provider=...`. Переключение провайдера в интерфейсе создаёт отдельный чат.
 - Горячий бэкап SQLite:
   ```sh
   docker compose exec core sqlite3 /app/data/app.db ".backup /tmp/backup.db"

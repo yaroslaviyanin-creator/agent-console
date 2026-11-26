@@ -68,7 +68,7 @@ func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 		t.Fatalf("auth after reopening DB failed: %v", err)
 	}
 	var version int
-	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 13 {
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 15 {
 		t.Fatalf("schema version %d: %v", version, err)
 	}
 	if currentDevice.LastSeenAt != device.LastSeenAt {
@@ -156,8 +156,20 @@ func TestUpgradeAndResumeChat(t *testing.T) {
 	if list[0].DurationMs != nil || list[2].DurationMs == nil || *list[2].DurationMs != 276608 {
 		t.Fatalf("unexpected durations after reopen: legacy=%v, reply=%v", list[0].DurationMs, list[2].DurationMs)
 	}
-	if session, err := reopened.BeginRun(ctx, "owner", "chat", "switch", "test", "stub", "default"); err != nil || session != "" {
-		t.Fatalf("resume session leaked across provider switch: session=%q err=%v", session, err)
+	if session, err := reopened.BeginRun(ctx, "owner", "chat", "paid", "test", "paid_api", "deepseek"); !errors.Is(err, ErrProviderUnavailable) || session != "" {
+		t.Fatalf("expected ErrProviderUnavailable for paid_api, got session=%q err=%v", session, err)
+	}
+	if session, err := reopened.BeginRun(ctx, "owner", "chat", "after-paid", "still codex", "codex", "default"); err != nil || session != sessionID {
+		t.Fatalf("rejected paid_api wiped or changed session: session=%q err=%v", session, err)
+	}
+	if session, err := reopened.BeginRun(ctx, "owner", "chat", "switch", "to stub", "stub", "default"); err != nil || session != "" {
+		t.Fatalf("expected empty session when switching provider, got session=%q err=%v", session, err)
+	}
+	if err := reopened.FinishRunWithProvider(ctx, "owner", "chat", "switch", "stub", "default", "stub reply", "", "stub-sess-1", 10, nil); err != nil {
+		t.Fatal(err)
+	}
+	if sess, prov, sessProv, _, err := reopened.ChatRunSessionState(ctx, "chat"); err != nil || sess != "stub-sess-1" || prov != "stub" || sessProv != "stub" {
+		t.Fatalf("unexpected post-switch state: sess=%q prov=%q sessProv=%q err=%v", sess, prov, sessProv, err)
 	}
 }
 
@@ -462,8 +474,9 @@ func TestProfileMigrationAndMemoryIsolation(t *testing.T) {
 		t.Fatalf("profile update error: %v", err)
 	}
 	validAvatar := "data:image/webp;base64,UklGRh4AAABXRUJQVlA4TBEAAAAvAAAAAAfQ//73v/+BiOh/AAA="
-	if profile, err = db.UpdateUserProfile(ctx, owner, nil, nil, nil, nil, &validAvatar); err != nil || profile.AvatarData != validAvatar {
-		t.Fatalf("avatar update error: %v", err)
+	if profile, err = db.UpdateUserProfile(ctx, owner, nil, nil, nil, nil, &validAvatar); err != nil ||
+		(!strings.HasPrefix(profile.AvatarData, "data:image/jpeg;base64,") && !strings.HasPrefix(profile.AvatarData, "data:image/png;base64,")) {
+		t.Fatalf("avatar update error: %v (avatar=%q)", err, profile.AvatarData)
 	}
 	invalidAvatar := "javascript:alert(1)"
 	if _, err := db.UpdateUserProfile(ctx, owner, nil, nil, nil, nil, &invalidAvatar); !errors.Is(err, ErrInvalidProfile) {
@@ -573,5 +586,139 @@ func TestAntigravityChatAndMigration(t *testing.T) {
 	}
 	if err := db.FinishRun(ctx, user.ID, chat.ID, "msg1", "Hi there!", "", "834a3b51-377b-4b32-b712-b0b6e81e8377", 100, nil); err != nil {
 		t.Fatalf("finish run failed: %v", err)
+	}
+}
+
+func TestBeginRunProviderMismatchSafetyAndConcurrency(t *testing.T) {
+	ctx := t.Context()
+	db, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	owner, err := db.CreateUserWithRole(ctx, "owner", []byte("hash"), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := db.CreateUserWithRole(ctx, "other", []byte("hash"), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat, err := db.CreateChat(ctx, owner.ID, "Codex Chat", "codex", "gpt-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantSession = "019abcde-0123-4567-89ab-0123456789cd"
+	if _, err := db.BeginRun(ctx, owner.ID, chat.ID, "m1", "hello", "codex", "gpt-5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishRun(ctx, owner.ID, chat.ID, "m1", "hi", "", wantSession, 50, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unauthorized user gets sql.ErrNoRows before provider mismatch.
+	if _, _, err := db.ChatDispatchInfo(ctx, other.ID, chat.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unauthorized ChatDispatchInfo = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := db.BeginRun(ctx, other.ID, chat.ID, "m-unauth", "hack", "claude", "default"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unauthorized BeginRun = %v, want sql.ErrNoRows", err)
+	}
+
+	// Concurrent paid_api rejections and provider switches never leak codex session to another provider.
+	const workers = 8
+	errs := make(chan error, workers)
+	for i := range workers {
+		go func(idx int) {
+			id := "concurrent-" + string(rune('a'+idx))
+			switch idx % 3 {
+			case 0:
+				_, err := db.BeginRun(ctx, owner.ID, chat.ID, id, "bad", "paid_api", "deepseek")
+				if !errors.Is(err, ErrProviderUnavailable) {
+					errs <- err
+					return
+				}
+			case 1:
+				sess, err := db.BeginRun(ctx, owner.ID, chat.ID, id, "switch", "claude", "sonnet")
+				if err != nil {
+					errs <- err
+					return
+				}
+				if sess != "" {
+					errs <- errors.New("leaked codex session to claude: " + sess)
+					return
+				}
+			default:
+				sess, err := db.BeginRun(ctx, owner.ID, chat.ID, id, "good", "codex", "gpt-5")
+				if err != nil {
+					errs <- err
+					return
+				}
+				if sess != wantSession {
+					errs <- errors.New("lost session id: " + sess)
+					return
+				}
+			}
+			errs <- nil
+		}(i)
+	}
+	for range workers {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent BeginRun invariant failed: %v", err)
+		}
+	}
+
+	_, storedProvider, err := db.ChatDispatchInfo(ctx, owner.ID, chat.ID)
+	if err != nil || storedProvider != "codex" {
+		t.Fatalf("stored provider mutated before FinishRun: %q (%v)", storedProvider, err)
+	}
+	sess, gotProvider, sessProv, _, err := db.ChatRunSessionState(ctx, chat.ID)
+	if err != nil || gotProvider != "codex" || sessProv != "codex" || sess != wantSession {
+		t.Fatalf("ChatRunSessionState = (%q, %q, %q, %v), want (%q, codex, codex)", sess, gotProvider, sessProv, err, wantSession)
+	}
+}
+
+func TestMigrationV14SanitizesStoredAvatars(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u1, err := db.CreateUserWithRole(ctx, "dirty_svg", []byte("h"), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u2, err := db.CreateUserWithRole(ctx, "valid_webp", []byte("h"), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seed legacy un-sanitized avatars at v14.
+	if _, err := db.db.ExecContext(ctx, `UPDATE users SET avatar_data='data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=' WHERE id=?`, u1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE users SET avatar_data='data:image/webp;base64,UklGRh4AAABXRUJQVlA4TBEAAAAvAAAAAAfQ//73v/+BiOh/AAA=' WHERE id=?`, u2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `PRAGMA user_version=14;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	p1, err := reopened.UserProfile(ctx, u1.ID)
+	if err != nil || p1.AvatarData != "" {
+		t.Fatalf("expected dirty SVG avatar to be cleared on v15 migration, got %q (%v)", p1.AvatarData, err)
+	}
+	p2, err := reopened.UserProfile(ctx, u2.ID)
+	if err != nil || (!strings.HasPrefix(p2.AvatarData, "data:image/jpeg;base64,") && !strings.HasPrefix(p2.AvatarData, "data:image/png;base64,")) {
+		t.Fatalf("expected legacy webp avatar to be re-encoded on v15 migration, got %q (%v)", p2.AvatarData, err)
 	}
 }

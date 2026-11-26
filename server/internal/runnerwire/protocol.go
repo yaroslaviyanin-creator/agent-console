@@ -3,6 +3,7 @@ package runnerwire
 
 const (
 	HealthPath      = "/healthz"
+	ProvidersPath   = "/v1/providers"
 	StreamPath      = "/v1/stream"
 	ModelsPath      = "/v1/models"
 	HistoryPath     = "/v1/history"
@@ -15,6 +16,7 @@ const (
 )
 
 type Request struct {
+	Provider           string `json:"provider,omitempty"`
 	UserID             string `json:"user_id"`
 	Model              string `json:"model,omitempty"`
 	Reasoning          string `json:"reasoning,omitempty"`
@@ -25,6 +27,11 @@ type Request struct {
 	// Reserved for a future authenticated, session-scoped bridge. Reject any
 	// nonempty value until that feature exists. Chat never contacts a bridge.
 	MCPEndpoint string `json:"mcp_endpoint,omitempty"`
+}
+
+type ProvidersResponse struct {
+	DefaultProvider string   `json:"default_provider"`
+	Providers       []string `json:"providers"`
 }
 
 type Usage struct {

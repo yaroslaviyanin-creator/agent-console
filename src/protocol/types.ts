@@ -9,6 +9,7 @@ export interface RunRequest {
   retryOf?: string
   chatId: string
   messageId: string // ID of the new assistant message
+  provider?: ServerProvider
   model: { provider: Provider; id: string }
   reasoning?: string
   target: Target
@@ -120,6 +121,11 @@ export interface ServerModel {
   defaultReasoning?: string
 }
 export interface ServerHealth { status: 'ok'; provider: ServerProvider }
+export interface ServerProviderInfo { id: ServerProvider; available: boolean }
+export interface ServerProvidersResponse {
+  defaultProvider: ServerProvider
+  providers: ServerProviderInfo[]
+}
 export interface ServerLoginRequest { username: string; password: string; deviceName: string }
 export type UserRole = 'pending' | 'user' | 'admin'
 export type PlanTier = 'none' | 'pro' | '2x_pro' | 'unlimited'
@@ -169,7 +175,7 @@ export interface ServerAdminAdapter extends AdminAdapter {
 export interface ServerDevice { id: string; userId: string; name: string; lastSeenAt: number; createdAt: number; isCurrent?: boolean }
 export interface ServerSession { user: ServerUser; device: ServerDevice }
 export interface ServerLoginResponse extends ServerSession { token: string }
-export interface ServerCreateChatRequest { title?: string; model?: string }
+export interface ServerCreateChatRequest { provider?: ServerProvider; title?: string; model?: string }
 export interface ServerChat {
   ownerId?: string
   access?: ChatAccess['access']

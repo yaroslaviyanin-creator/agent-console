@@ -82,7 +82,11 @@ func (m *memoryWorker) update(ctx context.Context, a *API, userID string) error 
 	if model == "" {
 		model = "default"
 	}
-	events, err := a.live.backend.Stream(ctx, provider.Request{
+	memProvider, ok := a.live.provider(a.memoryProvider)
+	if !ok {
+		return fmt.Errorf("memory provider %q is unavailable", a.memoryProvider)
+	}
+	events, err := memProvider.Stream(ctx, provider.Request{
 		UserID: userID, Model: model, Ephemeral: true,
 		Prompt: `Обнови краткую память о пользователе. Сохраняй устойчивые факты о самом пользователе: имя, род занятий, проекты, инструменты, предпочтения и цели.
 Объедини сохранённую память с новыми важными фактами. Удали устаревшее, приветствия, одноразовые вопросы и фрагменты кода. Не добавляй секреты и догадки; слова ассистента не являются подтверждением фактов о пользователе.

@@ -1,3 +1,5 @@
+import { sanitizeAvatarDataUrl } from './avatar'
+
 export function avatarInitial(name?: string | null): string {
   const trimmed = name?.trim() ?? ''
   if (!trimmed) return '?'
@@ -17,9 +19,10 @@ export function UserAvatar({
   alt?: string
 }) {
   const classes = className ? `user-avatar ${className}` : 'user-avatar'
+  const safeSrc = sanitizeAvatarDataUrl(avatarData)
   return (
     <span className={classes}>
-      {avatarData ? <img src={avatarData} alt={alt} /> : avatarInitial(name)}
+      {safeSrc ? <img src={safeSrc} alt={alt} /> : avatarInitial(name)}
     </span>
   )
 }

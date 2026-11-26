@@ -367,3 +367,87 @@ test('remote workspace lists members, updates grants and forks shared chats', as
   assert.equal(copy.id, fork.id)
   assert.deepEqual(copy.workspace.chats[0], { id: fork.id, ownerId: alice.id, access: 'owner', grants: [] })
 })
+
+test('remote providers, scoped models, 404 fallback, and createChat with provider', async t => {
+  const user = { id: 'u', username: 'demo' }
+  const device = { id: 'd', userId: 'u', name: 'Browser', lastSeenAt: 0, createdAt: 0 }
+  let providersStatus = 200
+  const calls: { route: string; query: string; body?: unknown }[] = []
+
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    assert.ok(init)
+    const url = new URL(String(input))
+    const route = init.method + ' ' + url.pathname
+    calls.push({ route, query: url.search, body: init.body ? JSON.parse(String(init.body)) : undefined })
+    switch (route) {
+      case 'POST /api/auth/login': return Response.json({ user, device, token: 'tok' })
+      case 'GET /api/health': return Response.json({ status: 'ok', provider: 'antigravity' })
+      case 'GET /api/devices': return Response.json([device])
+      case 'GET /api/quotas/current': return Response.json(null, { status: 404 })
+      case 'GET /api/chats': return Response.json([])
+      case 'GET /api/users': return Response.json([])
+      case 'GET /api/providers':
+        if (providersStatus === 404) return Response.json({ code: 'not_found' }, { status: 404 })
+        return Response.json({
+          defaultProvider: 'antigravity',
+          providers: [
+            { id: 'antigravity', available: true },
+            { id: 'codex', available: true },
+            { id: 'claude', available: false },
+            { id: 'paid_api', available: false },
+          ],
+        })
+      case 'GET /api/models':
+        if (url.search === '?provider=codex') {
+          return Response.json([{ id: 'gpt-5.2-codex', name: 'GPT-5.2-Codex', isDefault: true }])
+        }
+        return Response.json([{ id: 'gemini-4-hydrogen-medium', name: 'Gemini 4 Hydrogen (Medium)', isDefault: true }])
+      case 'POST /api/chats': {
+        const body = JSON.parse(String(init.body)) as { provider?: string; model?: string; title?: string }
+        return Response.json({
+          id: 'created-1',
+          title: body.title ?? 'Новый чат',
+          provider: body.provider ?? 'antigravity',
+          model: body.model ?? 'default',
+          createdAt: 1,
+          updatedAt: 1,
+        }, { status: 201 })
+      }
+      default: assert.fail(route)
+    }
+  })
+
+  const remote = new RemoteTransport('https://example.test')
+  t.after(() => remote.close())
+  await remote.workspace.login({ connection: remote.address, login: 'demo', password: 'pw', deviceName: 'Browser' })
+
+  const list = await remote.providers()
+  assert.equal(list.defaultProvider, 'antigravity')
+  assert.deepEqual(list.providers.map(p => [p.id, p.available]), [
+    ['antigravity', true],
+    ['codex', true],
+    ['claude', false],
+    ['paid_api', false],
+  ])
+
+  providersStatus = 404
+  const fallback = await remote.providers()
+  assert.equal(fallback.defaultProvider, 'antigravity')
+  assert.deepEqual(fallback.providers, [
+    { id: 'antigravity', available: true },
+    { id: 'codex', available: false },
+    { id: 'claude', available: false },
+    { id: 'paid_api', available: false },
+  ])
+
+  const codexModels = await remote.models('codex')
+  assert.deepEqual(codexModels.map(m => m.id), ['gpt-5.2-codex'])
+  const defaultModels = await remote.models()
+  assert.deepEqual(defaultModels.map(m => m.id), ['gemini-4-hydrogen-medium'])
+
+  const created = await remote.createChat({ provider: 'codex', model: 'gpt-5.2-codex', title: 'Codex chat' })
+  assert.equal(created.id, 'created-1')
+  assert.equal(remote.chats[0]?.provider, 'codex')
+  const postCall = calls.find(c => c.route === 'POST /api/chats')
+  assert.deepEqual(postCall?.body, { provider: 'codex', model: 'gpt-5.2-codex', title: 'Codex chat' })
+})

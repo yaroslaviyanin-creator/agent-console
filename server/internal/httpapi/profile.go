@@ -5,9 +5,28 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"agent-console/server/internal/store"
+	"agent-console/server/internal/uploads"
 )
+
+const (
+	maxProfileBodyBytes  = 3 << 20
+	profileUserRateLimit = 8
+	profileIPRateLimit   = 20
+)
+
+// profilePatchRequest is the strict allowlist of fields a user may modify on their own profile.
+// Privileged fields (id, userId, role, planTier, status, isAdmin, isActive) are intentionally absent
+// and rejected by decodeLimit's DisallowUnknownFields.
+type profilePatchRequest struct {
+	DisplayName   *string `json:"displayName"`
+	AvatarData    *string `json:"avatarData"`
+	ProfileMD     *string `json:"profileMd"`
+	MemoryMD      *string `json:"memoryMd"`
+	MemoryEnabled *bool   `json:"memoryEnabled"`
+}
 
 func (a *API) getProfile(w http.ResponseWriter, r *http.Request, s session) {
 	profile, err := a.db.UserProfile(r.Context(), s.User.ID)
@@ -19,21 +38,25 @@ func (a *API) getProfile(w http.ResponseWriter, r *http.Request, s session) {
 }
 
 func (a *API) patchProfile(w http.ResponseWriter, r *http.Request, s session) {
-	var patch struct {
-		DisplayName   *string `json:"displayName"`
-		AvatarData    *string `json:"avatarData"`
-		ProfileMD     *string `json:"profileMd"`
-		MemoryMD      *string `json:"memoryMd"`
-		MemoryEnabled *bool   `json:"memoryEnabled"`
-	}
-	// JSON escapes can expand every byte of the text/avatar fields.
-	if !decodeLimit(w, r, &patch, 256<<10) {
+	if !a.allowUserAndIPRate(w, r, a.uploads, "profile", s.User.ID, profileUserRateLimit, profileIPRateLimit, time.Minute) {
 		return
+	}
+	var patch profilePatchRequest
+	if !decodeLimit(w, r, &patch, maxProfileBodyBytes) {
+		return
+	}
+	if patch.AvatarData != nil {
+		sanitized, err := uploads.SanitizeAvatarDataURL(*patch.AvatarData)
+		if err != nil {
+			fail(w, http.StatusBadRequest, "invalid_avatar", "Аватар должен быть корректным изображением JPEG, PNG, WebP или GIF (до 2 МБ и 4096×4096 px).")
+			return
+		}
+		patch.AvatarData = &sanitized
 	}
 	profile, err := a.db.UpdateUserProfile(r.Context(), s.User.ID, patch.DisplayName, patch.ProfileMD, patch.MemoryMD, patch.MemoryEnabled, patch.AvatarData)
 	switch {
 	case errors.Is(err, store.ErrInvalidProfile):
-		fail(w, http.StatusBadRequest, "invalid_profile", "Имя должно занимать до 80 символов, аватар — до 128 КБ, а каждый текст — до 4096 байт.")
+		fail(w, http.StatusBadRequest, "invalid_profile", "Имя должно занимать до 80 символов, аватар — до 2 МБ, а каждый текст — до 4096 байт.")
 	case err != nil:
 		a.internal(w, r, err)
 	default:
@@ -41,6 +64,8 @@ func (a *API) patchProfile(w http.ResponseWriter, r *http.Request, s session) {
 	}
 }
 
+// userInstructions builds the per-user system context for LLM runs.
+// AvatarData and uploaded file metadata are strictly excluded so image metadata cannot inject prompts.
 func (a *API) userInstructions(ctx context.Context, userID string, shared bool) (string, error) {
 	profile, err := a.db.UserProfile(ctx, userID)
 	if err != nil {

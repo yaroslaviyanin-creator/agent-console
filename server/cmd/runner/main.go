@@ -13,11 +13,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	appconfig "agent-console/server/internal/config"
 	"agent-console/server/internal/provider"
 	"agent-console/server/internal/runnerwire"
 )
@@ -27,6 +29,7 @@ const (
 	defaultCodexBin         = "codex"
 	defaultAntigravityBin   = "agy"
 	defaultAntigravityModel = "gemini-3.8-flash-high"
+	defaultClaudeBin        = "claude"
 
 	maxStreamDuration   = 5 * time.Minute
 	maxMetadataDuration = 30 * time.Second
@@ -43,9 +46,12 @@ type config struct {
 	Addr                 string
 	SharedSecret         string
 	Provider             string
+	EnabledProviders     []string
+	DefaultProvider      string
 	CodexBin             string
 	AntigravityBin       string
 	AntigravityModel     string
+	ClaudeBin            string
 	MaxConcurrentStreams int
 }
 
@@ -59,9 +65,11 @@ type historyReader interface {
 }
 
 type runnerServer struct {
-	provider     provider.Provider
-	secretDigest [sha256.Size]byte
-	sem          chan struct{}
+	providers       map[string]provider.Provider
+	defaultProvider string
+	enabled         []string
+	secretDigest    [sha256.Size]byte
+	sem             chan struct{}
 }
 
 func main() {
@@ -87,14 +95,14 @@ func main() {
 	defer stop()
 
 	initCtx, cancelInit := context.WithTimeout(sigCtx, startupTimeout)
-	prov, err := buildProvider(initCtx, cfg)
+	providers, err := buildProviders(initCtx, cfg)
 	cancelInit()
 	if err != nil {
-		slog.Error("failed to initialize provider", "provider", cfg.Provider, "error", err)
+		slog.Error("failed to initialize providers", "defaultProvider", cfg.DefaultProvider, "enabled", cfg.EnabledProviders, "error", err)
 		os.Exit(1)
 	}
 
-	handler, err := newRunnerHandler(cfg, prov)
+	handler, err := newRunnerRegistryHandler(cfg, providers)
 	if err != nil {
 		slog.Error("failed to initialize runner handler", "error", err)
 		os.Exit(1)
@@ -112,7 +120,7 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("runner listening", "addr", cfg.Addr, "provider", cfg.Provider)
+		slog.Info("runner listening", "addr", cfg.Addr, "defaultProvider", cfg.DefaultProvider, "enabled", cfg.EnabledProviders)
 		errCh <- srv.ListenAndServe()
 	}()
 
@@ -162,14 +170,9 @@ func loadConfig(getenv func(string) (string, bool)) (config, error) {
 		return config{}, fmt.Errorf("RUNNER_SHARED_SECRET must be at least %d bytes", runnerwire.MinSecretBytes)
 	}
 
-	prov := strings.ToLower(strings.TrimSpace(get("PROVIDER")))
-	if prov == "" {
-		prov = "stub"
-	}
-	switch prov {
-	case "stub", "codex", "antigravity":
-	default:
-		return config{}, fmt.Errorf("unsupported PROVIDER %q", prov)
+	provCfg, err := appconfig.ParseProviderConfig(getenv)
+	if err != nil {
+		return config{}, err
 	}
 
 	codexBin := strings.TrimSpace(get("CODEX_BIN"))
@@ -187,6 +190,11 @@ func loadConfig(getenv func(string) (string, bool)) (config, error) {
 		agyModel = defaultAntigravityModel
 	}
 
+	claudeBin := strings.TrimSpace(get("CLAUDE_BIN"))
+	if claudeBin == "" {
+		claudeBin = defaultClaudeBin
+	}
+
 	var maxConcurrent int
 	if rawMax, ok := getenv("MAX_CONCURRENT_STREAMS"); ok && strings.TrimSpace(rawMax) != "" {
 		n, err := strconv.Atoi(strings.TrimSpace(rawMax))
@@ -199,16 +207,42 @@ func loadConfig(getenv func(string) (string, bool)) (config, error) {
 	return config{
 		Addr:                 addr,
 		SharedSecret:         secret,
-		Provider:             prov,
+		Provider:             provCfg.DefaultProvider,
+		EnabledProviders:     provCfg.EnabledProviders,
+		DefaultProvider:      provCfg.DefaultProvider,
 		CodexBin:             codexBin,
 		AntigravityBin:       agyBin,
 		AntigravityModel:     agyModel,
+		ClaudeBin:            claudeBin,
 		MaxConcurrentStreams: maxConcurrent,
 	}, nil
 }
 
-func buildProvider(ctx context.Context, cfg config) (provider.Provider, error) {
-	switch cfg.Provider {
+func buildProviders(ctx context.Context, cfg config) (map[string]provider.Provider, error) {
+	enabled := cfg.EnabledProviders
+	if len(enabled) == 0 {
+		def := cfg.DefaultProvider
+		if def == "" {
+			def = cfg.Provider
+		}
+		if def == "" {
+			def = "stub"
+		}
+		enabled = []string{def}
+	}
+	providers := make(map[string]provider.Provider, len(enabled))
+	for _, name := range enabled {
+		prov, err := buildProvider(ctx, name, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("provider %q: %w", name, err)
+		}
+		providers[name] = prov
+	}
+	return providers, nil
+}
+
+func buildProvider(ctx context.Context, name string, cfg config) (provider.Provider, error) {
+	switch name {
 	case "stub":
 		return provider.StubProvider{Delay: 100 * time.Millisecond}, nil
 	case "codex":
@@ -218,20 +252,77 @@ func buildProvider(ctx context.Context, cfg config) (provider.Provider, error) {
 			Bin:          cfg.AntigravityBin,
 			DefaultModel: cfg.AntigravityModel,
 		}, nil
+	case "claude":
+		return provider.ClaudeCliProvider{
+			Bin: cfg.ClaudeBin,
+		}, nil
 	default:
-		return nil, fmt.Errorf("unsupported provider %q", cfg.Provider)
+		return nil, fmt.Errorf("unsupported provider %q", name)
 	}
 }
 
 func newRunnerHandler(cfg config, prov provider.Provider) (http.Handler, error) {
-	if len(cfg.SharedSecret) < runnerwire.MinSecretBytes {
-		return nil, fmt.Errorf("shared secret must be at least %d bytes", runnerwire.MinSecretBytes)
-	}
 	if prov == nil {
 		return nil, errors.New("provider is required")
 	}
+	def := strings.ToLower(strings.TrimSpace(cfg.DefaultProvider))
+	if def == "" {
+		def = strings.ToLower(strings.TrimSpace(cfg.Provider))
+	}
+	if def == "" {
+		def = "stub"
+	}
+	return newRunnerRegistryHandler(cfg, map[string]provider.Provider{def: prov})
+}
+
+func newRunnerRegistryHandler(cfg config, providers map[string]provider.Provider) (http.Handler, error) {
+	if len(cfg.SharedSecret) < runnerwire.MinSecretBytes {
+		return nil, fmt.Errorf("shared secret must be at least %d bytes", runnerwire.MinSecretBytes)
+	}
+	if len(providers) == 0 {
+		return nil, errors.New("at least one provider is required")
+	}
 	if cfg.MaxConcurrentStreams < 0 {
 		return nil, errors.New("max concurrent streams cannot be negative")
+	}
+
+	normalized := make(map[string]provider.Provider, len(providers))
+	for k, v := range providers {
+		if v == nil {
+			return nil, fmt.Errorf("provider %q is nil", k)
+		}
+		normalized[strings.ToLower(strings.TrimSpace(k))] = v
+	}
+
+	def := strings.ToLower(strings.TrimSpace(cfg.DefaultProvider))
+	if def == "" {
+		def = strings.ToLower(strings.TrimSpace(cfg.Provider))
+	}
+	if def == "" && len(normalized) == 1 {
+		for k := range normalized {
+			def = k
+		}
+	}
+	if _, ok := normalized[def]; !ok {
+		return nil, fmt.Errorf("default provider %q is not registered", def)
+	}
+
+	var enabled []string
+	if len(cfg.EnabledProviders) > 0 {
+		enabled = make([]string, 0, len(cfg.EnabledProviders))
+		for _, p := range cfg.EnabledProviders {
+			name := strings.ToLower(strings.TrimSpace(p))
+			if _, ok := normalized[name]; !ok {
+				return nil, fmt.Errorf("enabled provider %q is not registered", name)
+			}
+			enabled = append(enabled, name)
+		}
+	} else {
+		enabled = make([]string, 0, len(normalized))
+		for k := range normalized {
+			enabled = append(enabled, k)
+		}
+		sort.Strings(enabled)
 	}
 
 	var sem chan struct{}
@@ -240,13 +331,16 @@ func newRunnerHandler(cfg config, prov provider.Provider) (http.Handler, error) 
 	}
 
 	s := &runnerServer{
-		provider:     prov,
-		secretDigest: sha256.Sum256([]byte(cfg.SharedSecret)),
-		sem:          sem,
+		providers:       normalized,
+		defaultProvider: def,
+		enabled:         enabled,
+		secretDigest:    sha256.Sum256([]byte(cfg.SharedSecret)),
+		sem:             sem,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+runnerwire.HealthPath, s.handleHealthz)
+	mux.HandleFunc("GET "+runnerwire.ProvidersPath, s.handleProviders)
 	mux.HandleFunc("POST "+runnerwire.StreamPath, s.handleStream)
 	mux.HandleFunc("GET "+runnerwire.ModelsPath, s.handleModels)
 	mux.HandleFunc("GET "+runnerwire.HistoryPath, s.handleHistoryList)
@@ -281,6 +375,36 @@ func (s *runnerServer) requireAuth(next http.Handler) http.Handler {
 
 func (s *runnerServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *runnerServer) resolveProvider(requested string) (provider.Provider, bool) {
+	name := strings.ToLower(strings.TrimSpace(requested))
+	if name == "" {
+		name = s.defaultProvider
+	}
+	prov, ok := s.providers[name]
+	return prov, ok && prov != nil
+}
+
+func (s *runnerServer) historyProvider() (historyReader, bool) {
+	if p, ok := s.providers["codex"]; ok && p != nil {
+		if hr, ok := p.(historyReader); ok {
+			return hr, true
+		}
+	}
+	if p, ok := s.providers[s.defaultProvider]; ok && p != nil {
+		if hr, ok := p.(historyReader); ok {
+			return hr, true
+		}
+	}
+	return nil, false
+}
+
+func (s *runnerServer) handleProviders(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, runnerwire.ProvidersResponse{
+		DefaultProvider: s.defaultProvider,
+		Providers:       append([]string(nil), s.enabled...),
+	})
 }
 
 func (s *runnerServer) handleStream(w http.ResponseWriter, r *http.Request) {
@@ -323,6 +447,12 @@ func (s *runnerServer) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	prov, ok := s.resolveProvider(req.Provider)
+	if !ok {
+		writeJSONError(w, http.StatusBadRequest, "unsupported provider")
+		return
+	}
+
 	if s.sem != nil {
 		select {
 		case s.sem <- struct{}{}:
@@ -346,7 +476,7 @@ func (s *runnerServer) handleStream(w http.ResponseWriter, r *http.Request) {
 		Ephemeral:          req.Ephemeral,
 	}
 
-	events, err := s.provider.Stream(ctx, provReq)
+	events, err := prov.Stream(ctx, provReq)
 	if err != nil {
 		slog.Error("provider stream failed to start", "error", err)
 		writeJSONError(w, http.StatusBadGateway, publicStreamError)
@@ -445,7 +575,12 @@ func (s *runnerServer) handleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *runnerServer) handleModels(w http.ResponseWriter, r *http.Request) {
-	lister, ok := s.provider.(modelLister)
+	prov, ok := s.resolveProvider(r.URL.Query().Get("provider"))
+	if !ok {
+		writeJSONError(w, http.StatusBadRequest, "unsupported provider")
+		return
+	}
+	lister, ok := prov.(modelLister)
 	if !ok {
 		writeJSON(w, http.StatusOK, []provider.Model{})
 		return
@@ -467,7 +602,7 @@ func (s *runnerServer) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *runnerServer) handleHistoryList(w http.ResponseWriter, r *http.Request) {
-	hr, ok := s.provider.(historyReader)
+	hr, ok := s.historyProvider()
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "history is not supported")
 		return
@@ -489,7 +624,7 @@ func (s *runnerServer) handleHistoryList(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *runnerServer) handleHistoryTurns(w http.ResponseWriter, r *http.Request) {
-	hr, ok := s.provider.(historyReader)
+	hr, ok := s.historyProvider()
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "history is not supported")
 		return

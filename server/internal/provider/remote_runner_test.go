@@ -557,3 +557,75 @@ func TestRemoteRunnerContextDeadlineCancellationOnGet(t *testing.T) {
 		t.Fatalf("expected context.DeadlineExceeded and nil slice, got (%#v, %v)", models, err)
 	}
 }
+
+func TestRemoteRunnerForProviderAndListProviders(t *testing.T) {
+	var gotStreamBody []byte
+	var gotModelsPath, gotModelsQuery string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+testRunnerSecret {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/base" + runnerwire.StreamPath:
+			var err error
+			gotStreamBody, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read stream body: %v", err)
+				return
+			}
+			w.Header().Set("Content-Type", runnerwire.StreamType)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"type":"done","session_id":"s1"}`+"\n")
+		case "/base" + runnerwire.ModelsPath:
+			gotModelsPath = r.URL.Path
+			gotModelsQuery = r.URL.RawQuery
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]Model{{ID: "claude-sonnet", Name: "Claude Sonnet", IsDefault: true}})
+		case "/base" + runnerwire.ProvidersPath:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(runnerwire.ProvidersResponse{
+				DefaultProvider: "codex",
+				Providers:       []string{"codex", "claude"},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	base, err := NewRemoteRunnerProvider(srv.URL+"/base", testRunnerSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := base.ForProvider("claude")
+
+	ch, err := bound.Stream(context.Background(), Request{UserID: "u1", Prompt: "hi", Model: "claude-sonnet"})
+	if err != nil {
+		t.Fatalf("Stream error: %v", err)
+	}
+	for range ch {
+	}
+
+	var wireReq runnerwire.Request
+	if err := json.Unmarshal(gotStreamBody, &wireReq); err != nil {
+		t.Fatalf("unmarshal stream request: %v", err)
+	}
+	if wireReq.Provider != "claude" {
+		t.Fatalf("expected wire provider claude, got %q", wireReq.Provider)
+	}
+
+	models, err := bound.ListModels(context.Background())
+	if err != nil || len(models) != 1 || models[0].ID != "claude-sonnet" {
+		t.Fatalf("bound ListModels = (%#v, %v)", models, err)
+	}
+	if gotModelsPath != "/base"+runnerwire.ModelsPath || gotModelsQuery != "provider=claude" {
+		t.Fatalf("models request = %s?%s", gotModelsPath, gotModelsQuery)
+	}
+
+	provs, err := base.ListProviders(context.Background())
+	if err != nil || provs.DefaultProvider != "codex" || !reflect.DeepEqual(provs.Providers, []string{"codex", "claude"}) {
+		t.Fatalf("ListProviders = (%+v, %v)", provs, err)
+	}
+}

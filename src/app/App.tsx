@@ -8,8 +8,10 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Hourglass, Image as ImageIcon, Laptop, Menu, PanelLeft, Paperclip, Share2, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
-import { demoPrompt, availableDevices, models, providerLabels, checkAccountStatus, logout, newChat, retryAnswer, retryHistory, sendPrompt, stopChat, updateChat, useChats } from './chatStore'
+import { demoPrompt, availableDevices, models, providerLabels, checkAccountStatus, logout, newChat, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, stopChat, switchChatProvider, updateChat, useChats } from './chatStore'
 import type { Chat, Turn } from './chatStore'
+import type { Provider, ServerProvider } from '../protocol/types'
+import { fallbackProviders } from '../transport/RemoteTransport'
 import { EnvironmentPopover, ModelPopover } from './ComposerPopovers'
 import type { ProviderOption } from './ProviderSelect'
 import { defaultReasoningForProvider, groupServerModels } from './modelCatalog'
@@ -84,13 +86,29 @@ function Transcript({ turn, chatId, writable, busy, retry, demo }: { turn: Turn;
 }
 
 function Conversation({ chat, share, billing }: { chat: Chat; share: () => void; billing: () => void }) {
-  const { workspace: w, remote, connected, serverModels, connectionError } = useChats()
-  const provider = models.find(m => m.id === chat.model)?.provider ?? (remote ? (remote.provider === 'stub' ? 'codex' : remote.provider) : 'claude')
+  const {
+    workspace: w,
+    remote,
+    connected,
+    serverProviders,
+    defaultServerProvider,
+    providersLoaded,
+    serverModelsByProvider,
+    connectionError,
+  } = useChats()
+  const demoProvider = models.find(m => m.id === chat.model)?.provider ?? 'claude'
+  const chatServerProvider: ServerProvider = chat.provider ?? defaultServerProvider ?? remote?.provider ?? 'stub'
+  const provider: Provider = remote
+    ? (chatServerProvider === 'stub' ? 'codex' : chatServerProvider)
+    : demoProvider
+  const serverModels = remote ? (serverModelsByProvider[chatServerProvider] ?? []) : []
+  const providerDisabled = !!remote && !chat.indexedCodex && providersLoaded && !serverProviders.some(p => p.id === chatServerProvider && p.available)
   const sampleBlocked = useAccountStore(s => !!blockReason(s.quotas.claude))
-  const reason = useAccountStore(s => remote ? undefined : blockReason(s.quotas[provider]))
+  const reason = useAccountStore(s => remote ? undefined : blockReason(s.quotas[demoProvider]))
   const devices = availableDevices(w!, chat.id)
-  const unavailableModel = !!remote && !chat.indexedCodex && chat.model !== 'default' && !serverModels.some(m => m.id === chat.model)
-  const blocked = !!reason || !!remote && (!connected || !chat.historyLoaded || unavailableModel)
+  const unavailableModel = !!remote && !chat.indexedCodex && !providerDisabled && chat.model !== 'default' && !serverModels.some(m => m.id === chat.model)
+  const blocked = !!reason || !!remote && (!connected || !chat.historyLoaded || providerDisabled || unavailableModel)
+  const canChangeProvider = !remote || (chat.access === 'owner' && !chat.indexedCodex)
   const scroll = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
   const input = useRef<HTMLTextAreaElement>(null)
@@ -154,10 +172,22 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
     ['claude', providerLabels.claude],
     ['paid_api', providerLabels.paid_api],
   ] as const
+  const activeServerProviders = remote
+    ? (serverProviders.length ? serverProviders : fallbackProviders(remote.provider).providers)
+    : []
+  const hasCurrentServerProvider = activeServerProviders.some(p => p.id === chatServerProvider)
   const providerOptions: ProviderOption[] = remote
     ? [
-        ...(remote.provider === 'stub' ? [{ id: 'stub', label: 'StubProvider', available: true }] : []),
-        ...providerEntries.map(([id, label]) => ({ id, label, available: id === remote.provider })),
+        ...activeServerProviders.map(p => ({
+          id: p.id,
+          label: p.id === 'stub' ? 'StubProvider' : (providerLabels[p.id] ?? p.id),
+          available: p.available,
+        })),
+        ...(!hasCurrentServerProvider ? [{
+          id: chatServerProvider,
+          label: chatServerProvider === 'stub' ? 'StubProvider' : (providerLabels[chatServerProvider] ?? chatServerProvider),
+          available: false,
+        }] : []),
       ]
     : providerEntries.map(([id, label]) => ({ id, label, available: models.some(m => m.provider === id) }))
 
@@ -190,6 +220,7 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
     : undefined
   const envTriggerLabel = chat.target.mode === 'mcp' ? 'Управление ПК' : 'Чат'
 
+  const chatProviderLabel = chatServerProvider === 'stub' ? 'StubProvider' : (providerLabels[chatServerProvider] ?? chatServerProvider)
   const statusText = pending
     ? 'Ожидается разрешение'
     : running
@@ -202,10 +233,12 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
             ? 'Подключение к серверу…'
             : remote && !chat.historyLoaded
               ? 'Ожидание истории…'
-              : unavailableModel
-                ? 'Выберите доступную модель'
-                : 'Готов к сообщению'
-  const statusTone = (reason || connectionError || unavailableModel)
+              : providerDisabled
+                ? `Провайдер ${chatProviderLabel} недоступен — отправка отключена`
+                : unavailableModel
+                  ? 'Выберите доступную модель'
+                  : 'Готов к сообщению'
+  const statusTone = (reason || connectionError || providerDisabled || unavailableModel)
     ? 'is-error'
     : (pending || running || (remote && (!connected || !chat.historyLoaded)))
       ? 'is-busy'
@@ -249,27 +282,33 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
     </div>
     <footer className="composer-wrap"><div className="composer-inner">{editable ? <>
       {reason && !running && <LimitActions key={provider} w={w!} provider={provider} reason={reason} switchCodex={() => updateChat(chat.id,c => ({ ...c, model: 'codex' }))} billing={billing}/>}
+      {providerDisabled && !running && <p className="notice" role="status">Провайдер {chatProviderLabel} недоступен на сервере. {canChangeProvider ? 'Выберите другой провайдер, чтобы продолжить чат.' : 'Отправка сообщений отключена.'}</p>}
       <div className="composer" ref={composerRef}>
         {openMenu === 'model' && (
           <ModelPopover
             remoteMode={!!remote}
-            provider={remote ? remote.provider : provider}
+            provider={remote ? chatServerProvider : provider}
             providerOptions={providerOptions}
             model={chat.model}
             reasoning={chat.reasoning}
             unavailableModel={unavailableModel}
             disabled={locked}
+            canChangeProvider={canChangeProvider}
+            providerDisabled={providerDisabled}
             demoModelGroups={demoModelGroups}
             activeDemoGroup={activeDemoGroup}
             hasDemoVariantReasoning={hasDemoVariantReasoning}
             demoReasoningOptions={demoReasoningOptions}
             onSelectProvider={nextProvider => {
-              if (remote) return
+              if (remote) {
+                void switchChatProvider(chat.id, nextProvider as ServerProvider)
+                return
+              }
               const first = models.find(m => m.provider === nextProvider)
               if (first) updateChat(chat.id, c => ({ ...c, model: first.id, reasoning: undefined }))
             }}
-            onSelectModel={model => updateChat(chat.id, c => ({ ...c, model }))}
-            onSelectReasoning={nextReasoning => updateChat(chat.id, c => ({ ...c, reasoning: nextReasoning || undefined }))}
+            onSelectModel={model => selectChatModel(chat.id, model)}
+            onSelectReasoning={nextReasoning => selectChatReasoning(chat.id, nextReasoning)}
           />
         )}
         {openMenu === 'env' && (

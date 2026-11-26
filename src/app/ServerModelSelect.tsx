@@ -1,9 +1,11 @@
 import { RefreshCw } from 'lucide-react'
+import type { ServerProvider } from '../protocol/types'
 import { refreshServerModels, useChats } from './chatStore'
 import { defaultReasoningForProvider, groupServerModels, pickVariantForGroup } from './modelCatalog'
 import { SelectMenu } from './SelectMenu'
 
-export function ServerModelSelect({ model, reasoning, unavailable, disabled, placement = 'auto', onChangeModel, onChangeReasoning }: {
+export function ServerModelSelect({ provider, model, reasoning, unavailable, disabled, placement = 'auto', onChangeModel, onChangeReasoning }: {
+  provider?: ServerProvider
   model: string
   reasoning?: string | undefined
   unavailable: boolean
@@ -12,17 +14,21 @@ export function ServerModelSelect({ model, reasoning, unavailable, disabled, pla
   onChangeModel: (id: string) => void
   onChangeReasoning: (reasoning: string) => void
 }) {
-  const { remote, serverModels, modelsLoading, modelsError } = useChats()
+  const { remote, serverModelsByProvider, modelsLoadingByProvider, modelsErrorByProvider } = useChats()
+  const effectiveProvider: ServerProvider = provider ?? remote?.provider ?? 'stub'
+  const serverModels = serverModelsByProvider[effectiveProvider] ?? []
+  const modelsLoading = Boolean(modelsLoadingByProvider[effectiveProvider])
+  const modelsError = modelsErrorByProvider[effectiveProvider] ?? ''
   const groups = groupServerModels(serverModels)
   const activeGroup = model === 'default'
     ? undefined
     : groups.find(g => g.variants.some(v => v.id === model))
   const currentVariant = activeGroup?.variants.find(v => v.id === model)
   const currentServerModel = serverModels.find(m => m.id === model)
-  const nonVariantEfforts = activeGroup && !activeGroup.hasVariantReasoning && remote
-    ? defaultReasoningForProvider(remote.provider, currentServerModel)
-    : model === 'default' && remote?.provider === 'codex'
-      ? defaultReasoningForProvider('codex')
+  const nonVariantEfforts = activeGroup && !activeGroup.hasVariantReasoning
+    ? defaultReasoningForProvider(effectiveProvider, currentServerModel)
+    : model === 'default' && (effectiveProvider === 'codex' || effectiveProvider === 'claude')
+      ? defaultReasoningForProvider(effectiveProvider)
       : []
 
   const modelValue = model === 'default'
@@ -81,8 +87,8 @@ export function ServerModelSelect({ model, reasoning, unavailable, disabled, pla
         />
       )}
     </div>
-    {(remote?.provider === 'codex' || remote?.provider === 'antigravity') && <button className="icon-btn models-refresh" type="button" disabled={modelsLoading}
-      onClick={() => void refreshServerModels()} aria-label="Обновить список моделей" title="Обновить список моделей">
+    {effectiveProvider !== 'stub' && <button className="icon-btn models-refresh" type="button" disabled={modelsLoading}
+      onClick={() => void refreshServerModels(effectiveProvider)} aria-label="Обновить список моделей" title="Обновить список моделей">
       <RefreshCw size={13}/>
     </button>}
     {(modelsLoading || modelsError || unavailable) && <small className="models-status" role="status">

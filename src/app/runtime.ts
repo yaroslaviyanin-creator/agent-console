@@ -2,7 +2,7 @@ import type { TransportAdapter } from '../protocol/types'
 import { MockTransport } from '../transport/MockTransport'
 
 export type ConnectionMode = 'demo' | 'server'
-export const defaultServerAddress = 'http://127.0.0.1:8080'
+export const defaultServerAddress = 'https://macbook-pro.tail2aa739.ts.net'
 const storageKey = 'agent-console.connection'
 interface Connection {
   mode: ConnectionMode

@@ -16,40 +16,150 @@ type Config struct {
 	Addr                 string
 	DBPath               string
 	Provider             string
+	EnabledProviders     []string
+	DefaultProvider      string
+	MemoryProvider       string
 	RunnerURL            string
 	RunnerSharedSecret   string
 	CORSOrigin           string
 	TrustProxyHeaders    bool
 	MaxConcurrentStreams int
 	CodexHistoryUsername string
-	MemoryAutoUpdate     bool
-	MemoryModel          string
-	MemoryCheckInterval  time.Duration
-	MemoryMinNewMessages int
+	MemoryAutoUpdate       bool
+	MemoryModel            string
+	MemoryCheckInterval    time.Duration
+	MemoryMinNewMessages   int
+	TelegramBotToken       string
+	TelegramInitDataMaxAge time.Duration
+}
+
+type ProviderConfig struct {
+	EnabledProviders []string
+	DefaultProvider  string
+	MemoryProvider   string
+}
+
+// IsCanonicalProvider reports whether name is a supported backend provider ID.
+func IsCanonicalProvider(name string) bool {
+	switch name {
+	case "antigravity", "codex", "claude", "stub":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateProviderName(name, source string) error {
+	if name == "paid_api" {
+		return fmt.Errorf("provider %q is not implemented yet", name)
+	}
+	if !IsCanonicalProvider(name) {
+		return fmt.Errorf("%s must use antigravity, codex, claude or stub (got %q)", source, name)
+	}
+	return nil
+}
+
+// ParseProviderConfig parses ENABLED_PROVIDERS (with legacy PROVIDER fallback),
+// DEFAULT_PROVIDER, and MEMORY_PROVIDER without loading .env files.
+func ParseProviderConfig(lookup func(string) (string, bool)) (ProviderConfig, error) {
+	get := func(key string) string {
+		if lookup == nil {
+			return ""
+		}
+		v, _ := lookup(key)
+		return strings.TrimSpace(v)
+	}
+
+	var enabled []string
+	seen := make(map[string]bool)
+
+	if rawEnabled := get("ENABLED_PROVIDERS"); rawEnabled != "" {
+		for _, part := range strings.Split(rawEnabled, ",") {
+			name := strings.ToLower(strings.TrimSpace(part))
+			if name == "" {
+				return ProviderConfig{}, errors.New("ENABLED_PROVIDERS must not contain empty entries")
+			}
+			if err := validateProviderName(name, "ENABLED_PROVIDERS"); err != nil {
+				return ProviderConfig{}, err
+			}
+			if seen[name] {
+				return ProviderConfig{}, fmt.Errorf("duplicate provider %q in ENABLED_PROVIDERS", name)
+			}
+			seen[name] = true
+			enabled = append(enabled, name)
+		}
+	} else {
+		legacy := strings.ToLower(get("PROVIDER"))
+		if legacy == "" {
+			legacy = "stub"
+		}
+		if err := validateProviderName(legacy, "PROVIDER"); err != nil {
+			return ProviderConfig{}, err
+		}
+		seen[legacy] = true
+		enabled = []string{legacy}
+	}
+
+	def := strings.ToLower(get("DEFAULT_PROVIDER"))
+	if def == "" {
+		def = enabled[0]
+	} else {
+		if err := validateProviderName(def, "DEFAULT_PROVIDER"); err != nil {
+			return ProviderConfig{}, err
+		}
+		if !seen[def] {
+			return ProviderConfig{}, fmt.Errorf("DEFAULT_PROVIDER %q must be enabled", def)
+		}
+	}
+
+	mem := strings.ToLower(get("MEMORY_PROVIDER"))
+	if mem == "" {
+		mem = def
+	} else {
+		if err := validateProviderName(mem, "MEMORY_PROVIDER"); err != nil {
+			return ProviderConfig{}, err
+		}
+		if !seen[mem] {
+			return ProviderConfig{}, fmt.Errorf("MEMORY_PROVIDER %q must be enabled", mem)
+		}
+	}
+
+	return ProviderConfig{
+		EnabledProviders: enabled,
+		DefaultProvider:  def,
+		MemoryProvider:   mem,
+	}, nil
 }
 
 func Load() (Config, error) {
 	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return Config{}, fmt.Errorf("load .env: %w", err)
 	}
+	provCfg, err := ParseProviderConfig(os.LookupEnv)
+	if err != nil {
+		return Config{}, err
+	}
+	hasCLI := false
+	for _, p := range provCfg.EnabledProviders {
+		if p != "stub" {
+			hasCLI = true
+			break
+		}
+	}
+	if hasCLI && !isRunningInDocker() && !isEnvTrue("ALLOW_HOST_CLI_EXECUTION") {
+		return Config{}, errors.New("refusing to run CLI provider outside Docker; use docker compose")
+	}
 	cfg := Config{
 		Addr:                 value("SERVER_ADDR", ":8080"),
 		DBPath:               value("DB_PATH", "./data/app.db"),
-		Provider:             value("PROVIDER", "stub"),
+		Provider:             provCfg.DefaultProvider,
+		EnabledProviders:     provCfg.EnabledProviders,
+		DefaultProvider:      provCfg.DefaultProvider,
+		MemoryProvider:       provCfg.MemoryProvider,
 		RunnerURL:            strings.TrimSpace(os.Getenv("RUNNER_URL")),
 		RunnerSharedSecret:   os.Getenv("RUNNER_SHARED_SECRET"),
 		CORSOrigin:           strings.TrimSpace(value("CORS_ORIGIN", "*")),
 		CodexHistoryUsername: strings.TrimSpace(os.Getenv("CODEX_HISTORY_USERNAME")),
-	}
-	if cfg.Provider != "stub" && !isRunningInDocker() && !isEnvTrue("ALLOW_HOST_CLI_EXECUTION") {
-		return Config{}, errors.New("refusing to run CLI provider outside Docker; use docker compose")
-	}
-	switch cfg.Provider {
-	case "stub", "codex", "antigravity":
-	case "claude", "paid_api":
-		return Config{}, fmt.Errorf("provider %q is not implemented yet", cfg.Provider)
-	default:
-		return Config{}, errors.New("PROVIDER must be antigravity, codex or stub")
 	}
 	if cfg.CORSOrigin != "*" {
 		for _, origin := range strings.Split(cfg.CORSOrigin, ",") {
@@ -84,6 +194,11 @@ func Load() (Config, error) {
 	cfg.MemoryMinNewMessages, err = strconv.Atoi(value("MEMORY_MIN_NEW_MESSAGES", "6"))
 	if err != nil || cfg.MemoryMinNewMessages < 2 {
 		return Config{}, errors.New("MEMORY_MIN_NEW_MESSAGES must be an integer >= 2")
+	}
+	cfg.TelegramBotToken = strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
+	cfg.TelegramInitDataMaxAge, err = time.ParseDuration(value("TELEGRAM_INIT_DATA_MAX_AGE", "1h"))
+	if err != nil || cfg.TelegramInitDataMaxAge <= 0 {
+		return Config{}, errors.New("TELEGRAM_INIT_DATA_MAX_AGE must be a positive duration")
 	}
 	return cfg, nil
 }

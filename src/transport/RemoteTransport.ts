@@ -1,6 +1,6 @@
 import type {
-  AccountingAdapter, AdminChat, AdminUser, ChatAccess, ServerAdminAdapter, IndexedCodexChat, LoginRequest, RunEvent, RunRequest, ServerChat, ServerError, ServerHealth,
-  ServerDevice, ServerDirectoryUser, ServerLoginResponse, ServerMessage, ServerModel, ServerQuota, ServerSession, TransportAdapter, UserProfile, UserProfilePatch, Workspace, WorkspaceAdapter,
+  AccountingAdapter, AdminChat, AdminUser, ChatAccess, ServerAdminAdapter, IndexedCodexChat, LoginRequest, RunEvent, RunRequest, ServerChat, ServerCreateChatRequest, ServerError, ServerHealth,
+  ServerDevice, ServerDirectoryUser, ServerLoginResponse, ServerMessage, ServerModel, ServerProvider, ServerProviderInfo, ServerProvidersResponse, ServerQuota, ServerSession, TransportAdapter, UserProfile, UserProfilePatch, Workspace, WorkspaceAdapter,
 } from '../protocol/types'
 
 type Change =
@@ -26,6 +26,19 @@ export function normalizeServerAddress(address: string) {
     throw Error('Укажите HTTP(S)-адрес сервера без пути, логина или пароля.')
   }
   return url.origin
+}
+
+const KNOWN_SERVER_PROVIDERS: readonly ServerProvider[] = ['antigravity', 'codex', 'claude', 'paid_api']
+
+export function fallbackProviders(defaultProvider: ServerProvider): ServerProvidersResponse {
+  const providers: ServerProviderInfo[] = KNOWN_SERVER_PROVIDERS.map(id => ({
+    id,
+    available: id === defaultProvider,
+  }))
+  if (defaultProvider === 'stub') {
+    providers.push({ id: 'stub', available: true })
+  }
+  return { defaultProvider, providers }
 }
 
 function unavailable(): never { throw Error('Эта функция доступна в демо-режиме.') }
@@ -95,12 +108,13 @@ export class RemoteTransport implements TransportAdapter {
   readonly workspace: WorkspaceAdapter = {
     login: request => this.authenticate(request, 'login'),
     logout: () => this.logoutRequest ??= this.logout(),
-    createChat: (sourceId) => this.updateWorkspace(async () => {
-      const path = sourceId ? '/api/chats/' + encodeURIComponent(sourceId) + '/fork' : '/api/chats'
-      const chat = await this.request<ServerChat>(path, sourceId ? undefined : {}, undefined, 'POST')
-      this.chatList = [chat, ...this.chatList]
-      return { id: chat.id, workspace: this.snapshot() }
-    }),
+    createChat: (sourceId) => sourceId
+      ? this.updateWorkspace(async () => {
+          const chat = await this.request<ServerChat>('/api/chats/' + encodeURIComponent(sourceId) + '/fork', undefined, undefined, 'POST')
+          this.chatList = [chat, ...this.chatList]
+          return { id: chat.id, workspace: this.snapshot() }
+        })
+      : this.createChat(),
     revokeDevice: id => this.updateWorkspace(async () => {
       const isCurrent = this.snapshot().deviceId === id
       await this.request('/api/devices/' + encodeURIComponent(id), undefined, undefined, 'DELETE')
@@ -167,7 +181,8 @@ export class RemoteTransport implements TransportAdapter {
       const detail: Partial<ServerError> = await response.json().catch(() => ({})) ?? {}
       const message = path === '/api/auth/login' && response.status === 401
         ? 'Неверный логин или пароль.'
-        : response.status === 429 || detail.code === 'rate_limited' ? 'Слишком много попыток входа. Попробуйте позже.'
+        : response.status === 429 || detail.code === 'rate_limited'
+          ? (path.startsWith('/api/auth/') ? 'Слишком много попыток входа. Попробуйте позже.' : 'Слишком много запросов. Попробуйте позже.')
         : response.status === 401 ? 'Сессия закончилась. Войдите снова.'
         : detail.code === 'account_pending' ? 'Аккаунт ожидает выдачи доступа.'
         : detail.code === 'invalid_registration' ? 'Проверьте логин, пароль и название устройства.'
@@ -262,8 +277,32 @@ export class RemoteTransport implements TransportAdapter {
     return this.snapshot()
   }
 
-  models() {
-    return this.request<ServerModel[]>('/api/models')
+  createChat(options: ServerCreateChatRequest = {}) {
+    return this.updateWorkspace(async () => {
+      const body: ServerCreateChatRequest = {}
+      if (options.provider) body.provider = options.provider
+      if (options.model) body.model = options.model
+      if (options.title) body.title = options.title
+      const chat = await this.request<ServerChat>('/api/chats', body, undefined, 'POST')
+      this.chatList = [chat, ...this.chatList]
+      return { id: chat.id, workspace: this.snapshot() }
+    })
+  }
+
+  async providers(signal?: AbortSignal): Promise<ServerProvidersResponse> {
+    try {
+      return await this.request<ServerProvidersResponse>('/api/providers', undefined, signal)
+    } catch (error) {
+      if (error instanceof RemoteError && error.status === 404) {
+        return fallbackProviders(this.provider)
+      }
+      throw error
+    }
+  }
+
+  models(provider?: ServerProvider, signal?: AbortSignal) {
+    const query = provider ? '?provider=' + encodeURIComponent(provider) : ''
+    return this.request<ServerModel[]>('/api/models' + query, undefined, signal)
   }
 
   async refreshCodexIndex() {
@@ -435,8 +474,16 @@ export class RemoteTransport implements TransportAdapter {
         this.responses.set(key, controller)
         try {
           // SQLite history is authoritative in server mode.
-          const { chatId, messageId, model, target, prompt, reasoning } = request
-          socket.send(JSON.stringify({ chatId, messageId, model, target, prompt, ...(reasoning ? { reasoning } : {}) }))
+          const { chatId, messageId, provider, model, target, prompt, reasoning } = request
+          socket.send(JSON.stringify({
+            chatId,
+            messageId,
+            ...(provider ? { provider } : {}),
+            model,
+            target,
+            prompt,
+            ...(reasoning ? { reasoning } : {}),
+          }))
         } catch (error) {
           this.responses.delete(key)
           throw error

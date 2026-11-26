@@ -108,10 +108,10 @@ func TestLoadConfig(t *testing.T) {
 			},
 		},
 		{
-			name: "unsupported claude provider",
+			name: "unsupported paid_api provider",
 			env: map[string]string{
 				"RUNNER_SHARED_SECRET": testSecret,
-				"PROVIDER":             "claude",
+				"PROVIDER":             "paid_api",
 			},
 		},
 		{
@@ -119,6 +119,21 @@ func TestLoadConfig(t *testing.T) {
 			env: map[string]string{
 				"RUNNER_SHARED_SECRET": testSecret,
 				"PROVIDER":             "custom",
+			},
+		},
+		{
+			name: "duplicate enabled providers",
+			env: map[string]string{
+				"RUNNER_SHARED_SECRET": testSecret,
+				"ENABLED_PROVIDERS":    "codex,codex",
+			},
+		},
+		{
+			name: "default provider not enabled",
+			env: map[string]string{
+				"RUNNER_SHARED_SECRET": testSecret,
+				"ENABLED_PROVIDERS":    "codex,claude",
+				"DEFAULT_PROVIDER":     "antigravity",
 			},
 		},
 		{
@@ -135,6 +150,19 @@ func TestLoadConfig(t *testing.T) {
 				t.Fatalf("expected config error for %s", tc.name)
 			}
 		})
+	}
+
+	multiCfg, err := loadConfig(envMap(map[string]string{
+		"RUNNER_SHARED_SECRET": testSecret,
+		"ENABLED_PROVIDERS":    "antigravity,claude,codex",
+		"DEFAULT_PROVIDER":     "claude",
+		"CLAUDE_BIN":           "/usr/local/bin/claude-custom",
+	}))
+	if err != nil {
+		t.Fatalf("multi loadConfig failed: %v", err)
+	}
+	if multiCfg.DefaultProvider != "claude" || multiCfg.Provider != "claude" || multiCfg.ClaudeBin != "/usr/local/bin/claude-custom" {
+		t.Fatalf("unexpected multi config: %+v", multiCfg)
 	}
 }
 
@@ -181,6 +209,7 @@ func TestAuthAllV1Routes(t *testing.T) {
 		path   string
 		body   string
 	}{
+		{http.MethodGet, runnerwire.ProvidersPath, ""},
 		{http.MethodPost, runnerwire.StreamPath, `{"user_id":"u1","prompt":"hi","mcp_endpoint":"http://bad"}`},
 		{http.MethodGet, runnerwire.ModelsPath, ""},
 		{http.MethodGet, runnerwire.HistoryPath, ""},
@@ -256,7 +285,22 @@ func TestStreamValidationAndMCPRejection(t *testing.T) {
 		},
 		{
 			name:       "unknown json field",
+			body:       `{"user_id":"u1","prompt":"hello","unknown_field":"claude"}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "disabled provider",
 			body:       `{"user_id":"u1","prompt":"hello","provider":"claude"}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "paid_api provider rejected",
+			body:       `{"user_id":"u1","prompt":"hello","provider":"paid_api"}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "mcp_endpoint rejected before provider check",
+			body:       `{"user_id":"u1","prompt":"hello","provider":"paid_api","mcp_endpoint":"http://127.0.0.1:9000"}`,
 			wantStatus: http.StatusBadRequest,
 		},
 		{
@@ -859,4 +903,143 @@ func decodeNDJSON(t *testing.T, raw []byte) []runnerwire.Event {
 		t.Fatalf("scan NDJSON: %v", err)
 	}
 	return events
+}
+
+func TestMultiProviderRegistryRoutingModelsProvidersAndCodexHistory(t *testing.T) {
+	t.Parallel()
+
+	claudeMock := &mockModelsProvider{
+		mockStreamProvider: mockStreamProvider{
+			streamFn: func(ctx context.Context, req provider.Request) (<-chan provider.Event, error) {
+				out := make(chan provider.Event, 2)
+				out <- provider.Event{Type: provider.Text, Delta: "from-claude"}
+				out <- provider.Event{Type: provider.Done}
+				close(out)
+				return out, nil
+			},
+		},
+		modelsFn: func(ctx context.Context) ([]provider.Model, error) {
+			return []provider.Model{{ID: "claude-sonnet", Name: "Claude Sonnet", IsDefault: true}}, nil
+		},
+	}
+
+	codexMock := &mockFullProvider{
+		mockModelsProvider: mockModelsProvider{
+			mockStreamProvider: mockStreamProvider{
+				streamFn: func(ctx context.Context, req provider.Request) (<-chan provider.Event, error) {
+					out := make(chan provider.Event, 2)
+					out <- provider.Event{Type: provider.Text, Delta: "from-codex"}
+					out <- provider.Event{Type: provider.Done}
+					close(out)
+					return out, nil
+				},
+			},
+			modelsFn: func(ctx context.Context) ([]provider.Model, error) {
+				return []provider.Model{{ID: "gpt-5-codex", Name: "GPT-5 Codex", IsDefault: true}}, nil
+			},
+		},
+		listChatsFn: func(ctx context.Context) ([]provider.IndexedChat, error) {
+			return []provider.IndexedChat{{ID: "codex-1", Title: "Codex Chat"}}, nil
+		},
+		readTurnsFn: func(ctx context.Context, id string) ([]provider.IndexedTurn, error) {
+			return []provider.IndexedTurn{{ID: "t1", Prompt: "hi", Answer: "codex answer"}}, nil
+		},
+	}
+
+	cfg := config{
+		Addr:             ":0",
+		SharedSecret:     testSecret,
+		Provider:         "claude",
+		DefaultProvider:  "claude",
+		EnabledProviders: []string{"claude", "codex"},
+	}
+	handler, err := newRunnerRegistryHandler(cfg, map[string]provider.Provider{
+		"claude": claudeMock,
+		"codex":  codexMock,
+	})
+	if err != nil {
+		t.Fatalf("newRunnerRegistryHandler: %v", err)
+	}
+
+	// /v1/providers returns enabled providers and default
+	pReq := httptest.NewRequest(http.MethodGet, runnerwire.ProvidersPath, nil)
+	pReq.Header.Set("Authorization", "Bearer "+testSecret)
+	pRec := httptest.NewRecorder()
+	handler.ServeHTTP(pRec, pReq)
+	if pRec.Code != http.StatusOK {
+		t.Fatalf("providers status = %d: %s", pRec.Code, pRec.Body.String())
+	}
+	var pResp runnerwire.ProvidersResponse
+	if err := json.Unmarshal(pRec.Body.Bytes(), &pResp); err != nil {
+		t.Fatal(err)
+	}
+	if pResp.DefaultProvider != "claude" || len(pResp.Providers) != 2 || pResp.Providers[0] != "claude" || pResp.Providers[1] != "codex" {
+		t.Fatalf("unexpected /v1/providers response: %+v", pResp)
+	}
+
+	// /v1/models defaults to claude, ?provider=codex scopes to codex, unknown/disabled returns 400
+	for _, tc := range []struct {
+		query      string
+		wantStatus int
+		wantID     string
+	}{
+		{"", http.StatusOK, "claude-sonnet"},
+		{"?provider=codex", http.StatusOK, "gpt-5-codex"},
+		{"?provider=antigravity", http.StatusBadRequest, ""},
+		{"?provider=paid_api", http.StatusBadRequest, ""},
+	} {
+		req := httptest.NewRequest(http.MethodGet, runnerwire.ModelsPath+tc.query, nil)
+		req.Header.Set("Authorization", "Bearer "+testSecret)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != tc.wantStatus {
+			t.Fatalf("models%s status = %d, want %d (%s)", tc.query, rec.Code, tc.wantStatus, rec.Body.String())
+		}
+		if tc.wantStatus == http.StatusOK {
+			var models []provider.Model
+			if err := json.Unmarshal(rec.Body.Bytes(), &models); err != nil {
+				t.Fatal(err)
+			}
+			if len(models) != 1 || models[0].ID != tc.wantID {
+				t.Fatalf("models%s = %+v, want %s", tc.query, models, tc.wantID)
+			}
+		}
+	}
+
+	// /v1/stream defaults to claude when provider omitted, routes to codex when specified
+	for _, tc := range []struct {
+		body      string
+		wantDelta string
+	}{
+		{`{"user_id":"u1","prompt":"hi"}`, "from-claude"},
+		{`{"user_id":"u1","prompt":"hi","provider":"codex"}`, "from-codex"},
+	} {
+		req := httptest.NewRequest(http.MethodPost, runnerwire.StreamPath, strings.NewReader(tc.body))
+		req.Header.Set("Authorization", "Bearer "+testSecret)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("stream %s status = %d (%s)", tc.body, rec.Code, rec.Body.String())
+		}
+		events := decodeNDJSON(t, rec.Body.Bytes())
+		if len(events) != 2 || events[0].Delta != tc.wantDelta {
+			t.Fatalf("stream %s events = %+v, want delta %q", tc.body, events, tc.wantDelta)
+		}
+	}
+
+	// /v1/history still resolves codex even though default is claude
+	hReq := httptest.NewRequest(http.MethodGet, runnerwire.HistoryPath, nil)
+	hReq.Header.Set("Authorization", "Bearer "+testSecret)
+	hRec := httptest.NewRecorder()
+	handler.ServeHTTP(hRec, hReq)
+	if hRec.Code != http.StatusOK {
+		t.Fatalf("history status = %d: %s", hRec.Code, hRec.Body.String())
+	}
+	var chats []provider.IndexedChat
+	if err := json.Unmarshal(hRec.Body.Bytes(), &chats); err != nil {
+		t.Fatal(err)
+	}
+	if len(chats) != 1 || chats[0].ID != "codex-1" {
+		t.Fatalf("unexpected history chats: %+v", chats)
+	}
 }
