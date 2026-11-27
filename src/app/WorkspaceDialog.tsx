@@ -3,7 +3,7 @@ import { Check, ChevronRight, Copy, Laptop, LogOut, Monitor, Palette, Trash2, Up
 import type { ShareAccess, UserProfile, UserProfilePatch, Workspace } from '../protocol/types'
 import { getTelegramUserId } from '../platform/telegram'
 import type { RemoteTransport } from '../transport/RemoteTransport'
-import { ACCENT_PRESETS, type ThemePreference, useAppearance } from './appearanceStore'
+import { ACCENT_PRESETS, GRADIENT_PALETTES, type ThemePreference, useAppearance } from './appearanceStore'
 import { changeServerAddress, logout, refreshServerDevices, revokeDevice, setConnectionMode, setShare, updateSelfProfileMember, useChats } from './chatStore'
 import { ConnectionMode } from './ConnectionMode'
 import { SelectMenu } from './SelectMenu'
@@ -518,7 +518,18 @@ function ProfileSection({ w, remote }: { w: Workspace; remote: RemoteTransport |
 }
 
 function AppearanceSection() {
-  const { theme, accent, ambientGradient, setTheme, setAccent, setAmbientGradient } = useAppearance()
+  const {
+    theme,
+    accent,
+    ambientGradient,
+    gradientPalette,
+    gradientCustomColor,
+    setTheme,
+    setAccent,
+    setAmbientGradient,
+    setGradientPalette,
+    setGradientCustomColor,
+  } = useAppearance()
   const themeOptions: readonly { id: ThemePreference; label: string }[] = [
     { id: 'dark', label: 'Тёмная' },
     { id: 'light', label: 'Светлая' },
@@ -576,7 +587,7 @@ function AppearanceSection() {
         <label className="settings-row memory-toggle">
           <span className="settings-row-info">
             <strong>Анимированный градиент на фоне</strong>
-            <small>Мягкое свечение орбов позади стеклянных поверхностей</small>
+            <small>Мягкое свечение орбов при генерации ответа, статичное в покое</small>
           </span>
           <input
             type="checkbox"
@@ -586,6 +597,38 @@ function AppearanceSection() {
             onChange={e => setAmbientGradient(e.target.checked)}
           />
         </label>
+        <div className="settings-row palette-row">
+          <div className="settings-row-info">
+            <strong>Палитра градиента</strong>
+            <small>Готовые сочетания или свой оттенок для фоновых орбов</small>
+          </div>
+          <div className="palette-picker" role="group" aria-label="Палитра градиента">
+            {GRADIENT_PALETTES.map(preset => (
+              <button
+                key={preset.id}
+                type="button"
+                className={`palette-chip${gradientPalette === preset.id ? ' is-selected' : ''}`}
+                aria-pressed={gradientPalette === preset.id}
+                disabled={!ambientGradient}
+                onClick={() => setGradientPalette(preset.id)}
+              >
+                <span className="palette-dot" style={{ background: preset.swatch }} aria-hidden="true" />
+                <span>{preset.label}</span>
+              </button>
+            ))}
+            <label className={`palette-chip palette-custom${gradientPalette === 'custom' ? ' is-selected' : ''}`} title="Свой цвет">
+              <input
+                type="color"
+                value={gradientCustomColor}
+                disabled={!ambientGradient}
+                aria-label="Свой цвет градиента"
+                onChange={e => setGradientCustomColor(e.target.value)}
+              />
+              <span className="palette-dot" style={{ background: gradientCustomColor }} aria-hidden="true" />
+              <span>Свой</span>
+            </label>
+          </div>
+        </div>
       </div>
     </div>
   )

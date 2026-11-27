@@ -5,7 +5,7 @@ import { Incoming, LimitActions, Quotas, ServerQuotas } from './Quotas'
 import { AuthScene } from './AuthScene'
 import { WorkspaceDialog } from './WorkspaceDialog'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Hourglass, Laptop, Menu, PanelLeft, Paperclip, Share2, Square, Terminal } from 'lucide-react'
+import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Hourglass, Laptop, Menu, PanelLeft, PanelRight, Paperclip, Share2, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
 import { clearChatAttachmentError, demoPrompt, availableDevices, models, providerLabels, checkAccountStatus, logout, newChat, removeChatAttachment, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, stopChat, switchChatProvider, updateChat, uploadChatFiles, useChats } from './chatStore'
@@ -13,6 +13,8 @@ import type { Chat, Turn } from './chatStore'
 import type { Provider, ServerProvider } from '../protocol/types'
 import { CHAT_ATTACHMENT_ACCEPT, MAX_CHAT_ATTACHMENTS } from './attachments'
 import { DraftAttachmentsBar, TurnAttachments } from './AttachmentViews'
+import { ChatContextPanel, collectChatAttachments, extractChatLinks } from './ChatContextPanel'
+import { clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH, readSidebarWidth, saveSidebarWidth } from './sidebarWidth'
 import { fallbackProviders } from '../transport/RemoteTransport'
 import { EnvironmentPopover, ModelPopover } from './ComposerPopovers'
 import type { ProviderOption } from './ProviderSelect'
@@ -53,18 +55,25 @@ function Transcript({ turn, chatId, writable, busy, retry, demo }: { turn: Turn;
   const author = authorId === w.user.id ? 'Вы' : authorMember?.displayName?.trim() || authorMember?.name || 'Участник'
   const avatarName = authorMember?.displayName?.trim() || authorMember?.name || author
   const isSelf = authorId === w.user.id
+  const hasPrompt = Boolean(turn.prompt && turn.prompt.trim().length > 0)
   return <article className="turn">
-    {(turn.prompt || !!turn.attachments?.length) && (
+    {(hasPrompt || !!turn.attachments?.length) && (
       <div className={'user-turn-block' + (isSelf ? ' is-self' : '')}>
         <div className="person user-person">
           <UserAvatar name={avatarName} avatarData={authorMember?.avatarData} className="person-avatar" />
           <strong>{author}</strong>
           <time>{clock.format(turn.time)}</time>
         </div>
-        <div className="user-bubble">
-          {!!turn.attachments?.length && <TurnAttachments attachments={turn.attachments} remote={remote} />}
-          {turn.prompt && <div className="user-prompt">{turn.prompt}</div>}
-        </div>
+        {!!turn.attachments?.length && (
+          <div className="user-turn-attachments">
+            <TurnAttachments attachments={turn.attachments} remote={remote} />
+          </div>
+        )}
+        {hasPrompt && (
+          <div className="user-bubble">
+            <div className="user-prompt">{turn.prompt}</div>
+          </div>
+        )}
       </div>
     )}
     <div className="person agent"><span className="agent-avatar"><CodeXml size={15}/></span><strong>{turn.model}</strong>{turn.retryOf && <span className="retry-label">Повтор ответа</span>}<time>{clock.format(turn.time)}</time></div>
@@ -83,7 +92,19 @@ function Transcript({ turn, chatId, writable, busy, retry, demo }: { turn: Turn;
   </article>
 }
 
-function Conversation({ chat, share, billing }: { chat: Chat; share: () => void; billing: () => void }) {
+function Conversation({
+  chat,
+  share,
+  billing,
+  contextOpen,
+  onCloseContext,
+}: {
+  chat: Chat
+  share: () => void
+  billing: () => void
+  contextOpen: boolean
+  onCloseContext: () => void
+}) {
   const {
     workspace: w,
     remote,
@@ -249,39 +270,40 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
       ? 'is-busy'
       : 'is-ready'
 
-  return <div
-    className={`chat-drop-zone${draggingFiles ? ' is-dragging' : ''}`}
-    onDragEnter={e => {
-      if (!editable || !remote || chat.indexedCodex) return
-      if (Array.from(e.dataTransfer.types).includes('Files')) {
-        e.preventDefault()
-        dragDepthRef.current++
-        setDraggingFiles(true)
-      }
-    }}
-    onDragOver={e => {
-      if (!editable || !remote || chat.indexedCodex) return
-      if (Array.from(e.dataTransfer.types).includes('Files')) {
-        e.preventDefault()
-      }
-    }}
-    onDragLeave={e => {
-      if (!editable || !remote || chat.indexedCodex) return
-      if (Array.from(e.dataTransfer.types).includes('Files')) {
-        dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
-        if (dragDepthRef.current === 0) setDraggingFiles(false)
-      }
-    }}
-    onDrop={e => {
-      dragDepthRef.current = 0
-      setDraggingFiles(false)
-      if (!editable || !remote || chat.indexedCodex) return
-      if (e.dataTransfer.files?.length) {
-        e.preventDefault()
-        void uploadChatFiles(chat.id, e.dataTransfer.files)
-      }
-    }}
-  >
+  return <div className="chat-split">
+    <div
+      className={`chat-drop-zone${draggingFiles ? ' is-dragging' : ''}`}
+      onDragEnter={e => {
+        if (!editable || !remote || chat.indexedCodex) return
+        if (Array.from(e.dataTransfer.types).includes('Files')) {
+          e.preventDefault()
+          dragDepthRef.current++
+          setDraggingFiles(true)
+        }
+      }}
+      onDragOver={e => {
+        if (!editable || !remote || chat.indexedCodex) return
+        if (Array.from(e.dataTransfer.types).includes('Files')) {
+          e.preventDefault()
+        }
+      }}
+      onDragLeave={e => {
+        if (!editable || !remote || chat.indexedCodex) return
+        if (Array.from(e.dataTransfer.types).includes('Files')) {
+          dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+          if (dragDepthRef.current === 0) setDraggingFiles(false)
+        }
+      }}
+      onDrop={e => {
+        dragDepthRef.current = 0
+        setDraggingFiles(false)
+        if (!editable || !remote || chat.indexedCodex) return
+        if (e.dataTransfer.files?.length) {
+          e.preventDefault()
+          void uploadChatFiles(chat.id, e.dataTransfer.files)
+        }
+      }}
+    >
     <header className="chat-heading"><div className="heading-inner"><div className="heading-icon"><Terminal size={19}/></div><div className="heading-text"><h1 title={chat.title}>{chat.title}</h1><div className="heading-meta"><i/>{remote ? 'Сервер' : 'Демо-сессия'}<span>/</span><span>{chat.indexedCodex ? 'История Codex' : chat.access === 'owner' ? 'Личный чат' : 'Общий чат'}</span>{!editable && chat.model && <><span>/</span><span className="heading-model-tag">{chat.model}</span></>}</div></div>{!chat.indexedCodex && chat.access === 'owner' && <button className="share-action" onClick={share} aria-label="Поделиться"><Share2 size={15}/><span>Поделиться</span></button>}</div></header>
     <div className="history" ref={scroll} onScroll={() => { const el = scroll.current; if (el) follow.current = el.scrollHeight - el.clientHeight - el.scrollTop < 48 }}>
       <div className="thread">
@@ -454,11 +476,33 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
         </div>
       </div>
     </> : <div className="access-note">{chat.access === 'fork' ? <button onClick={() => newChat(chat)}><GitFork size={15}/>Ответвить к себе</button> : 'Этот чат доступен для чтения'}</div>}</div></footer>
+    </div>
+    {contextOpen && (
+      <>
+        <div className="context-backdrop" onClick={onCloseContext} aria-hidden="true" />
+        <aside className="chat-context-side" aria-label="Контекстная панель чата">
+          <ChatContextPanel
+            turns={chat.turns}
+            providerLabel={chatProviderLabel}
+            modelLabel={modelButtonName}
+            remote={remote}
+            canAttach={canAttach}
+            onAttachClick={() => fileInputRef.current?.click()}
+            onClose={onCloseContext}
+          />
+        </aside>
+      </>
+    )}
   </div>
 }
 export function App() {
   const workspace = useChats(s => s.workspace)
   const restoring = useChats(s => s.restoring)
+  const isBusy = useChats(s => {
+    if (!s.workspace) return false
+    const activeChat = s.chats.find(c => c.id === s.activeId)
+    return activeChat?.turns.at(-1)?.state === 'running'
+  })
   const [showAuthScene, setShowAuthScene] = useState(() => !workspace)
   const [skipSplash, setSkipSplash] = useState(false)
   const prevWorkspaceRef = useRef(workspace)
@@ -476,7 +520,7 @@ export function App() {
   }, [])
 
   return <>
-    <AmbientBackground dimmed={!!workspace && !showAuthScene}/>
+    <AmbientBackground dimmed={!!workspace && !showAuthScene} active={isBusy}/>
     {workspace && (workspace.user.role === 'pending' ? <PendingAccount/> : <Connected key={workspace.user.id}/>)}
     {(showAuthScene || !workspace) && (
       <AuthScene
@@ -538,6 +582,43 @@ function Connected() {
     else if (view === 'billing') setView('chat')
   })
   const [collapsed, setCollapsed] = useState(false)
+  const [sidebarWidth, setSidebarWidth] = useState(() => readSidebarWidth())
+  const [resizingSidebar, setResizingSidebar] = useState(false)
+  const [contextOpen, setContextOpen] = useState(false)
+
+  useEffect(() => {
+    if (!resizingSidebar) return
+    const prevCursor = document.body.style.cursor
+    const prevSelect = document.body.style.userSelect
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    return () => {
+      document.body.style.cursor = prevCursor
+      document.body.style.userSelect = prevSelect
+    }
+  }, [resizingSidebar])
+
+  const startSidebarResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (collapsed) return
+    e.preventDefault()
+    const startX = e.clientX
+    const startW = sidebarWidth
+    let latestW = startW
+    setResizingSidebar(true)
+    const onMove = (ev: PointerEvent) => {
+      latestW = clampSidebarWidth(startW + (ev.clientX - startX))
+      setSidebarWidth(latestW)
+    }
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      setResizingSidebar(false)
+      saveSidebarWidth(latestW)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }
+
   useEffect(() => {
     if (remote) return
     const unsubscribe = transport.subscribeAccount(useAccountStore.getState().receive)
@@ -547,15 +628,54 @@ function Connected() {
     }, 0)
     return () => { clearTimeout(timer); unsubscribe(); useAccountStore.setState({ quotas: {}, requests: [] }); stopChat(useChats.getState().activeId) }
   }, [remote])
-  return <div className={'workspace ' + (collapsed ? 'collapsed' : '')}>
+
+  const isEmptyNewChat = !!chat && chat.turns.length === 0 && chat.title === 'Новый чат'
+  const topbarTitle = view === 'billing' ? 'Биллинг API' : (chat && !isEmptyNewChat ? chat.title : '')
+  const contextBadgeCount = chat
+    ? collectChatAttachments(chat.turns).length + extractChatLinks(chat.turns).length
+    : 0
+
+  return <div
+    className={'workspace ' + (collapsed ? 'collapsed' : '') + (resizingSidebar ? ' is-resizing' : '')}
+    style={{ '--sidebar-width': `${sidebarWidth}px` } as React.CSSProperties}
+  >
     <aside className="desktop-side"><Sidebar openBilling={() => setView('billing')} openSettings={() => setPanel('devices')} close={() => setView('chat')}/></aside>
+    {!collapsed && (
+      <div
+        className="sidebar-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Изменить ширину боковой панели"
+        aria-valuemin={200}
+        aria-valuemax={420}
+        aria-valuenow={sidebarWidth}
+        onPointerDown={startSidebarResize}
+        onDoubleClick={() => { setSidebarWidth(DEFAULT_SIDEBAR_WIDTH); saveSidebarWidth(DEFAULT_SIDEBAR_WIDTH) }}
+      />
+    )}
     <dialog ref={drawer} onClose={() => setDrawerOpen(false)} className="drawer" aria-label="Список чатов" onClick={e => { if (e.target === drawer.current) drawer.current.close() }}><Sidebar openBilling={() => { drawer.current?.close(); setView('billing') }} openSettings={() => { drawer.current?.close(); setPanel('devices') }} close={() => { drawer.current?.close(); setView('chat') }}/></dialog>
     <main className="main"><div className="topbar" data-tauri-drag-region><button className="icon-btn desk-toggle" aria-label="Переключить боковую панель" onClick={() => setCollapsed(!collapsed)}><PanelLeft size={17}/></button><button className="icon-btn mobile" aria-label="Открыть список чатов" onClick={() => { drawer.current?.showModal(); setDrawerOpen(true) }}><Menu size={18}/></button>
-      <span className="crumb" data-tauri-drag-region>Рабочее пространство</span><ChevronRight className="crumb-arrow" size={13} aria-hidden="true"/><span className="topbar-section" data-tauri-drag-region>{view === 'billing' ? 'Биллинг API' : chat?.indexedCodex ? 'Чаты Codex' : (!chat || chat.access === 'owner') ? 'Мои чаты' : 'Доступные мне'}</span>{remote ? <ServerQuotas menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> : <Quotas userId={w.user.id} menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> }
-      {isAdmin && <button className="alt-action admin-entry" onClick={() => setPanel('admin')}>Админка</button>}</div>
+      {topbarTitle && <span className="topbar-title" title={topbarTitle} data-tauri-drag-region>{topbarTitle}</span>}
+      <div className="topbar-actions">
+        {remote ? <ServerQuotas menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> : <Quotas userId={w.user.id} menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> }
+        {isAdmin && <button className="alt-action admin-entry" onClick={() => setPanel('admin')}>Админка</button>}
+        {view === 'chat' && chat && (
+          <button
+            type="button"
+            className={`icon-btn context-toggle-btn${contextOpen ? ' is-open' : ''}`}
+            aria-label="Переключить контекстную панель"
+            aria-expanded={contextOpen}
+            title="Источники, ссылки и сводка по чату"
+            onClick={() => setContextOpen(v => !v)}
+          >
+            <PanelRight size={17} />
+            {contextBadgeCount > 0 && <span className="topbar-panel-badge">{contextBadgeCount}</span>}
+          </button>
+        )}
+      </div></div>
       {connectionError && <p className="notice connection-error" role="alert">{connectionError}</p>}
       {!remote && incoming && <Incoming key={incoming.requestId} request={incoming}/>}
-      {view === 'billing' ? <Billing back={() => setView('chat')}/> : chat ? <Conversation key={chat.id} chat={chat} billing={() => setView('billing')} share={() => setPanel('share')}/> : <div className="empty empty-hero thread"><div className="empty-squircle" aria-hidden="true"><CodeXml size={26} strokeWidth={2.1}/></div><h2>Пока нет чатов</h2><p>Создайте первый диалог, чтобы начать работу с агентом.</p><button onClick={() => void newChat()}>Создать чат</button></div>}
+      {view === 'billing' ? <Billing back={() => setView('chat')}/> : chat ? <Conversation key={chat.id} chat={chat} billing={() => setView('billing')} share={() => setPanel('share')} contextOpen={contextOpen} onCloseContext={() => setContextOpen(false)}/> : <div className="empty empty-hero thread"><div className="empty-squircle" aria-hidden="true"><CodeXml size={26} strokeWidth={2.1}/></div><h2>Пока нет чатов</h2><p>Создайте первый диалог, чтобы начать работу с агентом.</p><button onClick={() => void newChat()}>Создать чат</button></div>}
       {panel === 'admin' && isAdmin && <AdminDialog admin={remote.admin} userId={w.user.id} close={() => setPanel(null)}/>}
       {panel && panel !== 'admin' && <WorkspaceDialog kind={panel} w={w} chatId={activeId} close={() => setPanel(null)}/>}
     </main></div>
