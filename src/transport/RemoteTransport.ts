@@ -165,20 +165,89 @@ export class RemoteTransport implements TransportAdapter {
   subscribeAccount() { return () => {} }
   respondToPermission() { return false }
 
-  async uploadAttachments(chatId: string, files: File[], signal?: AbortSignal): Promise<MessageAttachment[]> {
+  async uploadAttachments(
+    chatId: string,
+    files: File[],
+    signalOrOptions?: AbortSignal | { signal?: AbortSignal; onProgress?: (percent: number) => void },
+  ): Promise<MessageAttachment[]> {
+    const opts = signalOrOptions instanceof AbortSignal ? { signal: signalOrOptions } : (signalOrOptions ?? {})
     const form = new FormData()
     for (const file of files) {
       form.append('files', file, file.name)
     }
+    const url = this.address + '/api/chats/' + encodeURIComponent(chatId) + '/attachments'
+    const mapFailure = (status: number, detail: Partial<ServerError>) => {
+      const message = status === 429 || detail.code === 'rate_limited'
+        ? 'Слишком много загрузок. Попробуйте позже.'
+        : status === 413
+          ? (detail.message ?? 'Размер загрузки превышает допустимый лимит (100 МБ).')
+          : status === 401
+            ? 'Сессия закончилась. Войдите снова.'
+            : detail.message ?? 'Не удалось загрузить файл.'
+      const error = new RemoteError(status, message, detail.code)
+      if (error.sessionExpired && this.session) this.emit({ type: 'expired' })
+      return error
+    }
+
+    if (typeof XMLHttpRequest !== 'undefined') {
+      return await new Promise<MessageAttachment[]>((resolve, reject) => {
+        const xhr = new XMLHttpRequest()
+        const combinedSignal = AbortSignal.any([this.lifetime.signal, ...(opts.signal ? [opts.signal] : [])])
+        const onAbort = () => {
+          xhr.abort()
+          reject(Error('Загрузка отменена.'))
+        }
+        if (combinedSignal.aborted) {
+          reject(Error('Загрузка отменена.'))
+          return
+        }
+        combinedSignal.addEventListener('abort', onAbort, { once: true })
+        const cleanup = () => combinedSignal.removeEventListener('abort', onAbort)
+
+        xhr.open('POST', url)
+        xhr.timeout = 600_000
+        if (this.token) xhr.setRequestHeader('Authorization', 'Bearer ' + this.token)
+        xhr.upload.onprogress = evt => {
+          if (evt.lengthComputable && evt.total > 0 && opts.onProgress) {
+            opts.onProgress(Math.min(100, Math.round((evt.loaded / evt.total) * 100)))
+          }
+        }
+        xhr.onerror = () => {
+          cleanup()
+          reject(Error('Нет связи с сервером при загрузке файла.'))
+        }
+        xhr.ontimeout = () => {
+          cleanup()
+          reject(Error('Превышено время ожидания загрузки файла.'))
+        }
+        xhr.onload = () => {
+          cleanup()
+          let parsed: unknown = {}
+          try {
+            parsed = xhr.responseText ? JSON.parse(xhr.responseText) : {}
+          } catch {
+            parsed = {}
+          }
+          if (xhr.status < 200 || xhr.status >= 300) {
+            reject(mapFailure(xhr.status, (parsed ?? {}) as Partial<ServerError>))
+            return
+          }
+          const body = (parsed ?? {}) as { attachments?: MessageAttachment[] }
+          resolve(body.attachments ?? [])
+        }
+        xhr.send(form)
+      })
+    }
+
     const headers = new Headers()
     if (this.token) headers.set('Authorization', 'Bearer ' + this.token)
     let response: Response
     try {
-      response = await fetch(this.address + '/api/chats/' + encodeURIComponent(chatId) + '/attachments', {
+      response = await fetch(url, {
         method: 'POST',
         headers,
         body: form,
-        signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]),
+        signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(600_000), ...(opts.signal ? [opts.signal] : [])]),
         cache: 'no-store',
         redirect: 'error',
       })
@@ -187,16 +256,7 @@ export class RemoteTransport implements TransportAdapter {
     }
     if (!response.ok) {
       const detail: Partial<ServerError> = await response.json().catch(() => ({})) ?? {}
-      const message = response.status === 429 || detail.code === 'rate_limited'
-        ? 'Слишком много загрузок. Попробуйте позже.'
-        : response.status === 413
-          ? 'Размер загрузки превышает допустимый лимит (12 МБ).'
-          : response.status === 401
-            ? 'Сессия закончилась. Войдите снова.'
-            : detail.message ?? 'Не удалось загрузить файл.'
-      const error = new RemoteError(response.status, message, detail.code)
-      if (error.sessionExpired && this.session) this.emit({ type: 'expired' })
-      throw error
+      throw mapFailure(response.status, detail)
     }
     const body = await response.json() as { attachments?: MessageAttachment[] }
     return body.attachments ?? []

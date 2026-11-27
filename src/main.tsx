@@ -5,6 +5,7 @@ import { initializeAppearance } from './app/appearanceStore'
 import { restoreConnection } from './app/chatStore'
 import { initializePlatform } from './platform/tauri'
 import { initializeTelegram } from './platform/telegram'
+import 'katex/dist/katex.min.css'
 import './style.css'
 
 initializeAppearance()

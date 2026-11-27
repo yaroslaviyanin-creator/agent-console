@@ -63,26 +63,34 @@ func checkRunAccess(ctx context.Context, tx *sql.Tx, userID, deviceID string, no
 
 // BeginRun verifies write access and reserves the client message ID durably before calling the provider.
 func (s *Store) BeginRun(ctx context.Context, userID, chatID, messageID, prompt, backend, model string) (string, error) {
-	sessionID, _, err := s.beginRun(ctx, userID, "", chatID, messageID, prompt, backend, model, nil)
+	sessionID, _, err := s.beginRun(ctx, userID, "", chatID, messageID, prompt, backend, model, nil, 10)
 	return sessionID, err
 }
 
 // BeginRunForDevice checks current access and the available quota in one transaction.
 func (s *Store) BeginRunForDevice(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string) (string, error) {
-	sessionID, _, err := s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, nil)
+	sessionID, _, err := s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, nil, 10)
 	return sessionID, err
 }
 
 // BeginRunForDeviceWithAttachments checks access, quota, and atomically binds uploaded attachments to the user message.
 func (s *Store) BeginRunForDeviceWithAttachments(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string, attachmentIDs []string) (string, []Attachment, error) {
-	return s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, attachmentIDs)
+	return s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, attachmentIDs, 10)
 }
 
-func (s *Store) beginRun(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string, attachmentIDs []string) (string, []Attachment, error) {
+// BeginRunForDeviceWithAttachmentsLimit enforces a configurable maximum attachment count per message.
+func (s *Store) BeginRunForDeviceWithAttachmentsLimit(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string, attachmentIDs []string, maxAttachments int) (string, []Attachment, error) {
+	return s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, attachmentIDs, maxAttachments)
+}
+
+func (s *Store) beginRun(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string, attachmentIDs []string, maxAttachments int) (string, []Attachment, error) {
 	if !isRunnableProvider(backend) {
 		return "", nil, ErrProviderUnavailable
 	}
-	if len(attachmentIDs) > 5 {
+	if maxAttachments <= 0 {
+		maxAttachments = 10
+	}
+	if len(attachmentIDs) > maxAttachments {
 		return "", nil, ErrInvalidAttachments
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -115,10 +123,10 @@ func (s *Store) beginRun(ctx context.Context, userID, deviceID, chatID, messageI
 			seen[attID] = true
 			var att Attachment
 			var extracted sql.NullString
-			err := tx.QueryRowContext(ctx, `SELECT id,chat_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,created_at
+			err := tx.QueryRowContext(ctx, `SELECT id,chat_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,warning,created_at
 				FROM chat_attachments WHERE id=? AND chat_id=? AND user_id=? AND message_id IS NULL`,
 				attID, chatID, userID).
-				Scan(&att.ID, &att.ChatID, &att.UserID, &att.OriginalName, &att.MIMEType, &att.Kind, &att.SizeBytes, &att.SHA256, &att.StorageKey, &extracted, &att.CreatedAt)
+				Scan(&att.ID, &att.ChatID, &att.UserID, &att.OriginalName, &att.MIMEType, &att.Kind, &att.SizeBytes, &att.SHA256, &att.StorageKey, &extracted, &att.Warning, &att.CreatedAt)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return "", nil, ErrInvalidAttachments

@@ -81,11 +81,12 @@ CREATE TABLE IF NOT EXISTS chat_attachments (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     original_name TEXT NOT NULL,
     mime_type TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('image', 'text', 'pdf', 'archive')),
+    kind TEXT NOT NULL CHECK (kind IN ('image', 'text', 'pdf', 'archive', 'document')),
     size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
     sha256 TEXT NOT NULL,
     storage_key TEXT NOT NULL UNIQUE,
     extracted_text TEXT,
+    warning TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL
 );
 

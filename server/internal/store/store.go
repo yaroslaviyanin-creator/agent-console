@@ -166,7 +166,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version == 16 {
+	if version == 17 {
 		return nil
 	}
 	// SQLite requires disabling foreign keys outside the transaction on this connection.
@@ -183,7 +183,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	switch version {
 	case 0:
-		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=16;"); err != nil {
+		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=17;"); err != nil {
 			return err
 		}
 	case 1:
@@ -439,7 +439,34 @@ func (s *Store) migrate(ctx context.Context) error {
 		PRAGMA user_version=16;`); err != nil {
 			return err
 		}
+		fallthrough
 	case 16:
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE chat_attachments_v17 (
+			id TEXT PRIMARY KEY,
+			chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+			message_id TEXT REFERENCES chat_messages(id) ON DELETE CASCADE,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			original_name TEXT NOT NULL,
+			mime_type TEXT NOT NULL,
+			kind TEXT NOT NULL CHECK (kind IN ('image', 'text', 'pdf', 'archive', 'document')),
+			size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+			sha256 TEXT NOT NULL,
+			storage_key TEXT NOT NULL UNIQUE,
+			extracted_text TEXT,
+			warning TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		);
+		INSERT INTO chat_attachments_v17 (id,chat_id,message_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,warning,created_at)
+			SELECT id,chat_id,message_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,'',created_at FROM chat_attachments;
+		DROP TABLE chat_attachments;
+		ALTER TABLE chat_attachments_v17 RENAME TO chat_attachments;
+		CREATE INDEX IF NOT EXISTS chat_attachments_by_chat ON chat_attachments (chat_id, created_at);
+		CREATE INDEX IF NOT EXISTS chat_attachments_by_message ON chat_attachments (message_id);
+		CREATE INDEX IF NOT EXISTS chat_attachments_orphans ON chat_attachments (created_at) WHERE message_id IS NULL;
+		PRAGMA user_version=17;`); err != nil {
+			return err
+		}
+	case 17:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}

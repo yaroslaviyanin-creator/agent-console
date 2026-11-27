@@ -193,10 +193,11 @@ export interface AdminChat extends ServerChat { messagesCount: number }
 export interface IndexedCodexChat extends ServerChat { archived: boolean }
 export interface MessageAttachment {
   id?: string
-  kind: 'file' | 'image' | 'text' | 'pdf' | 'archive'
+  kind: 'file' | 'image' | 'text' | 'pdf' | 'archive' | 'document'
   name: string
   mimeType?: string
   sizeBytes?: number
+  warning?: string
   url?: string
   path?: string
 }

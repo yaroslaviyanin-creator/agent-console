@@ -413,7 +413,7 @@ function Conversation({ chat, share, billing }: { chat: Chat; share: () => void;
                   className="composer-trigger composer-attach-btn"
                   disabled={!canAttach}
                   aria-label="Прикрепить файлы"
-                  title="Прикрепить файлы (картинки, код, HTML, PDF, ZIP)"
+                  title="Прикрепить файлы (картинки, PDF, Word, Excel, PowerPoint, ODT, RTF, EPUB, код, ZIP)"
                   onClick={() => fileInputRef.current?.click()}
                 >
                   <Paperclip size={13} aria-hidden="true" />

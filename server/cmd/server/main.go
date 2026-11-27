@@ -66,8 +66,8 @@ func run(ctx context.Context, args []string, out io.Writer, logger *slog.Logger)
 	server := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		ReadTimeout:       10 * time.Minute,
+		WriteTimeout:      10 * time.Minute,
 		IdleTimeout:       60 * time.Second,
 	}
 	logger.Info("HTTP server listening", "addr", listener.Addr(), "provider", cfg.Provider)

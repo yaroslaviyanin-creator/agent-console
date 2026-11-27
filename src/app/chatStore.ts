@@ -1,7 +1,7 @@
 import { historyUntil, previousTurn } from './runHistory'
 import { create } from 'zustand'
 import type { LoginRequest, MessageAttachment, Workspace, PermissionDecision, Provider, RunEvent, ServerMessage, ServerModel, ServerProvider, ServerProviderInfo, ShareAccess, Target, ToolCall } from '../protocol/types'
-import { type DraftAttachment, inferDraftKind, isSafeRasterPreviewFile, MAX_CHAT_ATTACHMENTS } from './attachments'
+import { type DraftAttachment, inferDraftKind, isSafeRasterPreviewFile, MAX_ATTACHMENT_MB, MAX_CHAT_ATTACHMENTS, MAX_CHAT_TOTAL_ATTACHMENTS, MAX_IMAGE_MB } from './attachments'
 import { useAccountStore, blockReason } from './accountStore'
 import { readConnection, saveConnection, setTransport, transport } from './runtime'
 import type { ConnectionMode } from './runtime'
@@ -821,19 +821,42 @@ export async function uploadChatFiles(chatId: string, fileList: FileList | File[
   if (!target || (target.access !== 'owner' && target.access !== 'write')) return
 
   const existing = target.attachments ?? []
-  const availableSlots = MAX_CHAT_ATTACHMENTS - existing.length
+  const sentCount = target.turns.reduce((sum, t) => sum + (t.attachments?.length ?? 0), 0)
+  const remainingInChat = MAX_CHAT_TOTAL_ATTACHMENTS - sentCount - existing.length
+  const availableSlots = Math.min(MAX_CHAT_ATTACHMENTS - existing.length, remainingInChat)
   if (availableSlots <= 0) {
-    updateChat(chatId, c => ({ ...c, attachmentError: `Можно прикрепить не более ${MAX_CHAT_ATTACHMENTS} файлов к одному сообщению.` }))
+    const msg = remainingInChat <= 0
+      ? `В одном чате можно прикрепить не более ${MAX_CHAT_TOTAL_ATTACHMENTS} файлов.`
+      : `Можно прикрепить не более ${MAX_CHAT_ATTACHMENTS} файлов к одному сообщению.`
+    updateChat(chatId, c => ({ ...c, attachmentError: msg }))
     return
   }
-  const batch = files.slice(0, availableSlots)
-  const overflow = files.length > availableSlots
+
+  const validFiles: File[] = []
+  let sizeError = ''
+  for (const file of files) {
+    const isImage = inferDraftKind(file) === 'image'
+    const limitMb = isImage ? MAX_IMAGE_MB : MAX_ATTACHMENT_MB
+    if (file.size > limitMb * 1024 * 1024) {
+      sizeError = `Файл «${file.name}» превышает лимит ${limitMb} МБ.`
+      continue
+    }
+    validFiles.push(file)
+  }
+  if (!validFiles.length) {
+    if (sizeError) updateChat(chatId, c => ({ ...c, attachmentError: sizeError }))
+    return
+  }
+
+  const batch = validFiles.slice(0, availableSlots)
+  const overflow = validFiles.length > availableSlots
   const pendingItems: DraftAttachment[] = batch.map(file => ({
     localId: crypto.randomUUID(),
     name: file.name,
     sizeBytes: file.size,
     kind: inferDraftKind(file),
     status: 'uploading',
+    progress: 0,
     ...(isSafeRasterPreviewFile(file) && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
       ? { previewUrl: URL.createObjectURL(file) }
       : {}),
@@ -841,13 +864,24 @@ export async function uploadChatFiles(chatId: string, fileList: FileList | File[
 
   updateChat(chatId, c => ({
     ...c,
-    attachmentError: overflow ? `Прикреплены первые ${batch.length} из ${files.length} файлов (лимит ${MAX_CHAT_ATTACHMENTS}).` : undefined,
+    attachmentError: sizeError || (overflow ? `Прикреплены первые ${batch.length} из ${validFiles.length} файлов (лимит ${MAX_CHAT_ATTACHMENTS} на сообщение, ${MAX_CHAT_TOTAL_ATTACHMENTS} на чат).` : undefined),
     attachments: [...(c.attachments ?? []), ...pendingItems],
   }))
 
   const pendingIds = new Set(pendingItems.map(item => item.localId))
   try {
-    const uploaded = await remote.uploadAttachments(chatId, batch)
+    const uploaded = await remote.uploadAttachments(chatId, batch, {
+      onProgress: percent => {
+        updateChat(chatId, c => ({
+          ...c,
+          attachments: (c.attachments ?? []).map(item =>
+            pendingIds.has(item.localId) && item.status === 'uploading'
+              ? { ...item, progress: percent }
+              : item,
+          ),
+        }))
+      },
+    })
     updateChat(chatId, c => {
       const next = (c.attachments ?? []).map(item => {
         if (!pendingIds.has(item.localId)) return item
@@ -860,8 +894,10 @@ export async function uploadChatFiles(chatId: string, fileList: FileList | File[
           ...item,
           name: remoteAtt.name,
           sizeBytes: remoteAtt.sizeBytes ?? item.sizeBytes,
-          kind: (remoteAtt.kind === 'image' || remoteAtt.kind === 'pdf' || remoteAtt.kind === 'archive' ? remoteAtt.kind : 'text') as DraftAttachment['kind'],
+          kind: (remoteAtt.kind === 'image' || remoteAtt.kind === 'pdf' || remoteAtt.kind === 'archive' || remoteAtt.kind === 'document' ? remoteAtt.kind : 'text') as DraftAttachment['kind'],
           status: 'ready' as const,
+          progress: 100,
+          ...(remoteAtt.warning ? { warning: remoteAtt.warning } : {}),
           remote: remoteAtt,
         }
       })

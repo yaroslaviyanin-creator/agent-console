@@ -70,7 +70,7 @@ func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 		t.Fatalf("auth after reopening DB failed: %v", err)
 	}
 	var version int
-	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 16 {
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 17 {
 		t.Fatalf("schema version %d: %v", version, err)
 	}
 	if currentDevice.LastSeenAt != device.LastSeenAt {
@@ -806,5 +806,62 @@ func TestAttachmentStoreLifecycleAndCleanup(t *testing.T) {
 	}
 	if _, err := os.Stat(diskPath); !os.IsNotExist(err) {
 		t.Fatalf("expected bound attachment file removed on DeleteChat, got %v", err)
+	}
+}
+
+func TestStoreMigrateV16ToV17Attachments(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "v16.db")
+	db, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Downgrade chat_attachments to v16 schema and PRAGMA user_version=16 to test live upgrade.
+	if _, err := db.db.ExecContext(ctx, `
+		DROP TABLE chat_attachments;
+		CREATE TABLE chat_attachments (
+			id TEXT PRIMARY KEY,
+			chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+			message_id TEXT REFERENCES chat_messages(id) ON DELETE CASCADE,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			original_name TEXT NOT NULL,
+			mime_type TEXT NOT NULL,
+			kind TEXT NOT NULL CHECK (kind IN ('image', 'text', 'pdf', 'archive')),
+			size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+			sha256 TEXT NOT NULL,
+			storage_key TEXT NOT NULL UNIQUE,
+			extracted_text TEXT,
+			created_at INTEGER NOT NULL
+		);
+		PRAGMA user_version=16;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	reopened, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open after v16 failed: %v", err)
+	}
+	defer reopened.Close()
+
+	var version int
+	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 17 {
+		t.Fatalf("expected user_version=17, got %d (err=%v)", version, err)
+	}
+	owner, err := reopened.CreateUserWithRole(ctx, "u1", []byte("h"), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat, err := reopened.CreateChat(ctx, owner.ID, "Docs", "codex", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	att, err := reopened.CreateAttachment(ctx, chat.ID, owner.ID, uploads.ValidatedAttachment{
+		Filename: "doc.docx", MIMEType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		Kind: uploads.KindDocument, Size: 3, Data: []byte("doc"), Warning: "warn",
+	})
+	if err != nil || att.Warning != "warn" {
+		t.Fatalf("CreateAttachment after v17 migration failed: %+v err=%v", att, err)
 	}
 }

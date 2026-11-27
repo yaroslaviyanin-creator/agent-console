@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
+	"image/png"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -325,4 +327,352 @@ func TestChatAttachmentsSecurityAndLifecycle(t *testing.T) {
 	}
 
 	_ = uploads.KindImage
+}
+
+func testLargePNGBytes(t *testing.T) []byte {
+	t.Helper()
+	const w, h = 800, 800
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	var state uint32 = 0x12345678
+	for i := 0; i < len(img.Pix); i += 4 {
+		state ^= state << 13
+		state ^= state >> 17
+		state ^= state << 5
+		img.Pix[i] = byte(state)
+		img.Pix[i+1] = byte(state >> 8)
+		img.Pix[i+2] = byte(state >> 16)
+		img.Pix[i+3] = 255
+	}
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := enc.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() <= 1<<20 {
+		t.Fatalf("expected large PNG > 1 MiB, got %d", buf.Len())
+	}
+	return buf.Bytes()
+}
+
+func testTextPDFBytes(t *testing.T, text string) []byte {
+	t.Helper()
+	stream := fmt.Sprintf("BT /F1 12 Tf 72 720 Td (%s) Tj ET", text)
+	objs := []string{
+		"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+		"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+		"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+		fmt.Sprintf("4 0 obj\n<< /Length %d >>\nstream\n%s\nendstream\nendobj\n", len(stream), stream),
+		"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+	}
+	var out bytes.Buffer
+	out.WriteString("%PDF-1.4\n")
+	offsets := make([]int, len(objs)+1)
+	for i, obj := range objs {
+		offsets[i+1] = out.Len()
+		out.WriteString(obj)
+	}
+	xrefOffset := out.Len()
+	out.WriteString(fmt.Sprintf("xref\n0 %d\n0000000000 65535 f \n", len(objs)+1))
+	for i := 1; i <= len(objs); i++ {
+		out.WriteString(fmt.Sprintf("%010d 00000 n \n", offsets[i]))
+	}
+	out.WriteString(fmt.Sprintf("trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objs)+1, xrefOffset))
+	return out.Bytes()
+}
+
+func TestChatAttachmentsTypesLimitsAndErrors(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "chat-att-types.db")
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	alice, err := db.CreateUserWithRole(ctx, "alice", []byte("h"), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, tokAlice, err := db.IssueDevice(ctx, alice.ID, "devA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat, err := db.CreateChat(ctx, alice.ID, "Types", "stub", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler, err := New(ctx, db, config.Config{Provider: "stub", CORSOrigin: "*", MaxAttachmentMB: 3}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	upload := func(files map[string][]byte) *httptest.ResponseRecorder {
+		ct, body := buildMultipartUpload(t, "files", files)
+		r := httptest.NewRequest(http.MethodPost, "/api/chats/"+chat.ID+"/attachments", body)
+		r.Header.Set("Authorization", "Bearer "+tokAlice)
+		r.Header.Set("Content-Type", ct)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+
+	// 1. Upload .txt, large .png (> 1 MiB), .pdf (with text layer), and .zip.
+	largePNG := testLargePNGBytes(t)
+	pdfBytes := testTextPDFBytes(t, "Invoice PDF Content")
+	zipBytes := testZIPBytes(t, map[string][]byte{"readme.txt": []byte("hello zip")})
+
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{"note.txt", []byte("plain text note")},
+		{"large.png", largePNG},
+		{"doc.pdf", pdfBytes},
+		{"bundle.zip", zipBytes},
+	} {
+		rec := upload(map[string][]byte{tc.name: tc.data})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("upload %s failed (%d): %s", tc.name, rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Attachments []store.Attachment `json:"attachments"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || len(resp.Attachments) != 1 {
+			t.Fatalf("unexpected upload response for %s: %v (%s)", tc.name, err, rec.Body.String())
+		}
+		getReq := httptest.NewRequest(http.MethodGet, "/api/attachments/"+resp.Attachments[0].ID, nil)
+		getReq.Header.Set("Authorization", "Bearer "+tokAlice)
+		getRec := httptest.NewRecorder()
+		handler.ServeHTTP(getRec, getReq)
+		if getRec.Code != http.StatusOK || getRec.Body.Len() == 0 {
+			t.Fatalf("GET %s failed: %d (len=%d)", tc.name, getRec.Code, getRec.Body.Len())
+		}
+	}
+
+	// 2. Request exceeding MaxAttachmentMB returns 413, not invalid_multipart.
+	oversized := bytes.Repeat([]byte("a"), (3<<20)+1024)
+	overRec := upload(map[string][]byte{"huge.txt": oversized})
+	if overRec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized upload status=%d, want 413: %s", overRec.Code, overRec.Body.String())
+	}
+	if strings.Contains(overRec.Body.String(), "Ожидается multipart/form-data") {
+		t.Fatalf("oversized upload returned misleading multipart error: %s", overRec.Body.String())
+	}
+
+	// 3. Non-multipart request returns 400 invalid_multipart.
+	nonMultipartReq := httptest.NewRequest(http.MethodPost, "/api/chats/"+chat.ID+"/attachments", strings.NewReader(`{"hello":"world"}`))
+	nonMultipartReq.Header.Set("Authorization", "Bearer "+tokAlice)
+	nonMultipartReq.Header.Set("Content-Type", "application/json")
+	nonMultipartRec := httptest.NewRecorder()
+	handler.ServeHTTP(nonMultipartRec, nonMultipartReq)
+	if nonMultipartRec.Code != http.StatusBadRequest {
+		t.Fatalf("non-multipart status=%d, want 400: %s", nonMultipartRec.Code, nonMultipartRec.Body.String())
+	}
+	if !strings.Contains(nonMultipartRec.Body.String(), "invalid_multipart") {
+		t.Fatalf("expected invalid_multipart code, got: %s", nonMultipartRec.Body.String())
+	}
+
+	// 4. Empty file returns 400 empty_file.
+	emptyRec := upload(map[string][]byte{"empty.txt": nil})
+	if emptyRec.Code != http.StatusBadRequest || !strings.Contains(emptyRec.Body.String(), "empty_file") {
+		t.Fatalf("empty file status=%d body=%s, want 400 empty_file", emptyRec.Code, emptyRec.Body.String())
+	}
+}
+
+func TestChatAttachmentsStreamingLargePDFAndOfficeFormats(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "chat-att-streaming.db")
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	alice, err := db.CreateUserWithRole(ctx, "alice", []byte("h"), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, tokAlice, err := db.IssueDevice(ctx, alice.ID, "devA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat, err := db.CreateChat(ctx, alice.ID, "Office & Large PDF", "stub", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler, err := New(ctx, db, config.Config{
+		Provider:                  "stub",
+		CORSOrigin:                "*",
+		MaxAttachmentMB:           100,
+		MaxAttachmentsPerMessage:  10,
+		MaxAttachmentsPerChat:     20,
+		MaxAttachmentContextBytes: 256 << 10,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	upload := func(files map[string][]byte) *httptest.ResponseRecorder {
+		ct, body := buildMultipartUpload(t, "files", files)
+		r := httptest.NewRequest(http.MethodPost, "/api/chats/"+chat.ID+"/attachments", body)
+		r.Header.Set("Authorization", "Bearer "+tokAlice)
+		r.Header.Set("Content-Type", ct)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+
+	// 1. Streamed 30 MB PDF upload succeeds without OOM and extracts text.
+	basePDF := testTextPDFBytes(t, "Large Lecture PDF Content")
+	// Pad PDF safely with a comment block before %%EOF so PDF readers still parse it cleanly.
+	padChunk := bytes.Repeat([]byte("% padding comment line for large pdf streaming test\n"), 550_000)
+	var largePDF bytes.Buffer
+	idx := bytes.LastIndex(basePDF, []byte("%%EOF"))
+	largePDF.Write(basePDF[:idx])
+	largePDF.Write(padChunk)
+	largePDF.Write(basePDF[idx:])
+	if largePDF.Len() < 25<<20 {
+		t.Fatalf("expected synthetic PDF >= 25 MiB, got %d", largePDF.Len())
+	}
+
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		part, err := mw.CreateFormFile("files", "lecture_30mb.pdf")
+		if err == nil {
+			_, err = io.Copy(part, bytes.NewReader(largePDF.Bytes()))
+		}
+		_ = mw.Close()
+		_ = pw.CloseWithError(err)
+	}()
+	req := httptest.NewRequest(http.MethodPost, "/api/chats/"+chat.ID+"/attachments", pr)
+	req.Header.Set("Authorization", "Bearer "+tokAlice)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("large 30MB PDF upload failed (%d): %s", rec.Code, rec.Body.String())
+	}
+	var pdfResp struct {
+		Attachments []store.Attachment `json:"attachments"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &pdfResp); err != nil || len(pdfResp.Attachments) != 1 {
+		t.Fatalf("unexpected large PDF response: %v (%s)", err, rec.Body.String())
+	}
+	storedPDF, err := db.GetAttachment(ctx, alice.ID, pdfResp.Attachments[0].ID)
+	if err != nil || !strings.Contains(storedPDF.ExtractedText, "Large Lecture PDF Content") {
+		t.Fatalf("large PDF extracted text missing: err=%v text=%q", err, storedPDF.ExtractedText)
+	}
+
+	// 2. Scan PDF without text layer returns 201 + warning.
+	scanPDF := testTextPDFBytes(t, "")
+	scanRec := upload(map[string][]byte{"scan.pdf": scanPDF})
+	if scanRec.Code != http.StatusCreated {
+		t.Fatalf("scan PDF upload failed (%d): %s", scanRec.Code, scanRec.Body.String())
+	}
+	if !strings.Contains(scanRec.Body.String(), "warning") {
+		t.Fatalf("expected warning in scan PDF response, got: %s", scanRec.Body.String())
+	}
+
+	// 3. Office documents & TSV upload cleanly and enforce strict attachment download headers.
+	docx := testZIPBytes(t, map[string][]byte{
+		"word/document.xml": []byte(`<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Документ Word</w:t></w:r></w:p></w:body></w:document>`),
+	})
+	pptx := testZIPBytes(t, map[string][]byte{
+		"ppt/slides/slide1.xml": []byte(`<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Слайд 1</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>`),
+	})
+	rtf := []byte(`{\rtf1\ansi\ansicpg1251 Привет RTF\par}`)
+	officeRec := upload(map[string][]byte{
+		"paper.docx": docx,
+		"deck.pptx":  pptx,
+		"memo.rtf":   rtf,
+		"data.tsv":   []byte("k\tv\n1\t2\n"),
+	})
+	if officeRec.Code != http.StatusCreated {
+		t.Fatalf("office upload failed (%d): %s", officeRec.Code, officeRec.Body.String())
+	}
+	var officeResp struct {
+		Attachments []store.Attachment `json:"attachments"`
+	}
+	if err := json.Unmarshal(officeRec.Body.Bytes(), &officeResp); err != nil || len(officeResp.Attachments) != 4 {
+		t.Fatalf("unexpected office response: %v (%s)", err, officeRec.Body.String())
+	}
+	for _, att := range officeResp.Attachments {
+		gReq := httptest.NewRequest(http.MethodGet, "/api/attachments/"+att.ID, nil)
+		gReq.Header.Set("Authorization", "Bearer "+tokAlice)
+		gRec := httptest.NewRecorder()
+		handler.ServeHTTP(gRec, gReq)
+		if gRec.Code != http.StatusOK {
+			t.Fatalf("GET %s failed: %d", att.OriginalName, gRec.Code)
+		}
+		if !strings.HasPrefix(gRec.Header().Get("Content-Disposition"), "attachment;") {
+			t.Fatalf("%s Content-Disposition=%q, want attachment", att.OriginalName, gRec.Header().Get("Content-Disposition"))
+		}
+		if gRec.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Fatalf("%s missing nosniff", att.OriginalName)
+		}
+		if gRec.Header().Get("Content-Security-Policy") != "default-src 'none'; sandbox" {
+			t.Fatalf("%s missing strict CSP", att.OriginalName)
+		}
+	}
+
+	// 4. Zip bomb disguised as .docx returns 400 zip_bomb without OOM.
+	var bombBuf bytes.Buffer
+	zw := zip.NewWriter(&bombBuf)
+	zw.RegisterCompressor(zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
+		return flate.NewWriter(out, flate.BestCompression)
+	})
+	fw, _ := zw.Create("word/document.xml")
+	_, _ = fw.Write(bytes.Repeat([]byte{'A'}, int(uploads.ChatMaxOfficeUncompressedBytes)+4096))
+	_ = zw.Close()
+	bombRec := upload(map[string][]byte{"bomb.docx": bombBuf.Bytes()})
+	if bombRec.Code != http.StatusBadRequest || !strings.Contains(bombRec.Body.String(), "zip_bomb") {
+		t.Fatalf("bomb.docx status=%d body=%s, want 400 zip_bomb", bombRec.Code, bombRec.Body.String())
+	}
+
+	// 5. JPG+ZIP polyglot disguised as .docx returns 400 content_mismatch.
+	polyDOCX := append(testJPEGBytes(t), docx...)
+	polyRec := upload(map[string][]byte{"poly.docx": polyDOCX})
+	if polyRec.Code != http.StatusBadRequest || !strings.Contains(polyRec.Body.String(), "content_mismatch") {
+		t.Fatalf("poly.docx status=%d body=%s, want 400 content_mismatch", polyRec.Code, polyRec.Body.String())
+	}
+
+	// 6. PDF > 1000 pages returns 400 pdf_too_many_pages.
+	var pageKids strings.Builder
+	var pageObjs []string
+	pageObjs = append(pageObjs, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+	for i := 0; i < 1001; i++ {
+		pageKids.WriteString(fmt.Sprintf("%d 0 R ", 3+i))
+	}
+	pageObjs = append(pageObjs, fmt.Sprintf("2 0 obj\n<< /Type /Pages /Kids [%s] /Count 1001 >>\nendobj\n", pageKids.String()))
+	for i := 0; i < 1001; i++ {
+		pageObjs = append(pageObjs, fmt.Sprintf("%d 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n", 3+i))
+	}
+	var hugePagesPDF bytes.Buffer
+	hugePagesPDF.WriteString("%PDF-1.4\n")
+	pOffsets := make([]int, len(pageObjs)+1)
+	for i, o := range pageObjs {
+		pOffsets[i+1] = hugePagesPDF.Len()
+		hugePagesPDF.WriteString(o)
+	}
+	pXref := hugePagesPDF.Len()
+	hugePagesPDF.WriteString(fmt.Sprintf("xref\n0 %d\n0000000000 65535 f \n", len(pageObjs)+1))
+	for i := 1; i <= len(pageObjs); i++ {
+		hugePagesPDF.WriteString(fmt.Sprintf("%010d 00000 n \n", pOffsets[i]))
+	}
+	hugePagesPDF.WriteString(fmt.Sprintf("trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(pageObjs)+1, pXref))
+	manyPagesRec := upload(map[string][]byte{"too_many_pages.pdf": hugePagesPDF.Bytes()})
+	if manyPagesRec.Code != http.StatusBadRequest || !strings.Contains(manyPagesRec.Body.String(), "pdf_too_many_pages") {
+		t.Fatalf("1001-page PDF status=%d body=%s, want 400 pdf_too_many_pages", manyPagesRec.Code, manyPagesRec.Body.String())
+	}
+
+	// 7. Verify no lingering .tmp-* files remain in uploadsDir.
+	entries, _ := os.ReadDir(db.UploadsDir())
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			t.Fatalf("leftover temp file in uploadsDir: %s", e.Name())
+		}
+	}
 }

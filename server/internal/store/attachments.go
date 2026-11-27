@@ -6,9 +6,11 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"agent-console/server/internal/uploads"
@@ -34,6 +36,7 @@ type Attachment struct {
 	SHA256        string `json:"sha256,omitempty"`
 	StorageKey    string `json:"-"`
 	ExtractedText string `json:"-"`
+	Warning       string `json:"warning,omitempty"`
 	CreatedAt     int64  `json:"createdAt"`
 	URL           string `json:"url"`
 }
@@ -44,6 +47,7 @@ type MessageAttachment struct {
 	Name      string `json:"name"`
 	MimeType  string `json:"mimeType,omitempty"`
 	SizeBytes int64  `json:"sizeBytes,omitempty"`
+	Warning   string `json:"warning,omitempty"`
 	URL       string `json:"url,omitempty"`
 }
 
@@ -54,6 +58,7 @@ func (a Attachment) AsMessageAttachment() MessageAttachment {
 		Name:      a.OriginalName,
 		MimeType:  a.MIMEType,
 		SizeBytes: a.SizeBytes,
+		Warning:   a.Warning,
 		URL:       a.URL,
 	}
 }
@@ -65,7 +70,14 @@ func (s *Store) attachmentPath(storageKey string) (string, error) {
 	return filepath.Join(s.uploadsDir, storageKey), nil
 }
 
-// CreateAttachment writes validated bytes to an isolated UUID path (mode 0600) and records metadata.
+// CountChatAttachments returns the total number of attachments (attached and pending) in a chat.
+func (s *Store) CountChatAttachments(ctx context.Context, chatID string) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chat_attachments WHERE chat_id=?`, chatID).Scan(&count)
+	return count, err
+}
+
+// CreateAttachment writes or moves validated bytes to an isolated UUID path (mode 0600) and records metadata.
 func (s *Store) CreateAttachment(ctx context.Context, chatID, userID string, v uploads.ValidatedAttachment) (Attachment, error) {
 	id := randomHex(16)
 	storageKey := randomHex(16)
@@ -76,12 +88,42 @@ func (s *Store) CreateAttachment(ctx context.Context, chatID, userID string, v u
 	if err := os.MkdirAll(s.uploadsDir, 0700); err != nil {
 		return Attachment{}, err
 	}
-	if err := os.WriteFile(diskPath, v.Data, 0600); err != nil {
-		return Attachment{}, err
+
+	var (
+		sizeBytes int64
+		shaHex    string
+	)
+	if v.SourcePath != "" && v.Data == nil {
+		f, err := os.Open(v.SourcePath)
+		if err != nil {
+			return Attachment{}, err
+		}
+		h := sha256.New()
+		n, copyErr := io.Copy(h, f)
+		_ = f.Close()
+		if copyErr != nil {
+			return Attachment{}, copyErr
+		}
+		sizeBytes = n
+		shaHex = hex.EncodeToString(h.Sum(nil))
+		if err := os.Chmod(v.SourcePath, 0600); err != nil {
+			return Attachment{}, err
+		}
+		if err := os.Rename(v.SourcePath, diskPath); err != nil {
+			if err := copyFileSecure(v.SourcePath, diskPath); err != nil {
+				return Attachment{}, err
+			}
+			_ = os.Remove(v.SourcePath)
+		}
+	} else {
+		if err := os.WriteFile(diskPath, v.Data, 0600); err != nil {
+			return Attachment{}, err
+		}
+		sizeBytes = int64(len(v.Data))
+		sum := sha256.Sum256(v.Data)
+		shaHex = hex.EncodeToString(sum[:])
 	}
 
-	sum := sha256.Sum256(v.Data)
-	shaHex := hex.EncodeToString(sum[:])
 	now := time.Now().UnixMilli()
 	var extracted any
 	if v.ExtractedText != "" {
@@ -89,9 +131,9 @@ func (s *Store) CreateAttachment(ctx context.Context, chatID, userID string, v u
 	}
 
 	_, err = s.db.ExecContext(ctx, `INSERT INTO chat_attachments
-		(id,chat_id,message_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,created_at)
-		VALUES (?,?,NULL,?,?,?,?,?,?,?,?,?)`,
-		id, chatID, userID, v.Filename, v.MIMEType, string(v.Kind), int64(len(v.Data)), shaHex, storageKey, extracted, now)
+		(id,chat_id,message_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,warning,created_at)
+		VALUES (?,?,NULL,?,?,?,?,?,?,?,?,?,?)`,
+		id, chatID, userID, v.Filename, v.MIMEType, string(v.Kind), sizeBytes, shaHex, storageKey, extracted, v.Warning, now)
 	if err != nil {
 		_ = os.Remove(diskPath)
 		return Attachment{}, err
@@ -104,13 +146,32 @@ func (s *Store) CreateAttachment(ctx context.Context, chatID, userID string, v u
 		OriginalName:  v.Filename,
 		MIMEType:      v.MIMEType,
 		Kind:          string(v.Kind),
-		SizeBytes:     int64(len(v.Data)),
+		SizeBytes:     sizeBytes,
 		SHA256:        shaHex,
 		StorageKey:    storageKey,
 		ExtractedText: v.ExtractedText,
+		Warning:       v.Warning,
 		CreatedAt:     now,
 		URL:           "/api/attachments/" + id,
 	}, nil
+}
+
+func copyFileSecure(srcPath, dstPath string) error {
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dstPath)
+		return err
+	}
+	return out.Close()
 }
 
 // GetAttachment fetches an attachment only if userID owns the chat or has any share access.
@@ -118,10 +179,10 @@ func (s *Store) GetAttachment(ctx context.Context, userID, attachmentID string) 
 	var att Attachment
 	var messageID, extracted sql.NullString
 	var hasAccess bool
-	err := s.db.QueryRowContext(ctx, `SELECT a.id,a.chat_id,a.message_id,a.user_id,a.original_name,a.mime_type,a.kind,a.size_bytes,a.sha256,a.storage_key,a.extracted_text,a.created_at,
+	err := s.db.QueryRowContext(ctx, `SELECT a.id,a.chat_id,a.message_id,a.user_id,a.original_name,a.mime_type,a.kind,a.size_bytes,a.sha256,a.storage_key,a.extracted_text,a.warning,a.created_at,
 		(c.user_id=?2 OR EXISTS(SELECT 1 FROM chat_shares WHERE chat_id=c.id AND user_id=?2))
 		FROM chat_attachments a JOIN chats c ON c.id=a.chat_id WHERE a.id=?1`, attachmentID, userID).
-		Scan(&att.ID, &att.ChatID, &messageID, &att.UserID, &att.OriginalName, &att.MIMEType, &att.Kind, &att.SizeBytes, &att.SHA256, &att.StorageKey, &extracted, &att.CreatedAt, &hasAccess)
+		Scan(&att.ID, &att.ChatID, &messageID, &att.UserID, &att.OriginalName, &att.MIMEType, &att.Kind, &att.SizeBytes, &att.SHA256, &att.StorageKey, &extracted, &att.Warning, &att.CreatedAt, &hasAccess)
 	if err != nil {
 		return Attachment{}, err
 	}
@@ -140,6 +201,24 @@ func (s *Store) ReadAttachmentBytes(storageKey string) ([]byte, error) {
 		return nil, err
 	}
 	return os.ReadFile(diskPath)
+}
+
+// OpenAttachmentFile opens a stored attachment file for streaming downloads without loading it into RAM.
+func (s *Store) OpenAttachmentFile(storageKey string) (*os.File, int64, error) {
+	diskPath, err := s.attachmentPath(storageKey)
+	if err != nil {
+		return nil, 0, err
+	}
+	f, err := os.Open(diskPath)
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, err
+	}
+	return f, info.Size(), nil
 }
 
 // DeleteUnattachedAttachment removes an unattached upload authored by userID.
@@ -246,11 +325,24 @@ func (s *Store) CleanupOrphanAttachments(ctx context.Context, maxAge time.Durati
 			}
 		}
 	}
+	if s.uploadsDir != "" {
+		if entries, err := os.ReadDir(s.uploadsDir); err == nil {
+			staleBefore := time.Now().Add(-maxAge)
+			for _, entry := range entries {
+				if entry.IsDir() || !strings.HasPrefix(entry.Name(), ".tmp-") {
+					continue
+				}
+				if info, err := entry.Info(); err == nil && info.ModTime().Before(staleBefore) {
+					_ = os.Remove(filepath.Join(s.uploadsDir, entry.Name()))
+				}
+			}
+		}
+	}
 	return removed, nil
 }
 
 func (s *Store) messageAttachmentsForChat(ctx context.Context, chatID string) (map[string][]MessageAttachment, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, message_id, kind, original_name, mime_type, size_bytes
+	rows, err := s.db.QueryContext(ctx, `SELECT id, message_id, kind, original_name, mime_type, size_bytes, warning
 		FROM chat_attachments WHERE chat_id=? AND message_id IS NOT NULL ORDER BY created_at, rowid`, chatID)
 	if err != nil {
 		return nil, err
@@ -261,7 +353,7 @@ func (s *Store) messageAttachmentsForChat(ctx context.Context, chatID string) (m
 	for rows.Next() {
 		var msgID string
 		var att MessageAttachment
-		if err := rows.Scan(&att.ID, &msgID, &att.Kind, &att.Name, &att.MimeType, &att.SizeBytes); err != nil {
+		if err := rows.Scan(&att.ID, &msgID, &att.Kind, &att.Name, &att.MimeType, &att.SizeBytes, &att.Warning); err != nil {
 			return nil, err
 		}
 		att.URL = "/api/attachments/" + att.ID
@@ -272,7 +364,7 @@ func (s *Store) messageAttachmentsForChat(ctx context.Context, chatID string) (m
 
 // PriorAttachmentsForChat returns attachments keyed by user message ID for provider handoff context.
 func (s *Store) PriorAttachmentsForChat(ctx context.Context, chatID string) (map[string][]Attachment, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, chat_id, message_id, user_id, original_name, mime_type, kind, size_bytes, sha256, storage_key, COALESCE(extracted_text,''), created_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, chat_id, message_id, user_id, original_name, mime_type, kind, size_bytes, sha256, storage_key, COALESCE(extracted_text,''), warning, created_at
 		FROM chat_attachments WHERE chat_id=? AND message_id IS NOT NULL ORDER BY created_at, rowid`, chatID)
 	if err != nil {
 		return nil, err
@@ -282,7 +374,7 @@ func (s *Store) PriorAttachmentsForChat(ctx context.Context, chatID string) (map
 	result := make(map[string][]Attachment)
 	for rows.Next() {
 		var att Attachment
-		if err := rows.Scan(&att.ID, &att.ChatID, &att.MessageID, &att.UserID, &att.OriginalName, &att.MIMEType, &att.Kind, &att.SizeBytes, &att.SHA256, &att.StorageKey, &att.ExtractedText, &att.CreatedAt); err != nil {
+		if err := rows.Scan(&att.ID, &att.ChatID, &att.MessageID, &att.UserID, &att.OriginalName, &att.MIMEType, &att.Kind, &att.SizeBytes, &att.SHA256, &att.StorageKey, &att.ExtractedText, &att.Warning, &att.CreatedAt); err != nil {
 			return nil, err
 		}
 		att.URL = "/api/attachments/" + att.ID

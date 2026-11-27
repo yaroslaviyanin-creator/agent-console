@@ -29,8 +29,48 @@ type Config struct {
 	MemoryModel            string
 	MemoryCheckInterval    time.Duration
 	MemoryMinNewMessages   int
-	TelegramBotToken       string
-	TelegramInitDataMaxAge time.Duration
+	TelegramBotToken          string
+	TelegramInitDataMaxAge    time.Duration
+	MaxAttachmentMB           int
+	MaxAttachmentsPerMessage  int
+	MaxAttachmentsPerChat     int
+	MaxAttachmentContextBytes int
+}
+
+const (
+	DefaultMaxAttachmentMB           = 100
+	DefaultMaxAttachmentsPerMessage  = 10
+	DefaultMaxAttachmentsPerChat     = 20
+	DefaultMaxAttachmentContextBytes = 256 << 10
+)
+
+func (c Config) EffectiveMaxAttachmentBytes() int64 {
+	mb := c.MaxAttachmentMB
+	if mb <= 0 {
+		mb = DefaultMaxAttachmentMB
+	}
+	return int64(mb) << 20
+}
+
+func (c Config) EffectiveMaxAttachmentsPerMessage() int {
+	if c.MaxAttachmentsPerMessage <= 0 {
+		return DefaultMaxAttachmentsPerMessage
+	}
+	return c.MaxAttachmentsPerMessage
+}
+
+func (c Config) EffectiveMaxAttachmentsPerChat() int {
+	if c.MaxAttachmentsPerChat <= 0 {
+		return DefaultMaxAttachmentsPerChat
+	}
+	return c.MaxAttachmentsPerChat
+}
+
+func (c Config) EffectiveMaxAttachmentContextBytes() int {
+	if c.MaxAttachmentContextBytes <= 0 {
+		return DefaultMaxAttachmentContextBytes
+	}
+	return c.MaxAttachmentContextBytes
 }
 
 type ProviderConfig struct {
@@ -199,6 +239,22 @@ func Load() (Config, error) {
 	cfg.TelegramInitDataMaxAge, err = time.ParseDuration(value("TELEGRAM_INIT_DATA_MAX_AGE", "1h"))
 	if err != nil || cfg.TelegramInitDataMaxAge <= 0 {
 		return Config{}, errors.New("TELEGRAM_INIT_DATA_MAX_AGE must be a positive duration")
+	}
+	cfg.MaxAttachmentMB, err = strconv.Atoi(value("MAX_ATTACHMENT_MB", strconv.Itoa(DefaultMaxAttachmentMB)))
+	if err != nil || cfg.MaxAttachmentMB < 1 {
+		return Config{}, errors.New("MAX_ATTACHMENT_MB must be an integer >= 1")
+	}
+	cfg.MaxAttachmentsPerMessage, err = strconv.Atoi(value("MAX_ATTACHMENTS_PER_MESSAGE", strconv.Itoa(DefaultMaxAttachmentsPerMessage)))
+	if err != nil || cfg.MaxAttachmentsPerMessage < 1 {
+		return Config{}, errors.New("MAX_ATTACHMENTS_PER_MESSAGE must be an integer >= 1")
+	}
+	cfg.MaxAttachmentsPerChat, err = strconv.Atoi(value("MAX_ATTACHMENTS_PER_CHAT", strconv.Itoa(DefaultMaxAttachmentsPerChat)))
+	if err != nil || cfg.MaxAttachmentsPerChat < cfg.MaxAttachmentsPerMessage {
+		return Config{}, errors.New("MAX_ATTACHMENTS_PER_CHAT must be an integer >= MAX_ATTACHMENTS_PER_MESSAGE")
+	}
+	cfg.MaxAttachmentContextBytes, err = strconv.Atoi(value("MAX_ATTACHMENT_CONTEXT_BYTES", strconv.Itoa(DefaultMaxAttachmentContextBytes)))
+	if err != nil || cfg.MaxAttachmentContextBytes < 1024 {
+		return Config{}, errors.New("MAX_ATTACHMENT_CONTEXT_BYTES must be an integer >= 1024")
 	}
 	return cfg, nil
 }

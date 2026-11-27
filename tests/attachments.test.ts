@@ -4,8 +4,11 @@ import { test } from 'node:test'
 import {
   CHAT_ATTACHMENT_ACCEPT,
   formatAttachmentSize,
+  inferDraftKind,
   isRenderableImageAttachment,
   isSafeRasterPreviewFile,
+  MAX_CHAT_ATTACHMENTS,
+  MAX_CHAT_TOTAL_ATTACHMENTS,
 } from '../src/app/attachments'
 
 test('HTML, SVG, and XML are never treated as renderable <img> attachments', () => {
@@ -34,6 +37,18 @@ test('AttachmentViews renders non-raster files strictly as download cards withou
   assert.ok(CHAT_ATTACHMENT_ACCEPT.includes('.svg'))
   assert.ok(CHAT_ATTACHMENT_ACCEPT.includes('.zip'))
   assert.ok(CHAT_ATTACHMENT_ACCEPT.includes('.pdf'))
+  assert.ok(CHAT_ATTACHMENT_ACCEPT.includes('.docx'))
+  assert.ok(CHAT_ATTACHMENT_ACCEPT.includes('.xlsx'))
+  assert.ok(CHAT_ATTACHMENT_ACCEPT.includes('.pptx'))
+  assert.ok(CHAT_ATTACHMENT_ACCEPT.includes('.odt'))
+  assert.ok(CHAT_ATTACHMENT_ACCEPT.includes('.rtf'))
+  assert.ok(CHAT_ATTACHMENT_ACCEPT.includes('.epub'))
+  assert.ok(CHAT_ATTACHMENT_ACCEPT.includes('.tsv'))
+  assert.equal(MAX_CHAT_ATTACHMENTS, 10)
+  assert.equal(MAX_CHAT_TOTAL_ATTACHMENTS, 20)
+  assert.equal(inferDraftKind({ name: 'lecture.docx', type: '' }), 'document')
+  assert.equal(inferDraftKind({ name: 'deck.pptx', type: '' }), 'document')
+  assert.equal(inferDraftKind({ name: 'book.epub', type: '' }), 'document')
   assert.equal(formatAttachmentSize(512), '512 Б')
   assert.equal(formatAttachmentSize(1536), '2 КБ')
 })

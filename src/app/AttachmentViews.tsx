@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import { Download, FileArchive, FileCode, FileText, Image as ImageIcon, LoaderCircle, Paperclip, X } from 'lucide-react'
+import { AlertTriangle, Download, FileArchive, FileCode, FileText, Image as ImageIcon, LoaderCircle, Paperclip, X } from 'lucide-react'
 import type { MessageAttachment } from '../protocol/types'
 import type { RemoteTransport } from '../transport/RemoteTransport'
 import { type DraftAttachment, formatAttachmentSize, isRenderableImageAttachment } from './attachments'
 
 function attachmentFileIcon(att: Pick<MessageAttachment, 'kind' | 'name'>) {
   if (att.kind === 'archive' || att.name.toLowerCase().endsWith('.zip')) return FileArchive
-  if (att.kind === 'pdf' || att.name.toLowerCase().endsWith('.pdf')) return FileText
+  if (att.kind === 'pdf' || att.kind === 'document' || att.name.toLowerCase().endsWith('.pdf')) return FileText
   if (att.kind === 'text') return FileCode
   return Paperclip
 }
@@ -106,10 +106,15 @@ export function TurnAttachments({
             const Icon = att.kind === 'image' ? ImageIcon : attachmentFileIcon(att)
             const sizeLabel = formatAttachmentSize(att.sizeBytes)
             return (
-              <li key={att.id ?? `${att.name}-${index}`} title={att.name}>
+              <li key={att.id ?? `${att.name}-${index}`} title={att.warning ? `${att.name}: ${att.warning}` : att.name}>
                 <Icon size={14} aria-hidden="true" />
                 <span className="att-file-name">{att.name}</span>
                 {sizeLabel && <small className="att-file-size">{sizeLabel}</small>}
+                {att.warning && (
+                  <span className="att-warning-badge" title={att.warning} aria-label={att.warning}>
+                    <AlertTriangle size={12} aria-hidden="true" />
+                  </span>
+                )}
                 {att.url && remote && (
                   <button
                     type="button"
@@ -162,6 +167,7 @@ export function DraftAttachmentsBar({
   onRemove: (localId: string) => void
   onDismissError: () => void
 }) {
+  const warnings = attachments.filter(a => a.status === 'ready' && !!a.warning)
   if (attachments.length === 0 && !error) return null
   return (
     <div className="composer-attachments-wrap">
@@ -173,13 +179,26 @@ export function DraftAttachmentsBar({
           </button>
         </div>
       )}
+      {warnings.length > 0 && (
+        <div className="composer-attachment-warning" role="status">
+          <AlertTriangle size={13} aria-hidden="true" />
+          <span>{warnings.map(w => `${w.name}: ${w.warning}`).join(' · ')}</span>
+        </div>
+      )}
       {attachments.length > 0 && (
         <ul className="composer-attachments" aria-label="Прикреплённые файлы">
           {attachments.map(att => {
             const Icon = attachmentFileIcon(att)
             const sizeLabel = formatAttachmentSize(att.sizeBytes)
+            const progressLabel = att.status === 'uploading'
+              ? (att.progress != null && att.progress > 0 && att.progress < 100
+                  ? `Загрузка ${att.progress}%…`
+                  : att.progress === 100
+                    ? 'Обработка…'
+                    : 'Загрузка…')
+              : sizeLabel
             return (
-              <li key={att.localId} className={`composer-att-chip is-${att.status}`}>
+              <li key={att.localId} className={`composer-att-chip is-${att.status}`} title={att.warning ?? att.name}>
                 {att.kind === 'image' && att.previewUrl ? (
                   <img src={att.previewUrl} alt={att.name} className="composer-att-thumb" />
                 ) : (
@@ -191,10 +210,18 @@ export function DraftAttachmentsBar({
                 )}
                 <span className="composer-att-meta">
                   <strong title={att.name}>{att.name}</strong>
-                  <small>
-                    {att.status === 'uploading' ? 'Загрузка…' : sizeLabel}
-                  </small>
+                  <small>{progressLabel}</small>
+                  {att.status === 'uploading' && (
+                    <span className="composer-att-progress" aria-hidden="true">
+                      <span style={{ width: `${att.progress ?? 0}%` }} />
+                    </span>
+                  )}
                 </span>
+                {att.warning && (
+                  <span className="att-warning-badge" title={att.warning} aria-label={att.warning}>
+                    <AlertTriangle size={12} aria-hidden="true" />
+                  </span>
+                )}
                 <button
                   type="button"
                   className="composer-att-remove"

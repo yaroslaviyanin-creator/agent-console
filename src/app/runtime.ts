@@ -12,22 +12,52 @@ interface Connection {
 const demoTransport = new MockTransport({ nearLimit: true })
 export let transport: TransportAdapter = demoTransport
 
+let memoryConnection: Connection | null = null
+let storageBlocked = false
+
 export function setTransport(adapter: TransportAdapter = demoTransport) {
   transport = adapter
 }
 
+export function isStorageBlocked(): boolean {
+  if (storageBlocked) return true
+  if (typeof window === 'undefined') return false
+  try {
+    void window.localStorage.getItem(storageKey)
+    return false
+  } catch {
+    storageBlocked = true
+    return true
+  }
+}
+
 export function readConnection(): Connection {
   try {
-    if (typeof window === 'undefined') return { mode: 'demo', address: defaultServerAddress }
-    const saved = JSON.parse(localStorage.getItem(storageKey) ?? 'null')
+    if (typeof window === 'undefined') return memoryConnection ?? { mode: 'demo', address: defaultServerAddress }
+    const saved = JSON.parse(window.localStorage.getItem(storageKey) ?? 'null')
+    storageBlocked = false
     if (saved && typeof saved.address === 'string' && (saved.mode === 'demo' || saved.mode === 'server')) {
-      return { mode: saved.mode, address: saved.address, token: typeof saved.token === 'string' ? saved.token : undefined }
+      const connection: Connection = {
+        mode: saved.mode,
+        address: saved.address,
+        token: typeof saved.token === 'string' ? saved.token : undefined,
+      }
+      memoryConnection = connection
+      return connection
     }
-  } catch { /* Storage may be unavailable in a web view. */ }
-  return { mode: 'demo', address: defaultServerAddress }
+  } catch {
+    storageBlocked = true
+  }
+  return memoryConnection ?? { mode: 'demo', address: defaultServerAddress }
 }
 
 export function saveConnection(connection: Connection) {
-  try { localStorage.setItem(storageKey, JSON.stringify(connection)) }
-  catch { /* The current session remains usable without storage. */ }
+  memoryConnection = { ...connection }
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(storageKey, JSON.stringify(connection))
+    storageBlocked = false
+  } catch {
+    storageBlocked = true
+  }
 }

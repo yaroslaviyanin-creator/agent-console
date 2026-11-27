@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { ArrowRight, QrCode, Terminal } from 'lucide-react'
 import { useTelegramBack } from '../platform/telegram'
 import { login, restoreConnection, setConnectionMode, useChats } from './chatStore'
+import { isStorageBlocked } from './runtime'
 import { ConnectionMode } from './ConnectionMode'
 
 const connection = btoa('mock://agent-console')
@@ -111,6 +112,11 @@ export function Login() {
         {!demo && connectionError && <button type="button" className="alt-action" disabled={busy} onClick={() => void restoreConnection()}>Восстановить сессию</button>}
       </form>
       {demo && <p className="demo-accounts">Демо-логины: <code>demo</code>, <code>alex</code>, <code>maria</code>. Пароль для всех: <code>demo</code>.</p>}
+      {isStorageBlocked() && (
+        <p className="form-help">
+          Хранилище браузера ограничено (например, в Brave Shields или iframe): сессия сохранится только до закрытия вкладки.
+        </p>
+      )}
     </section>
   )
 }

@@ -482,7 +482,7 @@ var runDeniedMessages = map[store.RunDenied]string{
 }
 
 func (a *API) startRun(ctx context.Context, cancel context.CancelFunc, userID, deviceID, ownerID, targetProvider string, req runRequest, release func(*runEvent)) error {
-	_, attached, err := a.db.BeginRunForDeviceWithAttachments(ctx, userID, deviceID, req.ChatID, req.MessageID, req.Prompt, targetProvider, req.Model.ID, req.AttachmentIDs)
+	_, attached, err := a.db.BeginRunForDeviceWithAttachmentsLimit(ctx, userID, deviceID, req.ChatID, req.MessageID, req.Prompt, targetProvider, req.Model.ID, req.AttachmentIDs, a.config.EffectiveMaxAttachmentsPerMessage())
 	if err != nil {
 		return err
 	}
@@ -578,7 +578,7 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 	}
 
 	resumeSessionID := ""
-	prompt := buildPromptWithAttachments(req.Prompt, attached)
+	prompt := buildPromptWithAttachmentsBudget(req.Prompt, attached, a.config.EffectiveMaxAttachmentContextBytes())
 	if targetProvider == sessionProvider {
 		resumeSessionID = sessionID
 	} else {
