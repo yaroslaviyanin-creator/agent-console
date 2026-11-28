@@ -1,6 +1,7 @@
 import { historyUntil, previousTurn } from './runHistory'
 import { create } from 'zustand'
-import type { LoginRequest, MessageAttachment, Workspace, PermissionDecision, Provider, RunEvent, ServerMessage, ServerModel, ServerProvider, ServerProviderInfo, ShareAccess, Target, ToolCall } from '../protocol/types'
+import type { LoginRequest, MessageAttachment, MessageUsage, Workspace, PermissionDecision, Provider, RunEvent, RunRequest, ServerMessage, ServerModel, ServerProvider, ServerProviderInfo, ShareAccess, Target, ToolCall } from '../protocol/types'
+import { MockWorkspace } from '../transport/MockWorkspace'
 import { type DraftAttachment, inferDraftKind, isSafeRasterPreviewFile, MAX_ATTACHMENT_MB, MAX_CHAT_ATTACHMENTS, MAX_CHAT_TOTAL_ATTACHMENTS, MAX_IMAGE_MB } from './attachments'
 import { useAccountStore, blockReason } from './accountStore'
 import { readConnection, saveConnection, setTransport, transport } from './runtime'
@@ -43,6 +44,7 @@ export interface Turn {
   progress?: string
   durationMs?: number
   id: string
+  userMessageId?: string
   prompt: string
   parentId?: string | null
   retryOf?: string
@@ -51,6 +53,9 @@ export interface Turn {
   authorId?: string
   time: number
   model: string
+  modelId?: string
+  provider?: ServerProvider
+  usage?: MessageUsage
   parts: Part[]
   seq: number
   state: 'running' | 'completed' | 'stopped' | 'error' | 'refused' | 'denied'
@@ -59,6 +64,7 @@ export interface Turn {
 export interface Chat {
   id: string
   title: string
+  pinned?: boolean
   access: ShareAccess | 'owner'
   provider?: ServerProvider
   serverProvider?: ServerProvider
@@ -135,10 +141,37 @@ function remember() {
     drafts.set(workspace.user.id + '/' + c.id, c.draft)
   }
 }
+function sortChatsPinnedFirst(list: Chat[]): Chat[] {
+  const pinned: Chat[] = []
+  const regular: Chat[] = []
+  for (const item of list) {
+    if (item.pinned) pinned.push(item)
+    else regular.push(item)
+  }
+  return [...pinned, ...regular]
+}
+
+export function resolveAvailableProviders(
+  isRemote: boolean,
+  serverProviders: readonly ServerProviderInfo[],
+  defaultServerProvider: ServerProvider | null,
+): ServerProviderInfo[] {
+  if (!isRemote) {
+    return [
+      { id: 'claude', available: true },
+      { id: 'codex', available: true },
+      { id: 'antigravity', available: true },
+    ]
+  }
+  const available = serverProviders.filter(p => p.available)
+  if (available.length > 0) return available
+  return defaultServerProvider ? [{ id: defaultServerProvider, available: true }] : []
+}
+
 function loadWorkspace(w: Workspace | null, preferred?: string) {
   remember()
   if (!w) { useChats.setState({ workspace: null, chats: [], activeId: '' }); return }
-  const chats = w.chats.map(room => {
+  const rawChats = w.chats.map(room => {
     const saved = transcripts.get(room.id) ?? chat(room.id, 'Новый чат')
     let target = saved.target
     if (target.mode === 'mcp') {
@@ -148,8 +181,16 @@ function loadWorkspace(w: Workspace | null, preferred?: string) {
       }
     }
     const turns = saved.turns.map(t => t.authorId ? t : { ...t, authorId: room.ownerId })
-    return { ...saved, turns, access: room.access, target, draft: drafts.get(w.user.id + '/' + room.id) ?? '' }
+    return {
+      ...saved,
+      pinned: Boolean(room.pinned ?? saved.pinned),
+      turns,
+      access: room.access,
+      target,
+      draft: drafts.get(w.user.id + '/' + room.id) ?? '',
+    }
   })
+  const chats = sortChatsPinnedFirst(rawChats)
   const id = preferred ?? useChats.getState().activeId
   useChats.setState({ workspace: w, chats, activeId: chats.some(c => c.id === id) ? id : chats[0]?.id ?? '' })
 }
@@ -449,33 +490,37 @@ function applyRemoteWorkspace(remote: RemoteTransport, workspace: Workspace, pre
   if (state.remote !== remote) return
   const existing = new Map(state.chats.map(item => [item.id, item]))
   const accessById = new Map(workspace.chats.map(c => [c.id, c.access]))
-  const chats = remote.chats.map(item => {
+  const pinnedById = new Map(workspace.chats.map(c => [c.id, Boolean(c.pinned)]))
+  const rawChats = remote.chats.map(item => {
     const previous = existing.get(item.id)
     const serverProvider = item.provider ?? remote.provider
     const serverModel = serverProvider === 'stub' || item.model === 'codex' || item.model === 'antigravity' ? 'default' : item.model
     if ('archived' in item && typeof item.archived === 'boolean') {
-      return { ...(previous ?? chat(item.id, item.title, 'read')), title: item.title, provider: serverProvider, serverProvider, model: serverModel, indexedCodex: true, archived: item.archived }
+      return { ...(previous ?? chat(item.id, item.title, 'read')), title: item.title, pinned: false, provider: serverProvider, serverProvider, model: serverModel, indexedCodex: true, archived: item.archived }
     }
     const access = accessById.get(item.id) ?? 'read'
+    const pinned = item.pinned ?? pinnedById.get(item.id) ?? false
     if (!previous) {
-      return { ...chat(item.id, item.title, access), provider: serverProvider, serverProvider, model: serverModel }
+      return { ...chat(item.id, item.title, access), pinned, provider: serverProvider, serverProvider, model: serverModel }
     }
     const prevServerProvider = previous.serverProvider ?? serverProvider
     const hasLocalProviderOverride = previous.provider != null && previous.provider !== prevServerProvider
     const serverChanged = serverProvider !== prevServerProvider
     if (hasLocalProviderOverride && !serverChanged) {
-      return { ...previous, title: item.title, access, serverProvider }
+      return { ...previous, title: item.title, pinned, access, serverProvider }
     }
     const externalProviderChange = serverChanged && previous.provider !== serverProvider
     return {
       ...previous,
       title: item.title,
+      pinned,
       access,
       provider: serverProvider,
       serverProvider,
       ...(externalProviderChange ? { model: serverModel, reasoning: undefined } : {}),
     }
   })
+  const chats = sortChatsPinnedFirst(rawChats)
   for (const id of runs.keys()) if (!accessById.has(id)) stopChat(id)
   const selected = preferred ?? state.activeId
   const activeId = chats.some(c => c.id === selected) ? selected : chats[0]?.id ?? ''
@@ -573,11 +618,13 @@ function restoreTurns(messages: ServerMessage[], local: Turn[], label: string): 
     if (message.role === 'user') {
       const id = message.runId ?? message.id
       const pending = localByID.get(id)
-      previousPrompt = pending ?? {
-        id, prompt: message.content, model: label, time: message.createdAt, parts: [], seq: 0,
-        ...(message.attachments?.length ? { attachments: message.attachments } : {}),
-        state: 'stopped', notice: 'В истории пока есть только запрос.',
-      }
+      previousPrompt = pending
+        ? { ...pending, userMessageId: message.id, prompt: message.content }
+        : {
+          id, userMessageId: message.id, prompt: message.content, model: label, time: message.createdAt, parts: [], seq: 0,
+          ...(message.attachments?.length ? { attachments: message.attachments } : {}),
+          state: 'stopped', notice: 'В истории пока есть только запрос.',
+        }
       turns.set(id, previousPrompt)
     } else {
       const prompt = turns.get(message.runId ?? message.id) ?? (!message.runId ? previousPrompt : undefined)
@@ -585,9 +632,18 @@ function restoreTurns(messages: ServerMessage[], local: Turn[], label: string): 
       const parts: Part[] = []
       if (message.thinking) parts.push({ kind: 'thinking', text: message.thinking })
       if (message.content) parts.push({ kind: 'text', text: message.content })
+      const resolvedModelLabel = localByID.get(message.id)?.model ?? (message.model && message.model !== 'default' ? message.model : undefined) ?? label
       turns.set(message.id, {
-        id: message.id, prompt: prompt?.prompt ?? '', model: localByID.get(message.id)?.model ?? label,
-        time: prompt?.time ?? message.createdAt, parts, seq: 0,
+        id: message.id,
+        ...(prompt?.userMessageId ? { userMessageId: prompt.userMessageId } : {}),
+        prompt: prompt?.prompt ?? '',
+        model: resolvedModelLabel,
+        ...(message.model ? { modelId: message.model } : {}),
+        ...(message.provider ? { provider: message.provider } : {}),
+        ...(message.usage ? { usage: message.usage } : {}),
+        time: prompt?.time ?? message.createdAt,
+        parts,
+        seq: 0,
         ...(prompt?.attachments?.length ? { attachments: prompt.attachments } : {}),
         ...(message.progress ? { progress: message.progress } : {}),
         ...(message.durationMs != null ? { durationMs: message.durationMs } : {}),
@@ -665,6 +721,9 @@ export function applyEvent(turn: Turn, event: RunEvent): Turn {
     case 'done':
       next.state = event.reason
       if (event.durationMs != null) next.durationMs = event.durationMs
+      if (event.provider) next.provider = event.provider
+      if (event.model) next.modelId = event.model
+      if (event.usage) next.usage = event.usage
       break
   }
   return next
@@ -935,6 +994,377 @@ export function clearChatAttachmentError(chatId: string) {
   updateChat(chatId, c => ({ ...c, attachmentError: undefined }))
 }
 
+export function exportChatMarkdown(c: Chat): string {
+  const lines: string[] = [`# ${c.title || 'Чат'}`, '']
+  for (const turn of c.turns) {
+    const timeStr = new Date(turn.time).toLocaleString('ru-RU')
+    if (turn.prompt) {
+      lines.push(`## Пользователь (${timeStr})`, '', turn.prompt, '')
+    }
+    const textParts = turn.parts.flatMap(p => (p.kind === 'text' ? [p.text] : [])).join('\n\n').trim()
+    const thinkingParts = turn.parts.flatMap(p => (p.kind === 'thinking' ? [p.text] : [])).join('\n\n').trim()
+    const meta = [turn.model, turn.provider].filter(Boolean).join(' · ')
+    lines.push(`## Ассистент${meta ? ` — ${meta}` : ''}`, '')
+    if (thinkingParts) {
+      lines.push('<details>', '<summary>Размышления</summary>', '', thinkingParts, '', '</details>', '')
+    }
+    if (textParts) {
+      lines.push(textParts, '')
+    } else if (turn.notice) {
+      lines.push(`_${turn.notice}_`, '')
+    }
+    lines.push('---', '')
+  }
+  return lines.join('\n').trimEnd() + '\n'
+}
+
+export function downloadChatMarkdown(c: Chat) {
+  if (typeof document === 'undefined' || typeof Blob === 'undefined' || typeof URL === 'undefined') return
+  const md = exportChatMarkdown(c)
+  const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  try {
+    const a = document.createElement('a')
+    const safeName = (c.title || 'chat').replace(/[\\/:*?"<>|]+/g, '-').trim() || 'chat'
+    a.href = url
+    a.download = `${safeName}.md`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+}
+
+export async function renameChat(chatId: string, title: string) {
+  const trimmed = title.trim()
+  if (!trimmed || trimmed.length > 200) return
+  const { remote, chats } = useChats.getState()
+  const target = chats.find(c => c.id === chatId)
+  if (!target || target.access !== 'owner' || target.indexedCodex) return
+  if (remote) {
+    try {
+      const { workspace } = await remote.patchChat(chatId, { title: trimmed })
+      if (useChats.getState().remote === remote) applyRemoteWorkspace(remote, workspace)
+    } catch (error) {
+      if (useChats.getState().remote === remote) {
+        useChats.setState({ connectionError: error instanceof Error ? error.message : 'Не удалось переименовать чат.' })
+      }
+    }
+    return
+  }
+  updateChat(chatId, c => ({ ...c, title: trimmed }))
+  const saved = transcripts.get(chatId)
+  if (saved) transcripts.set(chatId, { ...saved, title: trimmed })
+}
+
+export async function togglePinChat(chatId: string) {
+  const { remote, chats } = useChats.getState()
+  const target = chats.find(c => c.id === chatId)
+  if (!target || target.access !== 'owner' || target.indexedCodex) return
+  const nextPinned = !target.pinned
+  if (remote) {
+    try {
+      const { workspace } = await remote.patchChat(chatId, { pinned: nextPinned })
+      if (useChats.getState().remote === remote) applyRemoteWorkspace(remote, workspace)
+    } catch (error) {
+      if (useChats.getState().remote === remote) {
+        useChats.setState({ connectionError: error instanceof Error ? error.message : 'Не удалось закрепить чат.' })
+      }
+    }
+    return
+  }
+  if (transport.workspace instanceof MockWorkspace) {
+    loadWorkspace(transport.workspace.setPinned(chatId, nextPinned))
+    return
+  }
+  useChats.setState(s => ({
+    chats: sortChatsPinnedFirst(s.chats.map(c => c.id === chatId ? { ...c, pinned: nextPinned } : c)),
+  }))
+}
+
+export async function forkChatAt(chatId: string, upToTurnId?: string) {
+  const { remote, chats } = useChats.getState()
+  const source = chats.find(c => c.id === chatId)
+  if (!source) return
+  if (remote) {
+    if (creatingIn === remote) return
+    creatingIn = remote
+    useChats.setState({ connectionError: '' })
+    try {
+      const { id, workspace } = await remote.forkChat(chatId, upToTurnId)
+      if (useChats.getState().remote === remote) applyRemoteWorkspace(remote, workspace, id)
+    } catch (error) {
+      if (useChats.getState().remote === remote) {
+        useChats.setState({ connectionError: error instanceof Error ? error.message : 'Не удалось создать ветку чата.' })
+      }
+    } finally {
+      if (creatingIn === remote) creatingIn = null
+    }
+    return
+  }
+  const { id, workspace } = await transport.workspace.createChat(source.id)
+  const idx = upToTurnId ? source.turns.findIndex(t => t.id === upToTurnId) : source.turns.length - 1
+  const slicedTurns = idx >= 0 ? structuredClone(source.turns.slice(0, idx + 1)) : structuredClone(source.turns)
+  const c: Chat = { ...chat(id, source.title + ' · копия'), turns: slicedTurns, model: source.model, target: { mode: 'chat' } }
+  transcripts.set(id, c)
+  const active = useChats.getState().activeId
+  if (runs.has(active)) stopChat(active)
+  loadWorkspace(workspace, id)
+}
+
+export async function deleteChatItem(chatId: string) {
+  const { remote, chats } = useChats.getState()
+  const target = chats.find(c => c.id === chatId)
+  if (!target || target.access !== 'owner' || target.indexedCodex) return
+  stopChat(chatId)
+  if (remote) {
+    try {
+      const workspace = await remote.deleteChat(chatId)
+      if (useChats.getState().remote === remote) applyRemoteWorkspace(remote, workspace)
+    } catch (error) {
+      if (useChats.getState().remote === remote) {
+        useChats.setState({ connectionError: error instanceof Error ? error.message : 'Не удалось удалить чат.' })
+      }
+    }
+    return
+  }
+  transcripts.delete(chatId)
+  if (transport.workspace instanceof MockWorkspace) {
+    loadWorkspace(transport.workspace.deleteChat(chatId))
+    return
+  }
+  useChats.setState(s => {
+    const remaining = s.chats.filter(c => c.id !== chatId)
+    const activeId = s.activeId === chatId ? remaining[0]?.id ?? '' : s.activeId
+    return { chats: remaining, activeId }
+  })
+}
+
+export async function deleteChatMessage(chatId: string, turnId: string) {
+  const { remote, chats } = useChats.getState()
+  const target = chats.find(c => c.id === chatId)
+  if (!target || runs.has(chatId) || (target.access !== 'owner' && target.access !== 'write')) return
+  const turn = target.turns.find(t => t.id === turnId)
+  if (!turn) return
+  if (remote) {
+    try {
+      await remote.deleteMessage(chatId, turn.id)
+      await loadRemoteHistory(remote, chatId)
+    } catch (error) {
+      if (useChats.getState().remote === remote) {
+        useChats.setState({ connectionError: error instanceof Error ? error.message : 'Не удалось удалить сообщение.' })
+      }
+    }
+    return
+  }
+  updateChat(chatId, c => ({ ...c, turns: c.turns.filter(t => t.id !== turnId) }))
+}
+
+async function executeTurnStream(
+  chatId: string,
+  turnId: string,
+  request: Omit<RunRequest, 'chatId' | 'messageId'>,
+  restoreDraftOnBusy?: string,
+) {
+  const controller = new AbortController()
+  runs.set(chatId, controller)
+  try {
+    for await (const event of transport.stream({ ...request, chatId, messageId: turnId }, controller.signal)) {
+      if (controller.signal.aborted) break
+      if (event.chatId === chatId && event.messageId === turnId) {
+        updateTurn(chatId, turnId, t => applyEvent(t, event))
+        if (restoreDraftOnBusy !== undefined && event.type === 'error' && (event.code === 'chat_busy' || event.code === 'server_busy')) {
+          updateChat(chatId, current => current.draft ? current : { ...current, draft: restoreDraftOnBusy })
+        }
+        if (event.type === 'done' || event.type === 'error') break
+      }
+    }
+    updateTurn(chatId, turnId, t => t.state === 'running' ? { ...t, state: 'error', notice: 'Поток завершился без подтверждения.' } : t)
+  } catch (error) {
+    if (!controller.signal.aborted) {
+      updateTurn(chatId, turnId, t => ({ ...t, state: 'error', notice: error instanceof Error ? error.message : 'Потеряно соединение' }))
+    }
+  } finally {
+    if (runs.get(chatId) === controller) runs.delete(chatId)
+  }
+}
+
+export async function regenerateTurn(
+  chatId: string,
+  turnId: string,
+  options?: { provider?: ServerProvider; model?: string },
+) {
+  const { workspace, chats, remote, connected, serverModelsByProvider, lastModelByProvider } = useChats.getState()
+  const c = chats.find(item => item.id === chatId)
+  if (!workspace || !c || runs.has(chatId) || (c.access !== 'owner' && c.access !== 'write')) return
+  const index = c.turns.findIndex(t => t.id === turnId)
+  const source = index >= 0 ? c.turns[index] : undefined
+  if (!source || source.state === 'running') return
+
+  if (!remote) {
+    const modelId = options?.model ?? c.model
+    const model = models.find(m => m.id === modelId) ?? models[0]
+    if (!source.prompt || blockReason(useAccountStore.getState().quotas[model.provider])) return
+    const parentId = previousTurn(c.turns, index)
+    const history = historyUntil(c.turns, parentId)
+    const turn: Turn = {
+      parentId,
+      target: source.target ?? c.target,
+      id: crypto.randomUUID(),
+      time: Date.now(),
+      authorId: workspace.user.id,
+      ...(source.attachments?.length ? { attachments: source.attachments } : {}),
+      prompt: source.prompt,
+      model: model.label,
+      modelId: model.id,
+      provider: model.provider,
+      seq: 0,
+      state: 'running',
+      parts: [],
+    }
+    updateChat(chatId, value => ({ ...value, model: model.id, turns: [...value.turns.slice(0, index), turn] }))
+    await executeTurnStream(chatId, turn.id, {
+      model: { id: model.id, provider: model.provider },
+      target: turn.target!,
+      prompt: source.prompt,
+      history,
+    })
+    return
+  }
+
+  if (!connected || !c.historyLoaded) return
+  const targetProvider: ServerProvider = options?.provider ?? c.provider ?? remote.provider
+  if (targetProvider !== 'stub' && serverModelsByProvider[targetProvider] === undefined) {
+    await refreshServerModels(targetProvider, false, remote)
+  }
+  const latest = useChats.getState()
+  const catalog = latest.serverModelsByProvider[targetProvider] ?? []
+  const resolved = options?.model
+    ? { model: options.model, reasoning: c.reasoning }
+    : targetProvider === (c.provider ?? remote.provider)
+      ? { model: c.model, reasoning: c.reasoning }
+      : resolveProviderModel(c, targetProvider, catalog, latest.lastModelByProvider ?? lastModelByProvider)
+
+  try {
+    const prep = await remote.regenerateMessage(chatId, source.id, { provider: targetProvider, model: resolved.model })
+    const serverModel = catalog.find(m => m.id === resolved.model)
+    const wireProvider: Provider = targetProvider === 'stub' ? 'codex' : targetProvider
+    const turn: Turn = {
+      id: crypto.randomUUID(),
+      userMessageId: prep.userMessageId,
+      prompt: prep.prompt,
+      ...(prep.attachments?.length ? { attachments: prep.attachments } : {}),
+      time: source.time,
+      authorId: workspace.user.id,
+      provider: targetProvider,
+      modelId: resolved.model,
+      model: serverModel?.name ?? (targetProvider === 'stub' ? 'StubProvider' : providerLabels[wireProvider]),
+      seq: 0,
+      state: 'running',
+      parts: [],
+    }
+    updateChat(chatId, value => ({
+      ...value,
+      provider: targetProvider,
+      serverProvider: targetProvider,
+      model: resolved.model,
+      turns: [...value.turns.slice(0, index), turn],
+    }))
+    await executeTurnStream(chatId, turn.id, {
+      reuseUserMessageId: prep.userMessageId,
+      provider: targetProvider,
+      model: { id: resolved.model, provider: wireProvider },
+      ...(resolved.reasoning ? { reasoning: resolved.reasoning } : {}),
+      target: { mode: 'chat' },
+      prompt: prep.prompt,
+    })
+  } catch (error) {
+    if (useChats.getState().remote === remote) {
+      useChats.setState({ connectionError: error instanceof Error ? error.message : 'Не удалось перегенерировать ответ.' })
+    }
+  }
+}
+
+export async function editAndResendPrompt(chatId: string, turnId: string, newContent: string) {
+  const trimmed = newContent.trim()
+  if (!trimmed) return
+  const { workspace, chats, remote, connected, serverModelsByProvider } = useChats.getState()
+  const c = chats.find(item => item.id === chatId)
+  if (!workspace || !c || runs.has(chatId) || (c.access !== 'owner' && c.access !== 'write')) return
+  const index = c.turns.findIndex(t => t.id === turnId)
+  const source = index >= 0 ? c.turns[index] : undefined
+  if (!source || source.state === 'running') return
+
+  if (!remote) {
+    const model = models.find(m => m.id === c.model) ?? models[0]
+    if (blockReason(useAccountStore.getState().quotas[model.provider])) return
+    const parentId = previousTurn(c.turns, index)
+    const history = historyUntil(c.turns, parentId)
+    const turn: Turn = {
+      parentId,
+      target: source.target ?? c.target,
+      id: crypto.randomUUID(),
+      time: Date.now(),
+      authorId: workspace.user.id,
+      ...(source.attachments?.length ? { attachments: source.attachments } : {}),
+      prompt: trimmed,
+      model: model.label,
+      modelId: model.id,
+      provider: model.provider,
+      seq: 0,
+      state: 'running',
+      parts: [],
+    }
+    updateChat(chatId, value => ({ ...value, turns: [...value.turns.slice(0, index), turn] }))
+    await executeTurnStream(chatId, turn.id, {
+      model: { id: model.id, provider: model.provider },
+      target: turn.target!,
+      prompt: trimmed,
+      history,
+    })
+    return
+  }
+
+  if (!connected || !c.historyLoaded) return
+  const targetMessageID = source.userMessageId ?? source.id
+  const chatProvider: ServerProvider = c.provider ?? remote.provider
+  const catalog = serverModelsByProvider[chatProvider] ?? []
+  const serverModel = catalog.find(m => m.id === c.model)
+  const wireProvider: Provider = chatProvider === 'stub' ? 'codex' : chatProvider
+
+  try {
+    const prep = await remote.editMessage(chatId, targetMessageID, trimmed)
+    const turn: Turn = {
+      id: crypto.randomUUID(),
+      userMessageId: prep.userMessageId,
+      prompt: trimmed,
+      ...(prep.attachments?.length ? { attachments: prep.attachments } : {}),
+      time: Date.now(),
+      authorId: workspace.user.id,
+      provider: chatProvider,
+      modelId: c.model,
+      model: serverModel?.name ?? (chatProvider === 'stub' ? 'StubProvider' : providerLabels[wireProvider]),
+      seq: 0,
+      state: 'running',
+      parts: [],
+    }
+    updateChat(chatId, value => ({ ...value, turns: [...value.turns.slice(0, index), turn] }))
+    await executeTurnStream(chatId, turn.id, {
+      reuseUserMessageId: prep.userMessageId,
+      provider: chatProvider,
+      model: { id: c.model, provider: wireProvider },
+      ...(c.reasoning ? { reasoning: c.reasoning } : {}),
+      target: { mode: 'chat' },
+      prompt: trimmed,
+    })
+  } catch (error) {
+    if (useChats.getState().remote === remote) {
+      useChats.setState({ connectionError: error instanceof Error ? error.message : 'Не удалось изменить сообщение.' })
+    }
+  }
+}
+
 export function sendPrompt(id: string, input: string) {
   return startRun(id, input)
 }
@@ -980,10 +1410,8 @@ async function startRun(id: string, input: string, retry?: { turnId: string; mod
   const turn: Turn = {
     ...retryFields, parentId, target, id: crypto.randomUUID(), time: Date.now(), authorId: workspace.user.id,
     ...(messageAttachments.length ? { attachments: messageAttachments } : {}),
-    prompt, model: remote && chatProvider === 'stub' ? 'StubProvider' : model.label, seq: 0, state: 'running', parts: [],
+    prompt, model: remote && chatProvider === 'stub' ? 'StubProvider' : model.label, modelId: model.id, provider: chatProvider, seq: 0, state: 'running', parts: [],
   }
-  const controller = new AbortController()
-  runs.set(id, controller)
   updateChat(id, value => ({
     ...value,
     title: !remote && value.title === 'Новый чат' ? (prompt || messageAttachments[0]?.name || 'Новый чат') : value.title,
@@ -994,10 +1422,10 @@ async function startRun(id: string, input: string, retry?: { turnId: string; mod
     target,
     turns: [...value.turns, turn],
   }))
-  try {
-    for await (const event of transport.stream({
-      chatId: id,
-      messageId: turn.id,
+  await executeTurnStream(
+    id,
+    turn.id,
+    {
       ...(remote ? { provider: chatProvider } : {}),
       model: { id: model.id, provider: model.provider },
       ...(c.reasoning ? { reasoning: c.reasoning } : {}),
@@ -1006,22 +1434,9 @@ async function startRun(id: string, input: string, retry?: { turnId: string; mod
       ...(attachmentIds.length ? { attachmentIds } : {}),
       ...(history ? { history } : {}),
       ...retryFields,
-    }, controller.signal)) {
-      if (controller.signal.aborted) break
-      if (event.chatId === id && event.messageId === turn.id) {
-        updateTurn(id, turn.id, t => applyEvent(t, event))
-        if (remote && event.type === 'error' && (event.code === 'chat_busy' || event.code === 'server_busy')) {
-          updateChat(id, current => current.draft ? current : { ...current, draft: prompt })
-        }
-        if (event.type === 'done' || event.type === 'error') break
-      }
-    }
-    updateTurn(id, turn.id, t => t.state === 'running' ? { ...t, state: 'error', notice: 'Поток завершился без подтверждения.' } : t)
-  } catch (error) {
-    if (!controller.signal.aborted) updateTurn(id, turn.id, t => ({ ...t, state: 'error', notice: error instanceof Error ? error.message : 'Потеряно соединение' }))
-  } finally {
-    if (runs.get(id) === controller) runs.delete(id)
-  }
+    },
+    remote ? prompt : undefined,
+  )
 }
 export async function decide(id: string, turnId: string, entry: ToolEntry, decision: PermissionDecision) {
   if (!entry.permission || entry.sending || entry.decision || entry.result || !runs.has(id)) return

@@ -47,6 +47,7 @@ const chatAccess = (chat: ServerChat, userId: string): ChatAccess => ({
   ownerId: chat.ownerId ?? userId,
   access: chat.access ?? 'owner',
   grants: chat.access === 'owner' ? chat.grants ?? [] : [],
+  ...(chat.pinned !== undefined ? { pinned: Boolean(chat.pinned) } : {}),
 })
 
 function readEvent(data: unknown): RunEvent | { type: 'workspace_changed' } | undefined {
@@ -419,9 +420,70 @@ export class RemoteTransport implements TransportAdapter {
       if (options.model) body.model = options.model
       if (options.title) body.title = options.title
       const chat = await this.request<ServerChat>('/api/chats', body, undefined, 'POST')
-      this.chatList = [chat, ...this.chatList]
+      const pinned = this.chatList.filter(c => c.pinned)
+      const regular = this.chatList.filter(c => !c.pinned)
+      this.chatList = [...pinned, chat, ...regular]
       return { id: chat.id, workspace: this.snapshot() }
     })
+  }
+
+  forkChat(chatId: string, upToMessageId?: string) {
+    return this.updateWorkspace(async () => {
+      const chat = await this.request<ServerChat>(
+        '/api/chats/' + encodeURIComponent(chatId) + '/fork',
+        upToMessageId ? { upToMessageId } : undefined,
+        undefined,
+        'POST',
+      )
+      await this.loadChatsAndUsers()
+      return { id: chat.id, workspace: this.snapshot() }
+    })
+  }
+
+  patchChat(chatId: string, patch: { title?: string; pinned?: boolean }) {
+    return this.updateWorkspace(async () => {
+      const updated = await this.request<ServerChat>('/api/chats/' + encodeURIComponent(chatId), patch, undefined, 'PATCH')
+      await this.loadChatsAndUsers()
+      return { chat: updated, workspace: this.snapshot() }
+    })
+  }
+
+  deleteChat(chatId: string) {
+    return this.updateWorkspace(async () => {
+      await this.request('/api/chats/' + encodeURIComponent(chatId), undefined, undefined, 'DELETE')
+      await this.loadChatsAndUsers()
+      return this.snapshot()
+    })
+  }
+
+  deleteMessage(chatId: string, messageId: string) {
+    return this.request<void>(
+      '/api/chats/' + encodeURIComponent(chatId) + '/messages/' + encodeURIComponent(messageId),
+      undefined,
+      undefined,
+      'DELETE',
+    )
+  }
+
+  regenerateMessage(chatId: string, messageId: string, options?: { provider?: ServerProvider; model?: string }) {
+    const body: { provider?: ServerProvider; model?: string } = {}
+    if (options?.provider) body.provider = options.provider
+    if (options?.model) body.model = options.model
+    return this.request<{ userMessageId: string; prompt: string; attachments?: MessageAttachment[] }>(
+      '/api/chats/' + encodeURIComponent(chatId) + '/messages/' + encodeURIComponent(messageId) + '/regenerate',
+      body,
+      undefined,
+      'POST',
+    )
+  }
+
+  editMessage(chatId: string, messageId: string, content: string) {
+    return this.request<{ userMessageId: string; prompt: string; attachments?: MessageAttachment[] }>(
+      '/api/chats/' + encodeURIComponent(chatId) + '/messages/' + encodeURIComponent(messageId),
+      { content },
+      undefined,
+      'PATCH',
+    )
   }
 
   async providers(signal?: AbortSignal): Promise<ServerProvidersResponse> {
@@ -609,10 +671,11 @@ export class RemoteTransport implements TransportAdapter {
         this.responses.set(key, controller)
         try {
           // SQLite history is authoritative in server mode.
-          const { chatId, messageId, provider, model, target, prompt, reasoning, attachmentIds } = request
+          const { chatId, messageId, reuseUserMessageId, provider, model, target, prompt, reasoning, attachmentIds } = request
           socket.send(JSON.stringify({
             chatId,
             messageId,
+            ...(reuseUserMessageId ? { reuseUserMessageId } : {}),
             ...(provider ? { provider } : {}),
             model,
             target,

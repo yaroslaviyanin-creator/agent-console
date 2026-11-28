@@ -3,7 +3,7 @@ import type { ChatAccess, Device, Grant, LoginRequest, ShareAccess, Target, Work
 export const users = [
   { id: 'demo', name: 'Демо-пользователь' }, { id: 'alex', name: 'Алексей' }, { id: 'maria', name: 'Мария' },
 ]
-interface Room { id: string; ownerId: string; grants: Grant[] }
+interface Room { id: string; ownerId: string; grants: Grant[]; pinned?: boolean }
 function room(id: string, ownerId: string, grants: Grant[] = []): Room { return { id, ownerId, grants } }
 
 export class MockWorkspace implements WorkspaceAdapter {
@@ -54,7 +54,7 @@ export class MockWorkspace implements WorkspaceAdapter {
     const { userId, deviceId } = this.requireSession()
     const chats: ChatAccess[] = []
     for (const r of this.rooms) {
-      if (r.ownerId === userId) chats.push({ id: r.id, ownerId: userId, access: 'owner', grants: r.grants })
+      if (r.ownerId === userId) chats.push({ id: r.id, ownerId: userId, access: 'owner', grants: r.grants, ...(r.pinned ? { pinned: true } : {}) })
       else {
         const g = r.grants.find(g => g.userId === userId)
         if (g) chats.push({ ...g, id: r.id, ownerId: r.ownerId, grants: [] })
@@ -91,6 +91,20 @@ export class MockWorkspace implements WorkspaceAdapter {
     const id = crypto.randomUUID()
     this.rooms.unshift(room(id, userId))
     return { id, workspace: this.snapshot() }
+  }
+  setPinned(chatId: string, pinned: boolean) {
+    const { userId } = this.requireSession()
+    const r = this.rooms.find(room => room.id === chatId && room.ownerId === userId)
+    if (!r) throw Error('Нет права закреплять этот чат.')
+    r.pinned = pinned
+    return this.snapshot()
+  }
+  deleteChat(chatId: string) {
+    const { userId } = this.requireSession()
+    const idx = this.rooms.findIndex(room => room.id === chatId && room.ownerId === userId)
+    if (idx < 0) throw Error('Нет права удалить этот чат.')
+    this.rooms.splice(idx, 1)
+    return this.snapshot()
   }
   authorize(chatId: string, target: Target, command: boolean) {
     const { userId } = this.requireSession()

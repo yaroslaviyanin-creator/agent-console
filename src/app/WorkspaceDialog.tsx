@@ -3,7 +3,8 @@ import { Check, ChevronRight, Copy, Laptop, LogOut, Monitor, Palette, Trash2, Up
 import type { ShareAccess, UserProfile, UserProfilePatch, Workspace } from '../protocol/types'
 import { getTelegramUserId } from '../platform/telegram'
 import type { RemoteTransport } from '../transport/RemoteTransport'
-import { ACCENT_PRESETS, GRADIENT_PALETTES, type ThemePreference, useAppearance } from './appearanceStore'
+import { ACCENT_PRESETS, GRADIENT_PALETTES, resolveTheme, type ThemePreference, useAppearance } from './appearanceStore'
+import { ColorWheelPicker } from './ColorWheelPicker'
 import { changeServerAddress, logout, refreshServerDevices, revokeDevice, setConnectionMode, setShare, updateSelfProfileMember, useChats } from './chatStore'
 import { ConnectionMode } from './ConnectionMode'
 import { SelectMenu } from './SelectMenu'
@@ -521,15 +522,23 @@ function AppearanceSection() {
   const {
     theme,
     accent,
+    accentCustomColor,
     ambientGradient,
     gradientPalette,
     gradientCustomColor,
+    gradientCustomColor2,
     setTheme,
     setAccent,
+    setAccentCustomColor,
     setAmbientGradient,
     setGradientPalette,
     setGradientCustomColor,
+    setGradientCustomColor2,
   } = useAppearance()
+  const [accentTab, setAccentTab] = useState<'presets' | 'custom'>(() => (accent === 'custom' ? 'custom' : 'presets'))
+  const [paletteTab, setPaletteTab] = useState<'presets' | 'custom'>(() => (gradientPalette === 'custom' ? 'custom' : 'presets'))
+  const [gradientSlot, setGradientSlot] = useState<1 | 2>(1)
+  const isLight = resolveTheme(theme) === 'light'
   const themeOptions: readonly { id: ThemePreference; label: string }[] = [
     { id: 'dark', label: 'Тёмная' },
     { id: 'light', label: 'Светлая' },
@@ -557,77 +566,159 @@ function AppearanceSection() {
         </div>
       </div>
 
-      <div className="settings-row">
-        <div className="settings-row-info">
-          <strong>Цветовая гамма</strong>
-          <small>Акцентные элементы, слайдер рассуждений и оттенки орбов</small>
-        </div>
-        <div className="accent-swatches" role="group" aria-label="Цветовая гамма">
-          {ACCENT_PRESETS.map(preset => (
+      <div className="settings-row settings-row-col">
+        <div className="settings-row-top">
+          <div className="settings-row-info">
+            <strong>Цветовая гамма</strong>
+            <small>Акцентные элементы и слайдер рассуждений</small>
+          </div>
+          <div className="settings-segmented color-mode-tabs" role="tablist" aria-label="Режим акцента">
             <button
-              key={preset.id}
               type="button"
-              className={`accent-swatch${accent === preset.id ? ' is-selected' : ''}`}
-              style={{ '--swatch': preset.swatch } as React.CSSProperties}
-              aria-label={preset.label}
-              title={preset.label}
-              aria-pressed={accent === preset.id}
-              onClick={() => setAccent(preset.id)}
+              role="tab"
+              aria-selected={accentTab === 'presets'}
+              onClick={() => setAccentTab('presets')}
             >
-              {accent === preset.id && <Check size={12} />}
+              Основные
             </button>
-          ))}
+            <button
+              type="button"
+              role="tab"
+              aria-selected={accentTab === 'custom'}
+              onClick={() => {
+                setAccentTab('custom')
+                if (accent !== 'custom') setAccentCustomColor(accentCustomColor)
+              }}
+            >
+              Свои цвета
+            </button>
+          </div>
         </div>
+        {accentTab === 'presets' ? (
+          <div className="accent-swatches" role="group" aria-label="Цветовая гамма">
+            {ACCENT_PRESETS.map(preset => (
+              <button
+                key={preset.id}
+                type="button"
+                className={`accent-swatch${accent === preset.id ? ' is-selected' : ''}`}
+                style={{ '--swatch': preset.swatch } as React.CSSProperties}
+                aria-label={preset.label}
+                title={preset.label}
+                aria-pressed={accent === preset.id}
+                onClick={() => setAccent(preset.id)}
+              >
+                {accent === preset.id && <Check size={12} />}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <ColorWheelPicker
+            value={accentCustomColor}
+            onChange={setAccentCustomColor}
+            label="HEX акцента"
+          />
+        )}
       </div>
 
-      <div className="settings-group">
+      <div className={`settings-group${isLight ? ' is-light-disabled' : ''}`}>
         <div className="settings-subhead">
           <h3>Эффекты и фон</h3>
+          {isLight && <span className="settings-light-note">Доступно в тёмной теме</span>}
         </div>
         <label className="settings-row memory-toggle">
           <span className="settings-row-info">
             <strong>Анимированный градиент на фоне</strong>
-            <small>Мягкое свечение орбов при генерации ответа, статичное в покое</small>
+            <small>
+              {isLight
+                ? 'Светлая тема использует чистый ровный фон без градиентов'
+                : 'Мягкое свечение орбов при генерации ответа, статичное в покое'}
+            </small>
           </span>
           <input
             type="checkbox"
             role="switch"
-            checked={ambientGradient}
+            checked={!isLight && ambientGradient}
+            disabled={isLight}
             aria-label="Анимированный градиент на фоне"
             onChange={e => setAmbientGradient(e.target.checked)}
           />
         </label>
-        <div className="settings-row palette-row">
-          <div className="settings-row-info">
-            <strong>Палитра градиента</strong>
-            <small>Готовые сочетания или свой оттенок для фоновых орбов</small>
-          </div>
-          <div className="palette-picker" role="group" aria-label="Палитра градиента">
-            {GRADIENT_PALETTES.map(preset => (
+        <div className="settings-row palette-row settings-row-col">
+          <div className="settings-row-top">
+            <div className="settings-row-info">
+              <strong>Палитра градиента</strong>
+              <small>Готовые сочетания или два своих оттенка для фоновых орбов</small>
+            </div>
+            <div className="settings-segmented color-mode-tabs" role="tablist" aria-label="Режим палитры градиента">
               <button
-                key={preset.id}
                 type="button"
-                className={`palette-chip${gradientPalette === preset.id ? ' is-selected' : ''}`}
-                aria-pressed={gradientPalette === preset.id}
-                disabled={!ambientGradient}
-                onClick={() => setGradientPalette(preset.id)}
+                role="tab"
+                disabled={isLight || !ambientGradient}
+                aria-selected={paletteTab === 'presets'}
+                onClick={() => setPaletteTab('presets')}
               >
-                <span className="palette-dot" style={{ background: preset.swatch }} aria-hidden="true" />
-                <span>{preset.label}</span>
+                Основные
               </button>
-            ))}
-            <label className={`palette-chip palette-custom${gradientPalette === 'custom' ? ' is-selected' : ''}`} title="Свой цвет">
-              <input
-                type="color"
-                value={gradientCustomColor}
-                disabled={!ambientGradient}
-                aria-label="Свой цвет градиента"
-                onChange={e => setGradientCustomColor(e.target.value)}
-              />
-              <span className="palette-dot" style={{ background: gradientCustomColor }} aria-hidden="true" />
-              <span>Свой</span>
-            </label>
+              <button
+                type="button"
+                role="tab"
+                disabled={isLight || !ambientGradient}
+                aria-selected={paletteTab === 'custom'}
+                onClick={() => {
+                  setPaletteTab('custom')
+                  if (gradientPalette !== 'custom') setGradientCustomColor(gradientCustomColor)
+                }}
+              >
+                Свои цвета
+              </button>
+            </div>
           </div>
+          {paletteTab === 'presets' ? (
+            <div className="palette-picker" role="group" aria-label="Палитра градиента">
+              {GRADIENT_PALETTES.map(preset => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  className={`palette-chip${gradientPalette === preset.id ? ' is-selected' : ''}`}
+                  aria-pressed={gradientPalette === preset.id}
+                  disabled={isLight || !ambientGradient}
+                  onClick={() => setGradientPalette(preset.id)}
+                >
+                  <span className="palette-dot" style={{ background: preset.swatch }} aria-hidden="true" />
+                  <span>{preset.label}</span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="custom-gradient-editor">
+              <div className="gradient-stop-tabs" role="group" aria-label="Цвета градиента">
+                <button
+                  type="button"
+                  className={`gradient-stop-btn${gradientSlot === 1 ? ' is-active' : ''}`}
+                  disabled={isLight || !ambientGradient}
+                  onClick={() => setGradientSlot(1)}
+                >
+                  <span className="palette-dot" style={{ background: gradientCustomColor }} aria-hidden="true" />
+                  <span>Цвет 1</span>
+                </button>
+                <button
+                  type="button"
+                  className={`gradient-stop-btn${gradientSlot === 2 ? ' is-active' : ''}`}
+                  disabled={isLight || !ambientGradient}
+                  onClick={() => setGradientSlot(2)}
+                >
+                  <span className="palette-dot" style={{ background: gradientCustomColor2 }} aria-hidden="true" />
+                  <span>Цвет 2</span>
+                </button>
+              </div>
+              <ColorWheelPicker
+                value={gradientSlot === 1 ? gradientCustomColor : gradientCustomColor2}
+                onChange={hex => (gradientSlot === 1 ? setGradientCustomColor(hex) : setGradientCustomColor2(hex))}
+                disabled={isLight || !ambientGradient}
+                label={gradientSlot === 1 ? 'HEX цвета градиента 1' : 'HEX цвета градиента 2'}
+              />
+            </div>
+          )}
         </div>
       </div>
     </div>

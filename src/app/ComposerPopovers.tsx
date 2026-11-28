@@ -160,6 +160,7 @@ export function ModelPopover({
     : activeDemoGroup?.name ?? model
 
   const canResetReasoning = !disabled && reasoningSteps.length > 1 && reasoningValue !== reasoningSteps[0]?.value
+  const showProviderRow = providerDisabled || providerOptions.filter(p => p.available).length > 1
 
   const handleReasoningChange = (nextVal: string) => {
     if (remoteMode) {
@@ -204,16 +205,18 @@ export function ModelPopover({
           </div>
 
           <div className="popover-nav-group">
-            <button
-              type="button"
-              className="popover-nav-row"
-              disabled={disabled || !canChangeProvider || !providerOptions.some(p => p.available && p.id !== provider)}
-              onClick={() => setSubview('provider')}
-            >
-              <span className="popover-nav-kicker">Провайдер</span>
-              <span className={`popover-nav-val${providerDisabled ? ' is-muted' : ''}`}>{providerLabel}</span>
-              <ChevronRight size={14} className="popover-nav-chevron" />
-            </button>
+            {showProviderRow && (
+              <button
+                type="button"
+                className="popover-nav-row"
+                disabled={disabled || !canChangeProvider || !providerOptions.some(p => p.available && p.id !== provider)}
+                onClick={() => setSubview('provider')}
+              >
+                <span className="popover-nav-kicker">Провайдер</span>
+                <span className={`popover-nav-val${providerDisabled ? ' is-muted' : ''}`}>{providerLabel}</span>
+                <ChevronRight size={14} className="popover-nav-chevron" />
+              </button>
+            )}
             <button
               type="button"
               className="popover-nav-row"

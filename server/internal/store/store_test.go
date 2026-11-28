@@ -70,7 +70,7 @@ func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 		t.Fatalf("auth after reopening DB failed: %v", err)
 	}
 	var version int
-	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 17 {
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 18 {
 		t.Fatalf("schema version %d: %v", version, err)
 	}
 	if currentDevice.LastSeenAt != device.LastSeenAt {
@@ -846,8 +846,8 @@ func TestStoreMigrateV16ToV17Attachments(t *testing.T) {
 	defer reopened.Close()
 
 	var version int
-	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 17 {
-		t.Fatalf("expected user_version=17, got %d (err=%v)", version, err)
+	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 18 {
+		t.Fatalf("expected user_version=18, got %d (err=%v)", version, err)
 	}
 	owner, err := reopened.CreateUserWithRole(ctx, "u1", []byte("h"), "user")
 	if err != nil {

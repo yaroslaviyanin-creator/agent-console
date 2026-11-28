@@ -24,13 +24,14 @@ import (
 
 // Direct RunRequest and RunEvent frames use the same field names as src/protocol/types.ts.
 type runRequest struct {
-	ChatID        string   `json:"chatId"`
-	MessageID     string   `json:"messageId"`
-	Prompt        string   `json:"prompt"`
-	AttachmentIDs []string `json:"attachmentIds,omitempty"`
-	Reasoning     string   `json:"reasoning,omitempty"`
-	Provider      string   `json:"provider,omitempty"`
-	Model         struct {
+	ChatID             string   `json:"chatId"`
+	MessageID          string   `json:"messageId"`
+	ReuseUserMessageID string   `json:"reuseUserMessageId,omitempty"`
+	Prompt             string   `json:"prompt"`
+	AttachmentIDs      []string `json:"attachmentIds,omitempty"`
+	Reasoning          string   `json:"reasoning,omitempty"`
+	Provider           string   `json:"provider,omitempty"`
+	Model              struct {
 		Provider string `json:"provider"`
 		ID       string `json:"id"`
 	} `json:"model"`
@@ -47,11 +48,13 @@ type runEvent struct {
 	Type        string                    `json:"type"`
 	Prompt      string                    `json:"prompt,omitempty"`
 	Attachments []store.MessageAttachment `json:"attachments,omitempty"`
+	Provider    string                    `json:"provider,omitempty"`
 	Model       string                    `json:"model,omitempty"`
 	CreatedAt   int64                     `json:"createdAt,omitempty"`
 	Delta       string                    `json:"delta,omitempty"`
 	Reason      string                    `json:"reason,omitempty"`
 	DurationMs  *int64                    `json:"durationMs,omitempty"`
+	Usage       *store.MessageUsage       `json:"usage,omitempty"`
 	Code        string                    `json:"code,omitempty"`
 	Message     string                    `json:"message,omitempty"`
 	Retryable   *bool                     `json:"retryable,omitempty"`
@@ -375,9 +378,11 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 		enqueue(client, req.failure(1, code, message, retryable))
 	}
 	req.Prompt = strings.TrimSpace(req.Prompt)
+	req.ReuseUserMessageID = strings.TrimSpace(req.ReuseUserMessageID)
 	if req.Target.Mode != "chat" || req.RetryOf != "" || len(req.Prompt) > 32<<10 ||
-		(req.Prompt == "" && len(req.AttachmentIDs) == 0) ||
-		len(req.AttachmentIDs) > 5 ||
+		(req.Prompt == "" && len(req.AttachmentIDs) == 0 && req.ReuseUserMessageID == "") ||
+		len(req.AttachmentIDs) > a.config.EffectiveMaxAttachmentsPerMessage() ||
+		(req.ReuseUserMessageID != "" && !correlationID.MatchString(req.ReuseUserMessageID)) ||
 		strings.ContainsRune(req.Prompt, 0) || !modelID.MatchString(req.Model.ID) {
 		reject("invalid_request", "Send a message in chat mode with a valid model.", false)
 		return
@@ -482,7 +487,7 @@ var runDeniedMessages = map[store.RunDenied]string{
 }
 
 func (a *API) startRun(ctx context.Context, cancel context.CancelFunc, userID, deviceID, ownerID, targetProvider string, req runRequest, release func(*runEvent)) error {
-	_, attached, err := a.db.BeginRunForDeviceWithAttachmentsLimit(ctx, userID, deviceID, req.ChatID, req.MessageID, req.Prompt, targetProvider, req.Model.ID, req.AttachmentIDs, a.config.EffectiveMaxAttachmentsPerMessage())
+	_, attached, err := a.db.BeginRunForDeviceWithAttachmentsReuse(ctx, userID, deviceID, req.ChatID, req.MessageID, req.Prompt, targetProvider, req.Model.ID, req.AttachmentIDs, a.config.EffectiveMaxAttachmentsPerMessage(), req.ReuseUserMessageID)
 	if err != nil {
 		return err
 	}
@@ -579,7 +584,7 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 
 	resumeSessionID := ""
 	prompt := buildPromptWithAttachmentsBudget(req.Prompt, attached, a.config.EffectiveMaxAttachmentContextBytes())
-	if targetProvider == sessionProvider {
+	if sessionID != "" && targetProvider == sessionProvider {
 		resumeSessionID = sessionID
 	} else {
 		prior, err := a.db.ChatPriorMessages(runCtx, req.ChatID, req.MessageID)
@@ -638,6 +643,15 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 				}
 				wire.Reason = "completed"
 				wire.DurationMs = &durationMs
+				wire.Provider = targetProvider
+				wire.Model = req.Model.ID
+				if event.Usage != nil {
+					wire.Usage = &store.MessageUsage{
+						InputTokens:       event.Usage.InputTokens,
+						CachedInputTokens: event.Usage.CachedInputTokens,
+						OutputTokens:      event.Usage.OutputTokens,
+					}
+				}
 			case provider.Error:
 				return failure("provider_error", "The provider could not complete the response.", event.Err)
 			default:

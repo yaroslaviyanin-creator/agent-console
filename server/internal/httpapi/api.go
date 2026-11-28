@@ -133,11 +133,15 @@ func newRegistryHandler(ctx context.Context, db *store.Store, cfg config.Config,
 	mux.HandleFunc("GET /api/users", api.withAuth(api.directoryUsers))
 	mux.HandleFunc("GET /api/chats", api.withAuth(api.chats))
 	mux.HandleFunc("POST /api/chats", api.withAuth(api.createChat))
+	mux.HandleFunc("PATCH /api/chats/{id}", api.withAuth(api.patchChat))
 	mux.HandleFunc("DELETE /api/chats/{id}", api.withAuth(api.deleteChat))
 	mux.HandleFunc("POST /api/chats/{id}/attachments", api.withAuth(api.uploadAttachments))
 	mux.HandleFunc("GET /api/attachments/{id}", api.withAuth(api.getAttachment))
 	mux.HandleFunc("DELETE /api/attachments/{id}", api.withAuth(api.deleteAttachment))
 	mux.HandleFunc("GET /api/chats/{id}/messages", api.withAuth(api.messages))
+	mux.HandleFunc("DELETE /api/chats/{id}/messages/{messageId}", api.withAuth(api.deleteMessage))
+	mux.HandleFunc("POST /api/chats/{id}/messages/{messageId}/regenerate", api.withAuth(api.regenerateMessage))
+	mux.HandleFunc("PATCH /api/chats/{id}/messages/{messageId}", api.withAuth(api.editMessage))
 	mux.HandleFunc("PUT /api/chats/{id}/shares/{userId}", api.withAuth(api.putChatShare))
 	mux.HandleFunc("DELETE /api/chats/{id}/shares/{userId}", api.withAuth(api.deleteChatShare))
 	mux.HandleFunc("POST /api/chats/{id}/fork", api.withAuth(api.forkChat))
@@ -466,7 +470,20 @@ func (a *API) changeChatShare(w http.ResponseWriter, r *http.Request, s session,
 }
 
 func (a *API) forkChat(w http.ResponseWriter, r *http.Request, s session) {
-	chat, err := a.db.ForkChat(r.Context(), s.User.ID, r.PathValue("id"))
+	var req struct {
+		UpToMessageID string `json:"upToMessageId"`
+	}
+	if r.ContentLength != 0 && r.Header.Get("Content-Type") != "" {
+		if !decode(w, r, &req) {
+			return
+		}
+	}
+	upTo := strings.TrimSpace(req.UpToMessageID)
+	if upTo != "" && !correlationID.MatchString(upTo) {
+		fail(w, http.StatusBadRequest, "invalid_message", "Invalid message ID.")
+		return
+	}
+	chat, err := a.db.ForkChatUpTo(r.Context(), s.User.ID, r.PathValue("id"), upTo)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		fail(w, http.StatusNotFound, "chat_not_found", "Chat not found.")
@@ -474,6 +491,151 @@ func (a *API) forkChat(w http.ResponseWriter, r *http.Request, s session) {
 		a.internal(w, r, err)
 	default:
 		reply(w, http.StatusCreated, chat)
+	}
+}
+
+func (a *API) patchChat(w http.ResponseWriter, r *http.Request, s session) {
+	var req struct {
+		Title  *string `json:"title"`
+		Pinned *bool   `json:"pinned"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Title == nil && req.Pinned == nil {
+		fail(w, http.StatusBadRequest, "invalid_chat", "Provide title or pinned.")
+		return
+	}
+	if req.Title != nil {
+		trimmed := strings.TrimSpace(*req.Title)
+		if !identity.ValidName(trimmed, 200) {
+			fail(w, http.StatusBadRequest, "invalid_chat", "Invalid chat title.")
+			return
+		}
+		req.Title = &trimmed
+	}
+	chat, err := a.db.UpdateChat(r.Context(), s.User.ID, r.PathValue("id"), req.Title, req.Pinned)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		fail(w, http.StatusNotFound, "chat_not_found", "Chat not found.")
+	case errors.Is(err, store.ErrForbidden):
+		fail(w, http.StatusForbidden, "forbidden", "Access denied.")
+	case err != nil:
+		a.internal(w, r, err)
+	default:
+		reply(w, http.StatusOK, chat)
+	}
+}
+
+func (a *API) isChatBusy(chatID string) bool {
+	a.live.mu.Lock()
+	defer a.live.mu.Unlock()
+	_, busy := a.live.chats[chatID]
+	return busy
+}
+
+func (a *API) deleteMessage(w http.ResponseWriter, r *http.Request, s session) {
+	chatID := r.PathValue("id")
+	if a.isChatBusy(chatID) {
+		fail(w, http.StatusConflict, "chat_busy", "Дождитесь окончания ответа перед изменением истории.")
+		return
+	}
+	err := a.db.DeleteMessage(r.Context(), s.User.ID, chatID, r.PathValue("messageId"))
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		fail(w, http.StatusNotFound, "message_not_found", "Message not found.")
+	case errors.Is(err, store.ErrForbidden):
+		fail(w, http.StatusForbidden, "forbidden", "Access denied.")
+	case err != nil:
+		a.internal(w, r, err)
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (a *API) regenerateMessage(w http.ResponseWriter, r *http.Request, s session) {
+	chatID := r.PathValue("id")
+	if a.isChatBusy(chatID) {
+		fail(w, http.StatusConflict, "chat_busy", "Дождитесь окончания ответа перед перегенерацией.")
+		return
+	}
+	var req struct {
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+	}
+	if r.ContentLength != 0 && r.Header.Get("Content-Type") != "" {
+		if !decode(w, r, &req) {
+			return
+		}
+	}
+	targetProvider := strings.ToLower(strings.TrimSpace(req.Provider))
+	targetModel := strings.TrimSpace(req.Model)
+	if targetProvider != "" {
+		if targetProvider == "paid_api" || !a.live.hasProvider(targetProvider) {
+			fail(w, http.StatusUnprocessableEntity, "provider_unavailable", "Requested provider is not available.")
+			return
+		}
+	}
+	if targetModel != "" && !modelID.MatchString(targetModel) {
+		fail(w, http.StatusBadRequest, "invalid_model", "Invalid model ID.")
+		return
+	}
+	userMsgID, prompt, attachments, err := a.db.PrepareRegenerate(r.Context(), s.User.ID, chatID, r.PathValue("messageId"), targetProvider, targetModel)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		fail(w, http.StatusNotFound, "message_not_found", "Message not found.")
+	case errors.Is(err, store.ErrForbidden):
+		fail(w, http.StatusForbidden, "forbidden", "Access denied.")
+	case err != nil:
+		a.internal(w, r, err)
+	default:
+		wireAtts := make([]store.MessageAttachment, 0, len(attachments))
+		for _, att := range attachments {
+			wireAtts = append(wireAtts, att.AsMessageAttachment())
+		}
+		reply(w, http.StatusOK, map[string]any{
+			"userMessageId": userMsgID,
+			"prompt":        prompt,
+			"attachments":   wireAtts,
+		})
+	}
+}
+
+func (a *API) editMessage(w http.ResponseWriter, r *http.Request, s session) {
+	chatID := r.PathValue("id")
+	if a.isChatBusy(chatID) {
+		fail(w, http.StatusConflict, "chat_busy", "Дождитесь окончания ответа перед редактированием.")
+		return
+	}
+	var req struct {
+		Content string `json:"content"`
+	}
+	if !decodeLimit(w, r, &req, 64<<10) {
+		return
+	}
+	req.Content = strings.TrimSpace(req.Content)
+	if req.Content == "" || len(req.Content) > 32<<10 || strings.ContainsRune(req.Content, 0) {
+		fail(w, http.StatusBadRequest, "invalid_message", "Invalid message content.")
+		return
+	}
+	userMsgID, attachments, err := a.db.PrepareEditMessage(r.Context(), s.User.ID, chatID, r.PathValue("messageId"), req.Content)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		fail(w, http.StatusNotFound, "message_not_found", "Message not found.")
+	case errors.Is(err, store.ErrForbidden):
+		fail(w, http.StatusForbidden, "forbidden", "Access denied.")
+	case err != nil:
+		a.internal(w, r, err)
+	default:
+		wireAtts := make([]store.MessageAttachment, 0, len(attachments))
+		for _, att := range attachments {
+			wireAtts = append(wireAtts, att.AsMessageAttachment())
+		}
+		reply(w, http.StatusOK, map[string]any{
+			"userMessageId": userMsgID,
+			"prompt":        req.Content,
+			"attachments":   wireAtts,
+		})
 	}
 }
 

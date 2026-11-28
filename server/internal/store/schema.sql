@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS chats (
     session_provider TEXT NOT NULL DEFAULT '' CHECK (session_provider IN ('', 'antigravity', 'codex', 'claude', 'paid_api', 'stub')),
     model TEXT NOT NULL,
     provider_session_id TEXT,
+    pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );

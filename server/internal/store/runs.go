@@ -63,27 +63,32 @@ func checkRunAccess(ctx context.Context, tx *sql.Tx, userID, deviceID string, no
 
 // BeginRun verifies write access and reserves the client message ID durably before calling the provider.
 func (s *Store) BeginRun(ctx context.Context, userID, chatID, messageID, prompt, backend, model string) (string, error) {
-	sessionID, _, err := s.beginRun(ctx, userID, "", chatID, messageID, prompt, backend, model, nil, 10)
+	sessionID, _, err := s.beginRun(ctx, userID, "", chatID, messageID, prompt, backend, model, nil, 10, "")
 	return sessionID, err
 }
 
 // BeginRunForDevice checks current access and the available quota in one transaction.
 func (s *Store) BeginRunForDevice(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string) (string, error) {
-	sessionID, _, err := s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, nil, 10)
+	sessionID, _, err := s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, nil, 10, "")
 	return sessionID, err
 }
 
 // BeginRunForDeviceWithAttachments checks access, quota, and atomically binds uploaded attachments to the user message.
 func (s *Store) BeginRunForDeviceWithAttachments(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string, attachmentIDs []string) (string, []Attachment, error) {
-	return s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, attachmentIDs, 10)
+	return s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, attachmentIDs, 10, "")
 }
 
 // BeginRunForDeviceWithAttachmentsLimit enforces a configurable maximum attachment count per message.
 func (s *Store) BeginRunForDeviceWithAttachmentsLimit(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string, attachmentIDs []string, maxAttachments int) (string, []Attachment, error) {
-	return s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, attachmentIDs, maxAttachments)
+	return s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, attachmentIDs, maxAttachments, "")
 }
 
-func (s *Store) beginRun(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string, attachmentIDs []string, maxAttachments int) (string, []Attachment, error) {
+// BeginRunForDeviceWithAttachmentsReuse starts a run either inserting a new user message or reusing an existing one (regenerate/edit).
+func (s *Store) BeginRunForDeviceWithAttachmentsReuse(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string, attachmentIDs []string, maxAttachments int, reuseUserMessageID string) (string, []Attachment, error) {
+	return s.beginRun(ctx, userID, deviceID, chatID, messageID, prompt, backend, model, attachmentIDs, maxAttachments, reuseUserMessageID)
+}
+
+func (s *Store) beginRun(ctx context.Context, userID, deviceID, chatID, messageID, prompt, backend, model string, attachmentIDs []string, maxAttachments int, reuseUserMessageID string) (string, []Attachment, error) {
 	if !isRunnableProvider(backend) {
 		return "", nil, ErrProviderUnavailable
 	}
@@ -114,55 +119,97 @@ func (s *Store) beginRun(ctx context.Context, userID, deviceID, chatID, messageI
 	}
 
 	var attached []Attachment
-	if len(attachmentIDs) > 0 {
-		seen := make(map[string]bool, len(attachmentIDs))
-		for _, attID := range attachmentIDs {
-			if attID == "" || seen[attID] {
-				return "", nil, ErrInvalidAttachments
+	var userMsgID string
+	if reuseUserMessageID != "" {
+		var existingRunID sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT id, content, run_id FROM chat_messages WHERE id=? AND chat_id=? AND role='user'`,
+			reuseUserMessageID, chatID).Scan(&userMsgID, &prompt, &existingRunID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return "", nil, sql.ErrNoRows
 			}
-			seen[attID] = true
-			var att Attachment
-			var extracted sql.NullString
-			err := tx.QueryRowContext(ctx, `SELECT id,chat_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,warning,created_at
-				FROM chat_attachments WHERE id=? AND chat_id=? AND user_id=? AND message_id IS NULL`,
-				attID, chatID, userID).
-				Scan(&att.ID, &att.ChatID, &att.UserID, &att.OriginalName, &att.MIMEType, &att.Kind, &att.SizeBytes, &att.SHA256, &att.StorageKey, &extracted, &att.Warning, &att.CreatedAt)
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return "", nil, ErrInvalidAttachments
-				}
-				return "", nil, err
-			}
-			att.ExtractedText = extracted.String
-			att.URL = "/api/attachments/" + att.ID
-			attached = append(attached, att)
+			return "", nil, err
 		}
-	}
-
-	userMsgID := randomHex(16)
-	result, err := tx.ExecContext(ctx, `INSERT INTO chat_messages (id,chat_id,role,content,created_at,run_id,run_user_id,memory_private)
-		VALUES (?,?,'user',?,?,?,?,NOT EXISTS(SELECT 1 FROM chat_shares WHERE chat_id=?)) ON CONFLICT(chat_id,role,run_id) DO NOTHING`,
-		userMsgID, chatID, prompt, now.UnixMilli(), messageID, userID, chatID)
-	if err != nil {
-		return "", nil, err
-	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return "", nil, err
-	}
-	if count == 0 {
-		return "", nil, ErrDuplicateRun
-	}
-	for i := range attached {
-		res, err := tx.ExecContext(ctx, `UPDATE chat_attachments SET message_id=? WHERE id=? AND chat_id=? AND user_id=? AND message_id IS NULL`,
-			userMsgID, attached[i].ID, chatID, userID)
+		res, err := tx.ExecContext(ctx, `UPDATE chat_messages SET run_id=?, run_user_id=? WHERE id=? AND chat_id=? AND role='user'`,
+			messageID, userID, userMsgID, chatID)
 		if err != nil {
 			return "", nil, err
 		}
 		if n, _ := res.RowsAffected(); n != 1 {
-			return "", nil, ErrInvalidAttachments
+			return "", nil, ErrDuplicateRun
 		}
-		attached[i].MessageID = userMsgID
+		attRows, err := tx.QueryContext(ctx, `SELECT id,chat_id,message_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,COALESCE(extracted_text,''),warning,created_at
+			FROM chat_attachments WHERE chat_id=? AND message_id=? ORDER BY created_at,rowid`, chatID, userMsgID)
+		if err != nil {
+			return "", nil, err
+		}
+		for attRows.Next() {
+			var att Attachment
+			var mID sql.NullString
+			if err := attRows.Scan(&att.ID, &att.ChatID, &mID, &att.UserID, &att.OriginalName, &att.MIMEType, &att.Kind, &att.SizeBytes, &att.SHA256, &att.StorageKey, &att.ExtractedText, &att.Warning, &att.CreatedAt); err != nil {
+				attRows.Close()
+				return "", nil, err
+			}
+			att.MessageID = mID.String
+			att.URL = "/api/attachments/" + att.ID
+			attached = append(attached, att)
+		}
+		if err := attRows.Err(); err != nil {
+			attRows.Close()
+			return "", nil, err
+		}
+		attRows.Close()
+	} else {
+		if len(attachmentIDs) > 0 {
+			seen := make(map[string]bool, len(attachmentIDs))
+			for _, attID := range attachmentIDs {
+				if attID == "" || seen[attID] {
+					return "", nil, ErrInvalidAttachments
+				}
+				seen[attID] = true
+				var att Attachment
+				var extracted sql.NullString
+				err := tx.QueryRowContext(ctx, `SELECT id,chat_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,warning,created_at
+					FROM chat_attachments WHERE id=? AND chat_id=? AND user_id=? AND message_id IS NULL`,
+					attID, chatID, userID).
+					Scan(&att.ID, &att.ChatID, &att.UserID, &att.OriginalName, &att.MIMEType, &att.Kind, &att.SizeBytes, &att.SHA256, &att.StorageKey, &extracted, &att.Warning, &att.CreatedAt)
+				if err != nil {
+					if errors.Is(err, sql.ErrNoRows) {
+						return "", nil, ErrInvalidAttachments
+					}
+					return "", nil, err
+				}
+				att.ExtractedText = extracted.String
+				att.URL = "/api/attachments/" + att.ID
+				attached = append(attached, att)
+			}
+		}
+
+		userMsgID = randomHex(16)
+		result, err := tx.ExecContext(ctx, `INSERT INTO chat_messages (id,chat_id,role,content,created_at,run_id,run_user_id,memory_private)
+			VALUES (?,?,'user',?,?,?,?,NOT EXISTS(SELECT 1 FROM chat_shares WHERE chat_id=?)) ON CONFLICT(chat_id,role,run_id) DO NOTHING`,
+			userMsgID, chatID, prompt, now.UnixMilli(), messageID, userID, chatID)
+		if err != nil {
+			return "", nil, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return "", nil, err
+		}
+		if count == 0 {
+			return "", nil, ErrDuplicateRun
+		}
+		for i := range attached {
+			res, err := tx.ExecContext(ctx, `UPDATE chat_attachments SET message_id=? WHERE id=? AND chat_id=? AND user_id=? AND message_id IS NULL`,
+				userMsgID, attached[i].ID, chatID, userID)
+			if err != nil {
+				return "", nil, err
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				return "", nil, ErrInvalidAttachments
+			}
+			attached[i].MessageID = userMsgID
+		}
 	}
 
 	titleSeed := prompt

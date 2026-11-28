@@ -7,6 +7,7 @@ export interface ContextMessage { role: 'user' | 'assistant'; text: string }
 export interface RunRequest {
   history?: ContextMessage[] // Ordered conversation before the current prompt.
   retryOf?: string
+  reuseUserMessageId?: string
   chatId: string
   messageId: string // ID of the new assistant message
   provider?: ServerProvider
@@ -35,7 +36,7 @@ type RunPayload =
   | { type: 'permission_request'; requestId: string; callId: string; folder: string; deviceId: string; tool: ToolCall }
   | { type: 'tool_result'; callId: string; status: 'ok' | 'denied' | 'error'; output: string }
   | { type: 'refusal_detected'; reason: string }
-  | { type: 'done'; reason: 'completed' | 'refused' | 'denied'; durationMs?: number }
+  | { type: 'done'; reason: 'completed' | 'refused' | 'denied'; durationMs?: number; provider?: ServerProvider; model?: string; usage?: MessageUsage }
   | { type: 'error'; code: string; message: string; retryable: boolean }
 
 export type RunEvent = RunPayload & { chatId: string; messageId: string; seq: number }
@@ -96,6 +97,7 @@ export interface ChatAccess {
   access: ShareAccess | 'owner'
   grants: Grant[] // Only owners receive the recipient list.
   trustedDeviceId?: string
+  pinned?: boolean
 }
 export interface Workspace {
   user: Member
@@ -182,12 +184,18 @@ export interface ServerChat {
   ownerId?: string
   access?: ChatAccess['access']
   grants?: Grant[]
+  pinned?: boolean
   id: string
   title: string
   provider: ServerProvider
   model: string
   createdAt: number
   updatedAt: number
+}
+export interface MessageUsage {
+  inputTokens: number
+  cachedInputTokens: number
+  outputTokens: number
 }
 export interface AdminChat extends ServerChat { messagesCount: number }
 export interface IndexedCodexChat extends ServerChat { archived: boolean }
@@ -205,6 +213,9 @@ export interface ServerMessage {
   attachments?: MessageAttachment[]
   progress?: string
   durationMs?: number
+  provider?: ServerProvider
+  model?: string
+  usage?: MessageUsage
   id: string
   runId?: string
   chatId: string

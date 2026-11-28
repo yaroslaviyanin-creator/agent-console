@@ -1,13 +1,15 @@
 import { useId } from 'react'
-import { useAppearance } from './appearanceStore'
+import { resolveTheme, useAppearance } from './appearanceStore'
 
 /**
  * Ambient mesh gradient background with three GPU-animated orbs and anti-banding noise.
+ * Light theme uses a clean flat surface without background gradients or orbs.
  */
 export function AmbientBackground({ dimmed = false, active = false }: { dimmed?: boolean; active?: boolean }) {
   const ambientGradient = useAppearance(s => s.ambientGradient)
+  const theme = useAppearance(s => s.theme)
   const filterId = useId()
-  if (!ambientGradient) return null
+  if (!ambientGradient || resolveTheme(theme) === 'light') return null
   return (
     <div
       className="ambient-bg"

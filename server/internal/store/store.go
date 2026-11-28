@@ -60,14 +60,24 @@ type Chat struct {
 	Provider        string      `json:"provider"`
 	SessionProvider string      `json:"-"`
 	Model           string      `json:"model"`
+	Pinned          bool        `json:"pinned,omitempty"`
 	CreatedAt       int64       `json:"createdAt"`
 	UpdatedAt       int64       `json:"updatedAt"`
+}
+
+type MessageUsage struct {
+	InputTokens       int64 `json:"inputTokens"`
+	CachedInputTokens int64 `json:"cachedInputTokens"`
+	OutputTokens      int64 `json:"outputTokens"`
 }
 
 type Message struct {
 	Attachments []MessageAttachment `json:"attachments,omitempty"`
 	Progress    string              `json:"progress,omitempty"`
 	DurationMs  *int64              `json:"durationMs,omitempty"`
+	Provider    string              `json:"provider,omitempty"`
+	Model       string              `json:"model,omitempty"`
+	Usage       *MessageUsage       `json:"usage,omitempty"`
 	RunID       string              `json:"runId,omitempty"`
 	ID          string              `json:"id"`
 	ChatID      string              `json:"chatId"`
@@ -166,7 +176,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version == 17 {
+	if version == 18 {
 		return nil
 	}
 	// SQLite requires disabling foreign keys outside the transaction on this connection.
@@ -183,7 +193,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	switch version {
 	case 0:
-		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=17;"); err != nil {
+		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=18;"); err != nil {
 			return err
 		}
 	case 1:
@@ -466,7 +476,21 @@ func (s *Store) migrate(ctx context.Context) error {
 		PRAGMA user_version=17;`); err != nil {
 			return err
 		}
+		fallthrough
 	case 17:
+		var pinnedExists bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chats') WHERE name='pinned')").Scan(&pinnedExists); err != nil {
+			return err
+		}
+		if !pinnedExists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE chats ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1));`); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=18;`); err != nil {
+			return err
+		}
+	case 18:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}
@@ -637,12 +661,12 @@ func insertChat(ctx context.Context, db interface {
 }
 
 func (s *Store) Chats(ctx context.Context, userID string) ([]Chat, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.title,c.provider,c.model,c.created_at,c.updated_at,c.user_id,
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.title,c.provider,c.model,c.pinned,c.created_at,c.updated_at,c.user_id,
 		COALESCE(membership.access,'owner'),g.user_id,g.access
 		FROM chats c LEFT JOIN chat_shares membership ON membership.chat_id=c.id AND membership.user_id=?1
 		LEFT JOIN chat_shares g ON g.chat_id=c.id AND c.user_id=?1
 		WHERE c.user_id=?1 OR membership.user_id IS NOT NULL
-		ORDER BY c.updated_at DESC,c.rowid DESC,g.created_at,g.user_id`, userID)
+		ORDER BY c.pinned DESC,c.updated_at DESC,c.rowid DESC,g.created_at,g.user_id`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -651,7 +675,7 @@ func (s *Store) Chats(ctx context.Context, userID string) ([]Chat, error) {
 	for rows.Next() {
 		var c Chat
 		var recipient, grant sql.NullString
-		if err := rows.Scan(&c.ID, &c.Title, &c.Provider, &c.Model, &c.CreatedAt, &c.UpdatedAt, &c.OwnerID, &c.Access, &recipient, &grant); err != nil {
+		if err := rows.Scan(&c.ID, &c.Title, &c.Provider, &c.Model, &c.Pinned, &c.CreatedAt, &c.UpdatedAt, &c.OwnerID, &c.Access, &recipient, &grant); err != nil {
 			return nil, err
 		}
 		if len(chats) == 0 || chats[len(chats)-1].ID != c.ID {
@@ -731,40 +755,15 @@ func (s *Store) SetChatShare(ctx context.Context, ownerID, chatID, targetUserID,
 }
 
 func (s *Store) ForkChat(ctx context.Context, userID, sourceChatID string) (Chat, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return Chat{}, err
-	}
-	defer tx.Rollback()
-	now := time.Now().UnixMilli()
-	c := Chat{ID: randomHex(16), OwnerID: userID, Access: "owner", CreatedAt: now, UpdatedAt: now}
-	if err := tx.QueryRowContext(ctx, `SELECT title,provider,model FROM chats c WHERE c.id=?1 AND
-		(c.user_id=?2 OR EXISTS(SELECT 1 FROM chat_shares WHERE chat_id=c.id AND user_id=?2 AND access='fork'))`,
-		sourceChatID, userID).Scan(&c.Title, &c.Provider, &c.Model); err != nil {
-		return Chat{}, err
-	}
-	c.SessionProvider = c.Provider
-	c.Title += " · копия"
-	if err := insertChat(ctx, tx, c); err != nil {
-		return Chat{}, err
-	}
-	// Copied messages keep their run IDs for transcript pairing and do not count toward quotas.
-	if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages (id,chat_id,role,content,thinking,created_at,run_id,duration_ms,run_user_id)
-		SELECT lower(hex(randomblob(16))),?,role,content,thinking,created_at,run_id,duration_ms,''
-		FROM chat_messages WHERE chat_id=? ORDER BY created_at,rowid`, c.ID, sourceChatID); err != nil {
-		return Chat{}, err
-	}
-	return c, tx.Commit()
-}
-
-func (s *Store) Messages(ctx context.Context, userID, chatID string) ([]Message, error) {
-	return s.messages(ctx, userID, chatID, true)
+	return s.ForkChatUpTo(ctx, userID, sourceChatID, "")
 }
 
 func (s *Store) messages(ctx context.Context, userID, chatID string, includeShared bool) ([]Message, error) {
 	// A LEFT JOIN distinguishes an accessible empty chat from an inaccessible chat.
-	rows, err := s.db.QueryContext(ctx, `SELECT CASE WHEN m.role='assistant' THEN COALESCE(m.run_id,m.id) ELSE m.id END, m.role,m.content,m.thinking,m.created_at,m.run_id,m.duration_ms
+	rows, err := s.db.QueryContext(ctx, `SELECT CASE WHEN m.role='assistant' THEN COALESCE(m.run_id,m.id) ELSE m.id END, m.role,m.content,m.thinking,m.created_at,m.run_id,m.duration_ms,
+		u.provider,u.model,u.input_tokens,u.cached_input_tokens,u.output_tokens
 		FROM chats c LEFT JOIN chat_messages m ON m.chat_id=c.id
+		LEFT JOIN usage_events u ON u.chat_id=m.chat_id AND u.run_id=m.run_id AND m.role='assistant'
 		WHERE c.id=?1 AND (c.user_id=?2 OR (?3 AND EXISTS(
 			SELECT 1 FROM chat_shares WHERE chat_id=c.id AND user_id=?2
 		))) ORDER BY m.created_at,m.rowid`, chatID, userID, includeShared)
@@ -776,14 +775,26 @@ func (s *Store) messages(ctx context.Context, userID, chatID string, includeShar
 	found := false
 	for rows.Next() {
 		found = true
-		var id, role, content, thinking, runID sql.NullString
-		var createdAt sql.NullInt64
+		var id, role, content, thinking, runID, uProvider, uModel sql.NullString
+		var createdAt, uIn, uCached, uOut sql.NullInt64
 		var durationMs *int64
-		if err := rows.Scan(&id, &role, &content, &thinking, &createdAt, &runID, &durationMs); err != nil {
+		if err := rows.Scan(&id, &role, &content, &thinking, &createdAt, &runID, &durationMs, &uProvider, &uModel, &uIn, &uCached, &uOut); err != nil {
 			return nil, err
 		}
 		if id.Valid {
-			messages = append(messages, Message{ID: id.String, RunID: runID.String, ChatID: chatID, Role: role.String, Content: content.String, Thinking: thinking.String, CreatedAt: createdAt.Int64, DurationMs: durationMs})
+			msg := Message{
+				ID: id.String, RunID: runID.String, ChatID: chatID, Role: role.String,
+				Content: content.String, Thinking: thinking.String, CreatedAt: createdAt.Int64, DurationMs: durationMs,
+				Provider: uProvider.String, Model: uModel.String,
+			}
+			if uIn.Valid || uCached.Valid || uOut.Valid {
+				msg.Usage = &MessageUsage{
+					InputTokens:       uIn.Int64,
+					CachedInputTokens: uCached.Int64,
+					OutputTokens:      uOut.Int64,
+				}
+			}
+			messages = append(messages, msg)
 		}
 	}
 	if err := rows.Err(); err != nil {

@@ -1,6 +1,12 @@
-import { Receipt, CodeXml, Eye, GitFork, MessageSquare, Plus, Radio, RefreshCw, Settings2, Users, X } from 'lucide-react'
-import { newChat, refreshCodexIndex, selectChat, useChats } from './chatStore'
-import type { Chat } from './chatStore'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import {
+  CodeXml, Download, Eye, GitFork, MessageSquare, MoreHorizontal, Pencil, Pin, PinOff, Plus, Radio, Receipt, RefreshCw, Settings2, Share2, Trash2, Users, X,
+} from 'lucide-react'
+import {
+  deleteChatItem, downloadChatMarkdown, forkChatAt, newChat, refreshCodexIndex, renameChat, selectChat, togglePinChat, useChats,
+  type Chat,
+} from './chatStore'
 import { useAccountStore } from './accountStore'
 import { UserAvatar } from './UserAvatar'
 
@@ -11,36 +17,208 @@ const planBadges = {
   unlimited: 'UNLIMITED',
 } as const
 
+interface MenuState {
+  chatId: string
+  x: number
+  y: number
+}
+
+export function clampMenuPosition(x: number, y: number, width: number, height: number, vw: number, vh: number) {
+  const pad = 8
+  return {
+    left: Math.max(pad, Math.min(x, Math.max(pad, vw - width - pad))),
+    top: Math.max(pad, Math.min(y, Math.max(pad, vh - height - pad))),
+  }
+}
+
 export function Sidebar({
   close,
   openBilling,
   openSettings,
+  openShare,
 }: {
   close: () => void
   openBilling: () => void
   openSettings: () => void
+  openShare: (chatId: string) => void
 }) {
   const { chats, activeId, mode, connected, codexIndex, workspace } = useChats()
   const serverQuota = useAccountStore(s => s.serverQuota)
   const online = mode === 'demo' || connected
+  const [menu, setMenu] = useState<MenuState | null>(null)
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
+  const [renamingId, setRenamingId] = useState<string | null>(null)
+  const [renameDraft, setRenameDraft] = useState('')
+  const menuRef = useRef<HTMLDivElement>(null)
+  const renameInputRef = useRef<HTMLInputElement>(null)
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const longPressOriginRef = useRef<{ x: number; y: number } | null>(null)
+  const suppressNextClickRef = useRef(false)
+  const [menuPos, setMenuPos] = useState<{ left: number; top: number } | null>(null)
+
+  useEffect(() => {
+    if (renamingId) {
+      renameInputRef.current?.focus()
+      renameInputRef.current?.select()
+    }
+  }, [renamingId])
+
+  useLayoutEffect(() => {
+    if (!menu || !menuRef.current) {
+      setMenuPos(null)
+      return
+    }
+    const rect = menuRef.current.getBoundingClientRect()
+    setMenuPos(clampMenuPosition(menu.x, menu.y, rect.width || 210, rect.height || 240, window.innerWidth, window.innerHeight))
+  }, [menu, confirmDeleteId])
+
+  useEffect(() => {
+    if (!menu) return
+    const onPointerDown = (e: PointerEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenu(null)
+        setConfirmDeleteId(null)
+      }
+    }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setMenu(null)
+        setConfirmDeleteId(null)
+      }
+    }
+    window.addEventListener('pointerdown', onPointerDown)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [menu])
+
+  const clearLongPress = () => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current)
+      longPressTimerRef.current = null
+    }
+    longPressOriginRef.current = null
+  }
+
+  const openMenuAt = (chatId: string, x: number, y: number) => {
+    setConfirmDeleteId(null)
+    setMenu({ chatId, x, y })
+  }
+
+  const commitRename = (chatId: string) => {
+    const next = renameDraft.trim()
+    setRenamingId(null)
+    if (next) void renameChat(chatId, next)
+  }
 
   function row(c: Chat) {
     const Icon = c.access === 'read' ? Eye : c.access === 'fork' ? GitFork : c.access === 'write' ? Users : MessageSquare
+    const isRenaming = renamingId === c.id
+    const showMenuTrigger = !c.indexedCodex
+
+    if (isRenaming) {
+      return (
+        <div key={c.id} className={'chat-row-item is-renaming ' + (c.id === activeId ? 'selected' : '')}>
+          <Icon size={15} />
+          <input
+            ref={renameInputRef}
+            type="text"
+            className="chat-rename-input"
+            aria-label="Новое название чата"
+            value={renameDraft}
+            maxLength={200}
+            onChange={e => setRenameDraft(e.target.value)}
+            onBlur={() => commitRename(c.id)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                commitRename(c.id)
+              } else if (e.key === 'Escape') {
+                e.preventDefault()
+                setRenamingId(null)
+              }
+            }}
+          />
+        </div>
+      )
+    }
+
     return (
-      <button
+      <div
         key={c.id}
-        className={'chat-link ' + (c.id === activeId ? 'selected' : '')}
-        aria-current={c.id === activeId ? 'page' : undefined}
-        title={c.title}
-        onClick={() => { selectChat(c.id); close() }}
+        className={'chat-row-item' + (c.id === activeId ? ' selected' : '') + (menu?.chatId === c.id ? ' menu-open' : '')}
+        onContextMenu={e => {
+          if (!showMenuTrigger) return
+          e.preventDefault()
+          openMenuAt(c.id, e.clientX, e.clientY)
+        }}
       >
-        <Icon size={15} aria-label={{ read: 'Чтение', fork: 'Разветвление', write: 'Полный доступ', owner: 'Мой чат' }[c.access]} />
-        <span>{c.title}</span>
-        {c.archived && <small className="archive-label">Архив</small>}
-      </button>
+        <button
+          className={'chat-link ' + (c.id === activeId ? 'selected' : '')}
+          aria-current={c.id === activeId ? 'page' : undefined}
+          title={c.title}
+          onPointerDown={e => {
+            if (!showMenuTrigger || e.pointerType === 'mouse') return
+            clearLongPress()
+            longPressOriginRef.current = { x: e.clientX, y: e.clientY }
+            const cx = e.clientX
+            const cy = e.clientY
+            longPressTimerRef.current = setTimeout(() => {
+              suppressNextClickRef.current = true
+              openMenuAt(c.id, cx, cy)
+              clearLongPress()
+            }, 480)
+          }}
+          onPointerMove={e => {
+            if (!longPressOriginRef.current) return
+            if (Math.hypot(e.clientX - longPressOriginRef.current.x, e.clientY - longPressOriginRef.current.y) > 8) {
+              clearLongPress()
+            }
+          }}
+          onPointerUp={clearLongPress}
+          onPointerCancel={clearLongPress}
+          onClick={e => {
+            if (suppressNextClickRef.current) {
+              suppressNextClickRef.current = false
+              e.preventDefault()
+              return
+            }
+            selectChat(c.id)
+            close()
+          }}
+        >
+          <Icon size={15} aria-label={{ read: 'Чтение', fork: 'Разветвление', write: 'Полный доступ', owner: 'Мой чат' }[c.access]} />
+          <span className="chat-link-title">{c.title}</span>
+          {c.pinned && <Pin size={12} className="chat-pin-badge" aria-label="Закреплён" />}
+          {c.archived && <small className="archive-label">Архив</small>}
+        </button>
+        {showMenuTrigger && (
+          <button
+            type="button"
+            className="chat-more-btn"
+            aria-label={`Действия с чатом ${c.title}`}
+            aria-haspopup="menu"
+            aria-expanded={menu?.chatId === c.id}
+            onClick={e => {
+              e.stopPropagation()
+              const rect = e.currentTarget.getBoundingClientRect()
+              if (menu?.chatId === c.id) {
+                setMenu(null)
+              } else {
+                openMenuAt(c.id, rect.right, rect.bottom + 4)
+              }
+            }}
+          >
+            <MoreHorizontal size={14} />
+          </button>
+        )}
+      </div>
     )
   }
 
+  const menuChat = menu ? chats.find(c => c.id === menu.chatId) : undefined
   const shared = chats.filter(c => c.access !== 'owner' && !c.indexedCodex)
   const handle = workspace ? '@' + (mode === 'server' ? workspace.user.name : workspace.user.id) : ''
   const profileDisplayName = workspace ? (workspace.user.displayName?.trim() || workspace.user.name) : ''
@@ -51,6 +229,122 @@ export function Sidebar({
         ? { label: 'ADMIN', tone: 'unlimited' }
         : null
     : { label: 'DEMO', tone: 'demo' }
+
+  const contextMenuNode = menu && menuChat && typeof document !== 'undefined'
+    ? createPortal(
+      <div
+        ref={menuRef}
+        className="chat-context-menu"
+        role="menu"
+        aria-label={`Меню чата ${menuChat.title}`}
+        style={menuPos ? { left: `${menuPos.left}px`, top: `${menuPos.top}px` } : { left: `${menu.x}px`, top: `${menu.y}px` }}
+      >
+        {menuChat.access === 'owner' && !menuChat.indexedCodex && (
+          <>
+            <button
+              type="button"
+              role="menuitem"
+              className="chat-menu-item"
+              onClick={() => {
+                setMenu(null)
+                setRenameDraft(menuChat.title)
+                setRenamingId(menuChat.id)
+              }}
+            >
+              <Pencil size={14} />
+              <span>Переименовать</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="chat-menu-item"
+              onClick={() => {
+                setMenu(null)
+                void togglePinChat(menuChat.id)
+              }}
+            >
+              {menuChat.pinned ? <PinOff size={14} /> : <Pin size={14} />}
+              <span>{menuChat.pinned ? 'Открепить' : 'Закрепить'}</span>
+            </button>
+          </>
+        )}
+        {menuChat.access !== 'read' && !menuChat.indexedCodex && (
+          <button
+            type="button"
+            role="menuitem"
+            className="chat-menu-item"
+            onClick={() => {
+              setMenu(null)
+              void forkChatAt(menuChat.id)
+              close()
+            }}
+          >
+            <GitFork size={14} />
+            <span>Создать ветку чата</span>
+          </button>
+        )}
+        {menuChat.access === 'owner' && !menuChat.indexedCodex && (
+          <button
+            type="button"
+            role="menuitem"
+            className="chat-menu-item"
+            onClick={() => {
+              setMenu(null)
+              close()
+              openShare(menuChat.id)
+            }}
+          >
+            <Share2 size={14} />
+            <span>Поделиться</span>
+          </button>
+        )}
+        <button
+          type="button"
+          role="menuitem"
+          className="chat-menu-item"
+          onClick={() => {
+            setMenu(null)
+            downloadChatMarkdown(menuChat)
+          }}
+        >
+          <Download size={14} />
+          <span>Экспорт в Markdown</span>
+        </button>
+        {menuChat.access === 'owner' && !menuChat.indexedCodex && (
+          confirmDeleteId === menuChat.id ? (
+            <div className="chat-menu-confirm">
+              <span>Удалить чат безвозвратно?</span>
+              <div className="chat-menu-confirm-btns">
+                <button
+                  type="button"
+                  className="is-danger"
+                  onClick={() => {
+                    setMenu(null)
+                    setConfirmDeleteId(null)
+                    void deleteChatItem(menuChat.id)
+                  }}
+                >
+                  Удалить
+                </button>
+                <button type="button" onClick={() => setConfirmDeleteId(null)}>Отмена</button>
+              </div>
+            </div>
+          ) : (
+            <button
+              type="button"
+              role="menuitem"
+              className="chat-menu-item is-danger"
+              onClick={() => setConfirmDeleteId(menuChat.id)}
+            >
+              <Trash2 size={14} />
+              <span>Удалить</span>
+            </button>
+          )
+        )}
+      </div>,
+      document.body,
+    )
+    : null
 
   return (
     <div className="sidebar-inner">
@@ -113,6 +407,7 @@ export function Sidebar({
           </div>
         </div>
       </div>
+      {contextMenuNode}
     </div>
   )
 }
