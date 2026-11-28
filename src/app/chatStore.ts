@@ -5,6 +5,7 @@ import { MockWorkspace } from '../transport/MockWorkspace'
 import { type DraftAttachment, inferDraftKind, isSafeRasterPreviewFile, MAX_ATTACHMENT_MB, MAX_CHAT_ATTACHMENTS, MAX_CHAT_TOTAL_ATTACHMENTS, MAX_IMAGE_MB } from './attachments'
 import { useAccountStore, blockReason } from './accountStore'
 import { applyServerUISettings, setAppearanceSyncHandler } from './appearanceStore'
+import { clearChatDraft, readChatDraft, writeChatDraft } from './drafts'
 import { readConnection, saveConnection, setTransport, transport } from './runtime'
 import type { ConnectionMode } from './runtime'
 import { RemoteError, RemoteTransport, fallbackProviders, normalizeServerAddress } from '../transport/RemoteTransport'
@@ -124,6 +125,7 @@ export const useChats = create<{
   lastModelByProvider: Partial<Record<ServerProvider, { model: string; reasoning?: string | undefined }>>
   codexIndex: 'hidden' | 'loading' | 'ready' | 'error'
   folders: ChatFolder[]
+  folderAttachmentsById: Record<string, MessageAttachment[]>
   pendingSearchJump: { chatId: string; messageId: string; nonce: number } | null
 }>(() => ({
   activeId: '', chats: [], workspace: null, mode: savedConnection.mode, address: savedConnection.address,
@@ -132,6 +134,7 @@ export const useChats = create<{
   serverModelsByProvider: {}, modelsLoadingByProvider: {}, modelsErrorByProvider: {}, lastModelByProvider: {},
   codexIndex: 'hidden',
   folders: [],
+  folderAttachmentsById: {},
   pendingSearchJump: null,
 }))
 
@@ -583,7 +586,7 @@ function applyRemoteWorkspace(remote: RemoteTransport, workspace: Workspace, pre
     const folderId = item.folderId !== undefined ? (item.folderId ?? null) : (folderById.get(item.id) ?? null)
     const archivedAt = item.archivedAt !== undefined ? (item.archivedAt ?? null) : (archivedById.get(item.id) ?? null)
     if (!previous) {
-      return { ...chat(item.id, item.title, access), pinned, folderId, archivedAt, provider: serverProvider, serverProvider, model: serverModel }
+      return { ...chat(item.id, item.title, access), draft: readChatDraft(item.id), pinned, folderId, archivedAt, provider: serverProvider, serverProvider, model: serverModel }
     }
     const prevServerProvider = previous.serverProvider ?? serverProvider
     const hasLocalProviderOverride = previous.provider != null && previous.provider !== prevServerProvider
@@ -1254,18 +1257,78 @@ export async function createChatFolder(name: string, color = '#6366f1') {
   return folder
 }
 
-export async function updateChatFolder(id: string, patch: { name?: string; color?: string }) {
+export async function updateChatFolder(id: string, patch: { name?: string; color?: string; systemPrompt?: string }) {
   const { remote } = useChats.getState()
   if (remote) {
     const updated = await remote.updateFolder(id, patch)
     if (useChats.getState().remote === remote) {
       useChats.setState(s => ({ folders: s.folders.map(f => f.id === id ? updated : f) }))
     }
-    return
+    return updated
   }
   useChats.setState(s => ({
     folders: s.folders.map(f => f.id === id ? { ...f, ...patch } : f),
   }))
+}
+
+export async function loadFolderAttachments(folderId: string) {
+  const { remote } = useChats.getState()
+  if (!remote || !folderId) return []
+  const attachments = await remote.folderAttachments(folderId)
+  if (useChats.getState().remote === remote) {
+    useChats.setState(s => ({
+      folderAttachmentsById: { ...s.folderAttachmentsById, [folderId]: attachments },
+      folders: s.folders.map(f => f.id === folderId ? { ...f, attachmentCount: attachments.length } : f),
+    }))
+  }
+  return attachments
+}
+
+export async function uploadFolderFiles(folderId: string, files: File[]) {
+  const { remote } = useChats.getState()
+  if (!remote || !folderId || files.length === 0) return []
+  const uploaded = await remote.uploadFolderAttachments(folderId, files)
+  if (useChats.getState().remote === remote) {
+    useChats.setState(s => {
+      const prev = s.folderAttachmentsById[folderId] ?? []
+      const next = [...prev, ...uploaded]
+      return {
+        folderAttachmentsById: { ...s.folderAttachmentsById, [folderId]: next },
+        folders: s.folders.map(f => f.id === folderId ? { ...f, attachmentCount: next.length } : f),
+      }
+    })
+  }
+  return uploaded
+}
+
+export async function removeFolderFile(folderId: string, attachmentId: string) {
+  const { remote } = useChats.getState()
+  if (!remote || !folderId) return
+  await remote.deleteFolderAttachment(folderId, attachmentId)
+  if (useChats.getState().remote === remote) {
+    useChats.setState(s => {
+      const next = (s.folderAttachmentsById[folderId] ?? []).filter(a => a.id !== attachmentId)
+      return {
+        folderAttachmentsById: { ...s.folderAttachmentsById, [folderId]: next },
+        folders: s.folders.map(f => f.id === folderId ? { ...f, attachmentCount: next.length } : f),
+      }
+    })
+  }
+}
+
+const draftSaveTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+export function setChatDraftText(chatId: string, text: string) {
+  updateChat(chatId, c => ({ ...c, draft: text }))
+  const prevTimer = draftSaveTimers.get(chatId)
+  if (prevTimer) clearTimeout(prevTimer)
+  draftSaveTimers.set(
+    chatId,
+    setTimeout(() => {
+      draftSaveTimers.delete(chatId)
+      writeChatDraft(chatId, text)
+    }, 200),
+  )
 }
 
 export async function deleteChatFolder(id: string) {
@@ -1702,6 +1765,11 @@ async function startRun(id: string, input: string, retry?: { turnId: string; mod
     ...retryFields, parentId, target, id: crypto.randomUUID(), time: Date.now(), authorId: workspace.user.id,
     ...(messageAttachments.length ? { attachments: messageAttachments } : {}),
     prompt, model: remote && chatProvider === 'stub' ? 'StubProvider' : model.label, modelId: model.id, provider: chatProvider, seq: 0, state: 'running', parts: [],
+  }
+  if (!source) {
+    const t = draftSaveTimers.get(id)
+    if (t) { clearTimeout(t); draftSaveTimers.delete(id) }
+    clearChatDraft(id)
   }
   updateChat(id, value => ({
     ...value,

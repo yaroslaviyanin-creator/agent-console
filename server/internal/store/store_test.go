@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -72,7 +73,7 @@ func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 		t.Fatalf("auth after reopening DB failed: %v", err)
 	}
 	var version int
-	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 23 {
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 24 {
 		t.Fatalf("schema version %d: %v", version, err)
 	}
 	if currentDevice.LastSeenAt != device.LastSeenAt {
@@ -855,8 +856,8 @@ func TestStoreMigrateV16ToV17Attachments(t *testing.T) {
 	defer reopened.Close()
 
 	var version int
-	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 23 {
-		t.Fatalf("expected user_version=23, got %d (err=%v)", version, err)
+	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 24 {
+		t.Fatalf("expected user_version=24, got %d (err=%v)", version, err)
 	}
 	owner, err := reopened.CreateUserWithRole(ctx, "u1", []byte("h"), "user")
 	if err != nil {
@@ -1009,8 +1010,8 @@ func TestUISettingsMigrationAndValidation(t *testing.T) {
 	defer db.Close()
 
 	var version int
-	if err := db.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 23 {
-		t.Fatalf("expected user_version 23, got %d (%v)", version, err)
+	if err := db.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 24 {
+		t.Fatalf("expected user_version 24, got %d (%v)", version, err)
 	}
 	prof, err := db.UserProfile(ctx, "u1")
 	if err != nil {
@@ -1039,5 +1040,93 @@ func TestUISettingsMigrationAndValidation(t *testing.T) {
 		if _, err := db.UpdateUserProfileWithUI(ctx, "u1", nil, nil, nil, nil, &bad); !errors.Is(err, ErrInvalidUISettings) {
 			t.Fatalf("expected ErrInvalidUISettings for %s, got %v", string(bad), err)
 		}
+	}
+
+	// Templates validation inside uiSettings
+	tplRaw := json.RawMessage(`{"templates":[{"id":"t1","slash":"/review","title":"Code review","content":"Review this code carefully"}]}`)
+	updatedTpl, err := db.UpdateUserProfileWithUI(ctx, "u1", nil, nil, nil, nil, &tplRaw)
+	if err != nil {
+		t.Fatalf("UpdateUserProfileWithUI valid templates failed: %v", err)
+	}
+	if !strings.Contains(string(updatedTpl.UISettings), `"/review"`) {
+		t.Fatalf("expected /review template saved in %s", updatedTpl.UISettings)
+	}
+
+	var many []map[string]string
+	for i := 0; i < 31; i++ {
+		many = append(many, map[string]string{"id": fmt.Sprintf("id-%d", i), "slash": fmt.Sprintf("/cmd%d", i), "title": "Title", "content": "Body"})
+	}
+	tooManyRaw, _ := json.Marshal(map[string]any{"templates": many})
+	for _, badTpl := range []json.RawMessage{
+		json.RawMessage(`{"templates":"not-array"}`),
+		json.RawMessage(`{"templates":[{"id":"t1","slash":"noslash","title":"T","content":"Body"}]}`),
+		json.RawMessage(`{"templates":[{"id":"t1","slash":"/bad space","title":"T","content":"Body"}]}`),
+		json.RawMessage(`{"templates":[{"id":"t1","slash":"/ok","title":"T","content":"Body","extra":"x"}]}`),
+		json.RawMessage(`{"templates":[{"id":"t1","slash":"/ok","title":"T","content":"   "}]}`),
+		tooManyRaw,
+	} {
+		if _, err := db.UpdateUserProfileWithUI(ctx, "u1", nil, nil, nil, nil, &badTpl); !errors.Is(err, ErrInvalidUISettings) {
+			t.Fatalf("expected ErrInvalidUISettings for templates %s, got %v", string(badTpl), err)
+		}
+	}
+}
+
+func TestMigrateV23ToV24FoldersAndProjectAttachments(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "v23-folders.db")
+	db, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateUserWithRole(ctx, "alice", []byte("h"), "user"); err != nil {
+		t.Fatal(err)
+	}
+	var userID string
+	if err := db.db.QueryRowContext(ctx, `SELECT id FROM users WHERE username='alice'`).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an existing v23 database before system_prompt and folder_attachments existed.
+	if _, err := db.db.ExecContext(ctx, `
+		DROP TABLE IF EXISTS folder_attachments;
+		DROP TABLE IF EXISTS chat_folders;
+		CREATE TABLE chat_folders (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name TEXT NOT NULL,
+			color TEXT NOT NULL DEFAULT '#6366f1',
+			sort_order INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL
+		);
+		INSERT INTO chat_folders (id, user_id, name, color, sort_order, created_at)
+		VALUES ('f-old', ?, 'Старая папка', '#10b981', 0, 1000);
+		PRAGMA user_version=23;
+	`, userID); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	reopened, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen v23 db failed: %v", err)
+	}
+	defer reopened.Close()
+
+	var version int
+	if err := reopened.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil || version != 24 {
+		t.Fatalf("expected user_version=24, got %d (%v)", version, err)
+	}
+	folders, err := reopened.ListFolders(ctx, userID)
+	if err != nil {
+		t.Fatalf("ListFolders after v23->v24 migration failed: %v", err)
+	}
+	if len(folders) != 1 || folders[0].ID != "f-old" || folders[0].Name != "Старая папка" {
+		t.Fatalf("unexpected folders after migration: %+v", folders)
+	}
+	created, err := reopened.CreateFolder(ctx, userID, "Новая папка", "#6366f1", "")
+	if err != nil {
+		t.Fatalf("CreateFolder after v23->v24 migration failed: %v", err)
+	}
+	if created.Name != "Новая папка" {
+		t.Fatalf("unexpected created folder: %+v", created)
 	}
 }

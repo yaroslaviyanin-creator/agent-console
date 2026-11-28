@@ -5,10 +5,14 @@ import { Incoming, LimitActions, Quotas, ServerQuotas } from './Quotas'
 import { AuthScene } from './AuthScene'
 import { WorkspaceDialog } from './WorkspaceDialog'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Globe, Hourglass, Laptop, Menu, PanelLeft, PanelRight, Paperclip, Receipt, Square, Terminal } from 'lucide-react'
+import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Globe, Hourglass, Laptop, Menu, Mic, MicOff, PanelLeft, PanelRight, Paperclip, Receipt, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
-import { clearChatAttachmentError, clearSearchJump, demoPrompt, availableDevices, downloadChatMarkdown, editAndResendPrompt, models, providerLabels, checkAccountStatus, logout, newChat, reconnectServer, removeChatAttachment, resolveAvailableProviders, resolveModelDisplay, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, stopChat, switchChatProvider, updateChat, uploadChatFiles, useChats } from './chatStore'
+import { clearChatAttachmentError, clearSearchJump, demoPrompt, availableDevices, downloadChatMarkdown, editAndResendPrompt, loadFolderAttachments, models, providerLabels, checkAccountStatus, logout, newChat, reconnectServer, removeChatAttachment, resolveAvailableProviders, resolveModelDisplay, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, setChatDraftText, stopChat, switchChatProvider, updateChat, uploadChatFiles, useChats } from './chatStore'
+import { useAppearance } from './appearanceStore'
+import { QuoteReplyButton } from './QuoteReplyButton'
+import { SlashCommandMenu, applySlashTemplate, filterPromptTemplates, findSlashQuery } from './SlashCommandMenu'
+import { useVoiceDictation } from './voiceInput'
 import type { Chat, Turn } from './chatStore'
 import type { Provider, ServerProvider } from '../protocol/types'
 import { CHAT_ATTACHMENT_ACCEPT, MAX_CHAT_ATTACHMENTS } from './attachments'
@@ -220,7 +224,7 @@ function Transcript({
       )}
       {turn.parts.map((p, i) => p.kind === 'tool' ? <ToolCard key={p.callId} chatId={chatId} turn={turn} entry={p}/> : p.kind === 'thinking'
       ? <details className="thinking" key={i}><summary><Brain size={14}/><span>Рассуждения</span><ChevronRight size={13}/></summary><p>{p.text}</p></details>
-      : <RichText text={formatStreamingDisplayText(p.text, turn.state === 'running')} key={i}/>)}
+      : <RichText text={formatStreamingDisplayText(p.text, turn.state === 'running')} streaming={turn.state === 'running'} key={i}/>)}
       {!!turn.assistantAttachments?.length && (
         <AssistantArtifacts attachments={turn.assistantAttachments} remote={remote} />
       )}
@@ -280,10 +284,37 @@ function Conversation({
   const [draggingFiles, setDraggingFiles] = useState(false)
   const [openMenu, setOpenMenu] = useState<'model' | 'env' | null>(null)
   const [highlightedTurnId, setHighlightedTurnId] = useState<string | null>(null)
+  const templates = useAppearance(s => s.templates)
+  const [slashIndex, setSlashIndex] = useState(0)
+  const [slashDismissed, setSlashDismissed] = useState(false)
+  const [cursorPos, setCursorPos] = useState(0)
   const pendingSearchJump = useChats(s => s.pendingSearchJump)
   const running = chat.turns.at(-1)?.state === 'running'
   const editable = chat.access === 'owner' || chat.access === 'write'
   const locked = running || !editable
+  const slashMatch = !locked && !slashDismissed ? findSlashQuery(chat.draft, cursorPos) : null
+  const slashResults = slashMatch ? filterPromptTemplates(templates, slashMatch.query) : []
+  const clampedSlashIdx = slashResults.length > 0 ? Math.min(slashIndex, slashResults.length - 1) : 0
+
+  const selectSlashTemplate = useCallback((tpl: (typeof templates)[number]) => {
+    if (!slashMatch) return
+    const { nextText, nextCursor } = applySlashTemplate(chat.draft, slashMatch, tpl)
+    setChatDraftText(chat.id, nextText)
+    setSlashDismissed(true)
+    window.requestAnimationFrame(() => {
+      const el = input.current
+      if (el) {
+        el.focus()
+        el.setSelectionRange(nextCursor, nextCursor)
+        setCursorPos(nextCursor)
+      }
+    })
+  }, [slashMatch, chat.draft, chat.id])
+
+  const voice = useVoiceDictation({
+    getCurrentText: () => useChats.getState().chats.find(c => c.id === chat.id)?.draft ?? '',
+    onUpdateText: text => setChatDraftText(chat.id, text),
+  })
   const draftAttachments = chat.attachments ?? []
   const uploadingAttachments = draftAttachments.some(a => a.status === 'uploading')
   const hasReadyAttachments = draftAttachments.some(a => a.status === 'ready' && !!a.remote?.id)
@@ -477,6 +508,23 @@ function Conversation({
       }}
     >
     <div className="history" ref={scroll} onScroll={() => { const el = scroll.current; if (el) follow.current = el.scrollHeight - el.clientHeight - el.scrollTop < 48 }}>
+      <QuoteReplyButton
+        feedRef={scroll}
+        enabled={editable && !chat.indexedCodex}
+        onQuote={quoted => {
+          const prev = chat.draft
+          const next = prev ? `${prev.replace(/\s+$/, '')}\n\n${quoted}` : quoted
+          setChatDraftText(chat.id, next)
+          window.requestAnimationFrame(() => {
+            const el = input.current
+            if (el) {
+              el.focus()
+              el.setSelectionRange(next.length, next.length)
+              setCursorPos(next.length)
+            }
+          })
+        }}
+      />
       <div className="thread">
         {chat.historyError && <div className="notice" role="alert">{chat.historyError} <button className="text-action" onClick={retryHistory}>Повторить загрузку</button></div>}
         {remote && !chat.historyLoaded ? !chat.historyError && (
@@ -525,6 +573,14 @@ function Conversation({
       {reason && !running && <LimitActions key={provider} w={w!} provider={provider} reason={reason} switchCodex={() => updateChat(chat.id,c => ({ ...c, model: 'codex' }))} billing={billing}/>}
       {providerDisabled && !running && <p className="notice" role="status">Провайдер {chatProviderLabel} недоступен на сервере. {canChangeProvider ? 'Выберите другой провайдер, чтобы продолжить чат.' : 'Отправка сообщений отключена.'}</p>}
       <div className="composer" ref={composerRef}>
+        {slashResults.length > 0 && (
+          <SlashCommandMenu
+            templates={slashResults}
+            activeIndex={clampedSlashIdx}
+            onHover={setSlashIndex}
+            onSelect={selectSlashTemplate}
+          />
+        )}
         {openMenu === 'model' && (
           <ModelPopover
             remoteMode={!!remote}
@@ -584,7 +640,13 @@ function Conversation({
           onPointerDown={() => setOpenMenu(null)}
           onMouseDown={() => setOpenMenu(null)}
           onFocus={() => setOpenMenu(null)}
-          onChange={e => updateChat(chat.id, c => ({ ...c, draft: e.target.value }))}
+          onSelect={e => setCursorPos((e.target as HTMLTextAreaElement).selectionStart ?? 0)}
+          onChange={e => {
+            setSlashDismissed(false)
+            setSlashIndex(0)
+            setCursorPos(e.target.selectionStart ?? e.target.value.length)
+            setChatDraftText(chat.id, e.target.value)
+          }}
           onPaste={e => {
             if (!remote || locked || chat.indexedCodex) return
             const files: File[] = []
@@ -599,7 +661,36 @@ function Conversation({
               void uploadChatFiles(chat.id, files)
             }
           }}
-          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit() } }}/>
+          onKeyDown={e => {
+            if (slashResults.length > 0) {
+              if (e.key === 'ArrowDown') {
+                e.preventDefault()
+                setSlashIndex(i => (i + 1) % slashResults.length)
+                return
+              }
+              if (e.key === 'ArrowUp') {
+                e.preventDefault()
+                setSlashIndex(i => (i - 1 + slashResults.length) % slashResults.length)
+                return
+              }
+              if (e.key === 'Enter' || e.key === 'Tab') {
+                e.preventDefault()
+                const chosen = slashResults[clampedSlashIdx]
+                if (chosen) selectSlashTemplate(chosen)
+                return
+              }
+              if (e.key === 'Escape') {
+                e.preventDefault()
+                setSlashDismissed(true)
+                return
+              }
+            }
+            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+              e.preventDefault()
+              if (voice.listening) voice.stop()
+              submit()
+            }
+          }}/>
         <div className="composer-controls">
           <div className="composer-triggers">
             {remote && !chat.indexedCodex && (
@@ -657,8 +748,20 @@ function Conversation({
             {(statusTone === 'is-error' || (remote && (!connected || !chat.historyLoaded))) && (
               <span className={`status-lamp ${statusTone}`} role="status" title={statusText} aria-label={statusText} />
             )}
+            {voice.supported && (
+              <button
+                type="button"
+                className={`composer-mic-btn${voice.listening ? ' is-listening' : ''}`}
+                disabled={!!reason || running}
+                aria-label={voice.listening ? 'Остановить голосовой ввод' : 'Голосовой ввод'}
+                title={voice.listening ? 'Остановить диктовку' : 'Голосовой ввод (ru-RU)'}
+                onClick={voice.toggle}
+              >
+                {voice.listening ? <MicOff size={15} /> : <Mic size={15} />}
+              </button>
+            )}
             {running && !remote ? <button className="send stop" title="Остановить ответ" aria-label="Остановить ответ" onClick={() => stopChat(chat.id)}><Square size={13} fill="currentColor"/></button>
-              : <button className="send" title="Отправить" aria-label="Отправить" disabled={blocked || running || uploadingAttachments || (!chat.draft.trim() && !hasReadyAttachments)} onClick={submit}><ArrowUp size={17}/></button>}
+              : <button className="send" title="Отправить" aria-label="Отправить" disabled={blocked || running || uploadingAttachments || (!chat.draft.trim() && !hasReadyAttachments)} onClick={() => { if (voice.listening) voice.stop(); submit() }}><ArrowUp size={17}/></button>}
           </div>
         </div>
       </div>
@@ -762,6 +865,15 @@ function Connected() {
     closeFile()
     closeLightbox()
   }, [activeId, closeFile, closeLightbox])
+  useEffect(() => {
+    if (!contextOpen || !remote || !chat || chat.access !== 'owner' || !chat.folderId) return
+    const state = useChats.getState()
+    const folder = state.folders.find(f => f.id === chat.folderId)
+    if (!folder || (folder.attachmentCount ?? 0) === 0) return
+    if (state.folderAttachmentsById[folder.id] === undefined) {
+      void loadFolderAttachments(folder.id).catch(() => {})
+    }
+  }, [contextOpen, remote, chat?.id, chat?.access, chat?.folderId])
   useTelegramBack(searchOpen || !!panel || drawerOpen || quotasOpen || !!lightboxFile || !!viewerFile || contextOpen || view === 'billing', () => {
     if (searchOpen) setSearchOpen(false)
     else if (panel) setPanel(null)
@@ -1040,6 +1152,14 @@ function Connected() {
               canAttach={!!remote && editableChat && !chat.indexedCodex}
               onAttachClick={() => document.querySelector<HTMLInputElement>('.composer input[type="file"]')?.click()}
               onExportMarkdown={() => downloadChatMarkdown(chat)}
+              projectFolder={(() => {
+                if (chat.access !== 'owner' || !chat.folderId) return null
+                return useChats.getState().folders.find(f => f.id === chat.folderId) ?? null
+              })()}
+              projectFiles={(() => {
+                if (chat.access !== 'owner' || !chat.folderId) return undefined
+                return useChats.getState().folderAttachmentsById[chat.folderId]
+              })()}
               onClose={() => setContextOpen(false)}
             />
           </aside>

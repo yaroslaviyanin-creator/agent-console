@@ -26,7 +26,8 @@ var safeStorageKeyRe = regexp.MustCompile(`^[a-f0-9]{32}$`)
 
 type Attachment struct {
 	ID            string `json:"id"`
-	ChatID        string `json:"chatId"`
+	ChatID        string `json:"chatId,omitempty"`
+	FolderID      string `json:"folderId,omitempty"`
 	MessageID     string `json:"messageId,omitempty"`
 	UserID        string `json:"userId"`
 	OriginalName  string `json:"name"`
@@ -84,51 +85,55 @@ func (s *Store) CountChatAttachments(ctx context.Context, chatID string) (int, e
 	return count, err
 }
 
-// CreateAttachment writes or moves validated bytes to an isolated UUID path (mode 0600) and records metadata.
-func (s *Store) CreateAttachment(ctx context.Context, chatID, userID string, v uploads.ValidatedAttachment) (Attachment, error) {
-	id := randomHex(16)
-	storageKey := randomHex(16)
-	diskPath, err := s.attachmentPath(storageKey)
+func (s *Store) stageValidatedAttachment(v uploads.ValidatedAttachment) (storageKey string, diskPath string, sizeBytes int64, shaHex string, err error) {
+	storageKey = randomHex(16)
+	diskPath, err = s.attachmentPath(storageKey)
 	if err != nil {
-		return Attachment{}, err
+		return "", "", 0, "", err
 	}
 	if err := os.MkdirAll(s.uploadsDir, 0700); err != nil {
-		return Attachment{}, err
+		return "", "", 0, "", err
 	}
 
-	var (
-		sizeBytes int64
-		shaHex    string
-	)
 	if v.SourcePath != "" && v.Data == nil {
 		f, err := os.Open(v.SourcePath)
 		if err != nil {
-			return Attachment{}, err
+			return "", "", 0, "", err
 		}
 		h := sha256.New()
 		n, copyErr := io.Copy(h, f)
 		_ = f.Close()
 		if copyErr != nil {
-			return Attachment{}, copyErr
+			return "", "", 0, "", copyErr
 		}
 		sizeBytes = n
 		shaHex = hex.EncodeToString(h.Sum(nil))
 		if err := os.Chmod(v.SourcePath, 0600); err != nil {
-			return Attachment{}, err
+			return "", "", 0, "", err
 		}
 		if err := os.Rename(v.SourcePath, diskPath); err != nil {
 			if err := copyFileSecure(v.SourcePath, diskPath); err != nil {
-				return Attachment{}, err
+				return "", "", 0, "", err
 			}
 			_ = os.Remove(v.SourcePath)
 		}
 	} else {
 		if err := os.WriteFile(diskPath, v.Data, 0600); err != nil {
-			return Attachment{}, err
+			return "", "", 0, "", err
 		}
 		sizeBytes = int64(len(v.Data))
 		sum := sha256.Sum256(v.Data)
 		shaHex = hex.EncodeToString(sum[:])
+	}
+	return storageKey, diskPath, sizeBytes, shaHex, nil
+}
+
+// CreateAttachment writes or moves validated bytes to an isolated UUID path (mode 0600) and records metadata.
+func (s *Store) CreateAttachment(ctx context.Context, chatID, userID string, v uploads.ValidatedAttachment) (Attachment, error) {
+	id := randomHex(16)
+	storageKey, diskPath, sizeBytes, shaHex, err := s.stageValidatedAttachment(v)
+	if err != nil {
+		return Attachment{}, err
 	}
 
 	now := time.Now().UnixMilli()

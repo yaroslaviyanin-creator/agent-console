@@ -33,6 +33,22 @@ CREATE TABLE IF NOT EXISTS chat_folders (
     name TEXT NOT NULL,
     color TEXT NOT NULL DEFAULT '#6366f1',
     sort_order INTEGER NOT NULL DEFAULT 0,
+    system_prompt TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS folder_attachments (
+    id TEXT PRIMARY KEY,
+    folder_id TEXT NOT NULL REFERENCES chat_folders(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    original_name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('image', 'text', 'pdf', 'archive', 'document')),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    sha256 TEXT NOT NULL,
+    storage_key TEXT NOT NULL UNIQUE,
+    extracted_text TEXT,
+    warning TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL
 );
 
@@ -108,6 +124,7 @@ CREATE TABLE IF NOT EXISTS chat_attachments (
 
 CREATE INDEX IF NOT EXISTS devices_by_user ON devices (user_id);
 CREATE INDEX IF NOT EXISTS chat_folders_by_user ON chat_folders (user_id, sort_order, created_at);
+CREATE INDEX IF NOT EXISTS folder_attachments_by_folder ON folder_attachments (folder_id, created_at);
 CREATE INDEX IF NOT EXISTS chats_by_user ON chats (user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS messages_by_chat ON chat_messages (chat_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS chat_message_runs ON chat_messages (chat_id, role, run_id);

@@ -2,9 +2,10 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Archive, ArchiveRestore, ChevronDown, ChevronRight, CodeXml, Download, Eye, Folder, FolderInput, FolderPlus,
-  GitFork, MessageSquare, MoreHorizontal, Palette, Pencil, Pin, PinOff, Plus, Radio, Receipt, Search,
-  Settings2, Share2, Shield, Trash2, Users, X,
+  GitFork, MessageSquare, MoreHorizontal, Palette, Paperclip, Pencil, Pin, PinOff, Plus, Radio, Receipt, Search,
+  Settings2, Share2, Shield, Sparkles, Trash2, Users, X,
 } from 'lucide-react'
+import { ProjectSettingsModal } from './ProjectSettingsModal'
 import {
   createChatFolder, deleteChatFolder, deleteChatItem, downloadChatMarkdown, forkChatAt,
   moveChatToFolder, newChat, renameChat, selectChat, toggleArchiveChat, togglePinChat,
@@ -95,10 +96,12 @@ export function Sidebar({
   const [renameDraft, setRenameDraft] = useState('')
   const [renamingFolderId, setRenamingFolderId] = useState<string | null>(null)
   const [renameFolderDraft, setRenameFolderDraft] = useState('')
+  const [projectModalFolderId, setProjectModalFolderId] = useState<string | null>(null)
 
   const [creatingFolder, setCreatingFolder] = useState(false)
   const [newFolderName, setNewFolderName] = useState('')
   const [newFolderColor, setNewFolderColor] = useState<string>(FOLDER_COLORS[0])
+  const [folderCreateError, setFolderCreateError] = useState('')
   const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>(() => ({
     archive: true,
     ...readCollapsedSections(),
@@ -210,12 +213,17 @@ export function Sidebar({
     if (next) void updateChatFolder(folderId, { name: next })
   }
 
-  const submitCreateFolder = () => {
+  const submitCreateFolder = async () => {
     const trimmed = newFolderName.trim()
     if (!trimmed) return
-    setCreatingFolder(false)
-    setNewFolderName('')
-    void createChatFolder(trimmed, newFolderColor)
+    setFolderCreateError('')
+    try {
+      await createChatFolder(trimmed, newFolderColor)
+      setCreatingFolder(false)
+      setNewFolderName('')
+    } catch (err) {
+      setFolderCreateError(err instanceof Error ? err.message : 'Не удалось создать папку.')
+    }
   }
 
   function row(c: Chat) {
@@ -296,6 +304,7 @@ export function Sidebar({
         >
           <Icon size={15} aria-label={{ read: 'Чтение', fork: 'Разветвление', write: 'Полный доступ', owner: 'Мой чат' }[c.access]} />
           <span className="chat-link-title">{c.title}</span>
+          {c.draft.trim().length > 0 && <small className="draft-label">Черновик</small>}
           {c.pinned && <Pin size={12} className="chat-pin-badge" aria-label="Закреплён" />}
           {(c.archived || c.archivedAt != null) && <small className="archive-label">Архив</small>}
         </button>
@@ -518,6 +527,18 @@ export function Sidebar({
               className="chat-menu-item"
               onClick={() => {
                 setMenu(null)
+                setProjectModalFolderId(menuFolder.id)
+              }}
+            >
+              <Settings2 size={14} />
+              <span>Настройки проекта</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="chat-menu-item"
+              onClick={() => {
+                setMenu(null)
                 setRenameFolderDraft(menuFolder.name)
                 setRenamingFolderId(menuFolder.id)
               }}
@@ -613,11 +634,11 @@ export function Sidebar({
         </div>
 
         {creatingFolder && (
-          <form
+            <form
             className="folder-create-box"
             onSubmit={e => {
               e.preventDefault()
-              submitCreateFolder()
+              void submitCreateFolder()
             }}
           >
             <input
@@ -627,14 +648,19 @@ export function Sidebar({
               placeholder="Название папки…"
               maxLength={60}
               value={newFolderName}
-              onChange={e => setNewFolderName(e.target.value)}
+              onChange={e => {
+                setNewFolderName(e.target.value)
+                if (folderCreateError) setFolderCreateError('')
+              }}
               onKeyDown={e => {
                 if (e.key === 'Escape') {
                   setCreatingFolder(false)
                   setNewFolderName('')
+                  setFolderCreateError('')
                 }
               }}
             />
+            {folderCreateError && <p className="auth-error" role="alert">{folderCreateError}</p>}
             <div className="folder-color-row">
               {FOLDER_COLORS.map(c => (
                 <button
@@ -698,6 +724,17 @@ export function Sidebar({
                       {isCollapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
                       <Folder size={14} style={{ color: folder.color }} aria-hidden="true" />
                       <span className="folder-name">{folder.name}</span>
+                      {(folder.systemPrompt?.trim() || (folder.attachmentCount ?? 0) > 0) && (
+                        <span className="folder-project-badge" title="Проект: заданы инструкции или файлы">
+                          {folder.systemPrompt?.trim() && <Sparkles size={10} aria-hidden="true" />}
+                          {(folder.attachmentCount ?? 0) > 0 && (
+                            <span className="folder-file-count">
+                              <Paperclip size={10} aria-hidden="true" />
+                              {folder.attachmentCount}
+                            </span>
+                          )}
+                        </span>
+                      )}
                       <small className="folder-count">{folderChats.length}</small>
                     </button>
                     <button
@@ -791,6 +828,14 @@ export function Sidebar({
         </div>
       </div>
       {contextMenuNode}
+      {projectModalFolderId && (() => {
+        const targetFolder = folders.find(f => f.id === projectModalFolderId)
+        if (!targetFolder) return null
+        return createPortal(
+          <ProjectSettingsModal folder={targetFolder} onClose={() => setProjectModalFolderId(null)} />,
+          document.body,
+        )
+      })()}
     </div>
   )
 }

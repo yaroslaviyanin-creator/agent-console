@@ -191,12 +191,27 @@ export class RemoteTransport implements TransportAdapter {
     files: File[],
     signalOrOptions?: AbortSignal | { signal?: AbortSignal; onProgress?: (percent: number) => void },
   ): Promise<MessageAttachment[]> {
+    return this.uploadFilesToUrl(this.address + '/api/chats/' + encodeURIComponent(chatId) + '/attachments', files, signalOrOptions)
+  }
+
+  async uploadFolderAttachments(
+    folderId: string,
+    files: File[],
+    signalOrOptions?: AbortSignal | { signal?: AbortSignal; onProgress?: (percent: number) => void },
+  ): Promise<MessageAttachment[]> {
+    return this.uploadFilesToUrl(this.address + '/api/folders/' + encodeURIComponent(folderId) + '/attachments', files, signalOrOptions)
+  }
+
+  private async uploadFilesToUrl(
+    url: string,
+    files: File[],
+    signalOrOptions?: AbortSignal | { signal?: AbortSignal; onProgress?: (percent: number) => void },
+  ): Promise<MessageAttachment[]> {
     const opts = signalOrOptions instanceof AbortSignal ? { signal: signalOrOptions } : (signalOrOptions ?? {})
     const form = new FormData()
     for (const file of files) {
       form.append('files', file, file.name)
     }
-    const url = this.address + '/api/chats/' + encodeURIComponent(chatId) + '/attachments'
     const mapFailure = (status: number, detail: Partial<ServerError>) => {
       const message = status === 429 || detail.code === 'rate_limited'
         ? 'Слишком много загрузок. Попробуйте позже.'
@@ -499,16 +514,34 @@ export class RemoteTransport implements TransportAdapter {
     return this.request<ChatFolder[]>('/api/folders', undefined, signal)
   }
 
-  createFolder(name: string, color?: string) {
-    return this.request<ChatFolder>('/api/folders', { name, ...(color ? { color } : {}) }, undefined, 'POST')
+  createFolder(name: string, color?: string, systemPrompt?: string) {
+    return this.request<ChatFolder>('/api/folders', { name, ...(color ? { color } : {}), ...(systemPrompt ? { systemPrompt } : {}) }, undefined, 'POST')
   }
 
-  updateFolder(id: string, patch: { name?: string; color?: string; sortOrder?: number }) {
+  updateFolder(id: string, patch: { name?: string; color?: string; sortOrder?: number; systemPrompt?: string }) {
     return this.request<ChatFolder>('/api/folders/' + encodeURIComponent(id), patch, undefined, 'PATCH')
   }
 
   deleteFolder(id: string) {
     return this.request<void>('/api/folders/' + encodeURIComponent(id), undefined, undefined, 'DELETE')
+  }
+
+  async folderAttachments(folderId: string, signal?: AbortSignal): Promise<MessageAttachment[]> {
+    const res = await this.request<{ attachments?: MessageAttachment[] }>(
+      '/api/folders/' + encodeURIComponent(folderId) + '/attachments',
+      undefined,
+      signal,
+    )
+    return res.attachments ?? []
+  }
+
+  deleteFolderAttachment(folderId: string, attachmentId: string) {
+    return this.request<void>(
+      '/api/folders/' + encodeURIComponent(folderId) + '/attachments/' + encodeURIComponent(attachmentId),
+      undefined,
+      undefined,
+      'DELETE',
+    )
   }
 
   search(query: string, limit = 30, signal?: AbortSignal) {

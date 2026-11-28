@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { UISettings } from '../protocol/types'
+import type { PromptTemplate, UISettings } from '../protocol/types'
 
 export type ThemePreference = 'dark' | 'light' | 'system'
 export type AccentPreset = 'mint' | 'ocean' | 'violet' | 'amber' | 'rose' | 'graphite' | 'custom'
@@ -13,6 +13,7 @@ export interface AppearanceState {
   gradientPalette: GradientPalette
   gradientCustomColor: string
   gradientCustomColor2: string
+  templates: PromptTemplate[]
   setTheme: (theme: ThemePreference) => void
   setAccent: (accent: AccentPreset) => void
   setAccentCustomColor: (hex: string) => void
@@ -20,6 +21,7 @@ export interface AppearanceState {
   setGradientPalette: (palette: GradientPalette) => void
   setGradientCustomColor: (hex: string) => void
   setGradientCustomColor2: (hex: string) => void
+  setTemplates: (templates: PromptTemplate[]) => void
 }
 
 export const ACCENT_PRESETS: readonly { id: Exclude<AccentPreset, 'custom'>; label: string; swatch: string }[] = [
@@ -51,6 +53,7 @@ interface StoredAppearance {
   gradientPalette?: GradientPalette
   gradientCustomColor?: string
   gradientCustomColor2?: string
+  templates?: PromptTemplate[]
 }
 
 type AppearanceSnapshot = {
@@ -61,6 +64,24 @@ type AppearanceSnapshot = {
   gradientPalette: GradientPalette
   gradientCustomColor: string
   gradientCustomColor2: string
+  templates: PromptTemplate[]
+}
+
+function normalizeTemplates(raw: unknown, fallback: PromptTemplate[]): PromptTemplate[] {
+  if (!Array.isArray(raw)) return fallback
+  const out: PromptTemplate[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const rec = item as Record<string, unknown>
+    const id = typeof rec.id === 'string' ? rec.id.trim() : ''
+    const slash = typeof rec.slash === 'string' ? rec.slash.trim() : ''
+    const title = typeof rec.title === 'string' ? rec.title.trim() : ''
+    const content = typeof rec.content === 'string' ? rec.content : ''
+    if (!id || !slash.startsWith('/') || slash.length < 2 || /\s/.test(slash) || !title || !content.trim()) continue
+    out.push({ id, slash, title, content })
+    if (out.length >= 30) break
+  }
+  return out
 }
 
 function normalizeHex(raw: unknown, fallback: string): string {
@@ -78,6 +99,7 @@ function parseSnapshot(parsed: StoredAppearance | null | undefined, base?: Appea
     gradientPalette: 'accent',
     gradientCustomColor: '#8b5cf6',
     gradientCustomColor2: '#3b82f6',
+    templates: [],
   }
   if (!parsed || typeof parsed !== 'object') return fallback
   const theme: ThemePreference = parsed.theme === 'light' || parsed.theme === 'system' || parsed.theme === 'dark' ? parsed.theme : fallback.theme
@@ -93,7 +115,8 @@ function parseSnapshot(parsed: StoredAppearance | null | undefined, base?: Appea
       : fallback.gradientPalette
   const gradientCustomColor = normalizeHex(parsed.gradientCustomColor, fallback.gradientCustomColor)
   const gradientCustomColor2 = normalizeHex(parsed.gradientCustomColor2, fallback.gradientCustomColor2)
-  return { theme, accent, accentCustomColor, ambientGradient, gradientPalette, gradientCustomColor, gradientCustomColor2 }
+  const templates = parsed.templates !== undefined ? normalizeTemplates(parsed.templates, fallback.templates) : fallback.templates
+  return { theme, accent, accentCustomColor, ambientGradient, gradientPalette, gradientCustomColor, gradientCustomColor2, templates }
 }
 
 function readStored(): AppearanceSnapshot {
@@ -150,7 +173,7 @@ const ORB_CSS_PROPS = [
   '--orb-3-fade',
 ] as const
 
-export function applyAppearanceToDom(state: AppearanceSnapshot) {
+export function applyAppearanceToDom(state: Omit<AppearanceSnapshot, 'templates'> & { templates?: PromptTemplate[] }) {
   if (typeof document === 'undefined') return
   const resolved = resolveTheme(state.theme)
   const root = document.documentElement
@@ -224,6 +247,7 @@ export function serializeAppearanceSnapshot(s: AppearanceSnapshot): UISettings {
     gradientPalette: s.gradientPalette,
     gradientCustomColor: s.gradientCustomColor,
     gradientCustomColor2: s.gradientCustomColor2,
+    templates: s.templates,
   }
 }
 
@@ -248,6 +272,7 @@ export function applyServerUISettings(raw: UISettings | undefined | null) {
     gradientPalette: current.gradientPalette,
     gradientCustomColor: current.gradientCustomColor,
     gradientCustomColor2: current.gradientCustomColor2,
+    templates: current.templates,
   }
   const merged = parseSnapshot(raw, base)
   saveStored(merged)
@@ -264,6 +289,7 @@ export const useAppearance = create<AppearanceState>((set, get) => {
     gradientPalette: patch.gradientPalette ?? get().gradientPalette,
     gradientCustomColor: patch.gradientCustomColor ?? get().gradientCustomColor,
     gradientCustomColor2: patch.gradientCustomColor2 ?? get().gradientCustomColor2,
+    templates: patch.templates ?? get().templates,
   })
   const commit = (patch: Partial<AppearanceSnapshot>) => {
     const next = snapshot(patch)
@@ -290,6 +316,7 @@ export const useAppearance = create<AppearanceState>((set, get) => {
       const gradientCustomColor2 = normalizeHex(hex, get().gradientCustomColor2)
       commit({ gradientPalette: 'custom', gradientCustomColor2 })
     },
+    setTemplates: templates => commit({ templates: normalizeTemplates(templates, []) }),
   }
 })
 

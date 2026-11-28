@@ -59,7 +59,7 @@ func (a *API) patchProfile(w http.ResponseWriter, r *http.Request, s session) {
 	profile, err := a.db.UpdateUserProfileWithUI(r.Context(), s.User.ID, patch.DisplayName, patch.ProfileMD, patch.MemoryMD, patch.MemoryEnabled, patch.UISettings, patch.AvatarData)
 	switch {
 	case errors.Is(err, store.ErrInvalidUISettings):
-		fail(w, http.StatusBadRequest, "invalid_ui_settings", "Некорректные настройки оформления (допустимы только известные поля, HEX #RRGGBB и размер до 8 КБ).")
+		fail(w, http.StatusBadRequest, "invalid_ui_settings", "Некорректные настройки оформления (допустимы только известные поля, HEX #RRGGBB, шаблоны и размер до 32 КБ).")
 	case errors.Is(err, store.ErrInvalidProfile):
 		fail(w, http.StatusBadRequest, "invalid_profile", "Имя должно занимать до 80 символов, аватар — до 2 МБ, а каждый текст — до 4096 байт.")
 	case err != nil:
@@ -71,7 +71,7 @@ func (a *API) patchProfile(w http.ResponseWriter, r *http.Request, s session) {
 
 // userInstructions builds the per-user system context for LLM runs.
 // AvatarData and uploaded file metadata are strictly excluded so image metadata cannot inject prompts.
-func (a *API) userInstructions(ctx context.Context, userID string, shared bool) (string, error) {
+func (a *API) userInstructions(ctx context.Context, userID string, shared bool, projectPrompt string) (string, error) {
 	profile, err := a.db.UserProfile(ctx, userID)
 	if err != nil {
 		return "", err
@@ -95,6 +95,9 @@ func (a *API) userInstructions(ctx context.Context, userID string, shared bool) 
 	}
 	if profile.MemoryEnabled && profile.MemoryMD != "" {
 		instructions.WriteString("\n\n## Память из прошлых чатов\n" + profile.MemoryMD)
+	}
+	if trimmedProject := strings.TrimSpace(projectPrompt); trimmedProject != "" {
+		instructions.WriteString("\n\n<project_instructions>\n" + trimmedProject + "\n</project_instructions>")
 	}
 	instructions.WriteString("\n\n" + artifacts.ArtifactSystemPrompt)
 	return instructions.String(), nil

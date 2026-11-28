@@ -11,6 +11,7 @@ import bash from 'highlight.js/lib/languages/bash'
 import python from 'highlight.js/lib/languages/python'
 import javascript from 'highlight.js/lib/languages/javascript'
 import { Check, Copy } from 'lucide-react'
+import { MermaidBlock } from './MermaidBlock'
 
 for (const [name, language] of Object.entries({ typescript, json, bash, python, javascript })) hljs.registerLanguage(name, language)
 
@@ -27,7 +28,7 @@ function extractCodeInfo(children: ReactNode): { lang: string; raw: string } {
   return { lang: '', raw: typeof children === 'string' ? children.replace(/\n$/, '') : '' }
 }
 
-function CodeBlock({ children }: { children?: ReactNode }) {
+function CodeBlock({ children, streaming = false }: { children?: ReactNode; streaming?: boolean }) {
   const { lang, raw } = extractCodeInfo(children)
   const [copied, setCopied] = useState(false)
   const timerRef = useRef<number | undefined>(undefined)
@@ -35,6 +36,10 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   useEffect(() => () => {
     if (timerRef.current !== undefined) window.clearTimeout(timerRef.current)
   }, [])
+
+  if (lang.toLowerCase() === 'mermaid') {
+    return <MermaidBlock code={raw} streaming={streaming} />
+  }
 
   async function copyCode() {
     if (!raw) return
@@ -202,7 +207,7 @@ export function preprocessMathDelimiters(src: string): string {
   return out
 }
 
-export function RichText({ text }: { text: string }) {
+export function RichText({ text, streaming = false }: { text: string; streaming?: boolean }) {
   const prepared = preprocessMathDelimiters(text)
   return <div className="markdown"><Markdown
     remarkPlugins={[remarkGfm, remarkMath]}
@@ -212,7 +217,7 @@ export function RichText({ text }: { text: string }) {
       img: ({ alt }) => <span>{alt}</span>,
       a: ({ children, href }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
       table: ({ children }) => <div className="md-table-wrap"><table>{children}</table></div>,
-      pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
+      pre: ({ children }) => <CodeBlock streaming={streaming}>{children}</CodeBlock>,
       code: ({ className, children }) => {
         const lang = className?.replace(/^language-/, '')
         if (!lang || !hljs.getLanguage(lang)) return <code className={className}>{children}</code>

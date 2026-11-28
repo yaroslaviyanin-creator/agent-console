@@ -591,8 +591,35 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 		}
 	}
 
+	var projectPrompt string
+	var projectAtts []store.Attachment
+	if !shared && userID == ownerID {
+		projectFolder, folderAtts, pErr := a.db.GetChatProjectContext(runCtx, userID, req.ChatID)
+		if pErr != nil {
+			return failure("storage_error", "Could not load project context.", pErr)
+		}
+		projectPrompt = projectFolder.SystemPrompt
+		projectAtts = folderAtts
+		for _, att := range projectAtts {
+			if att.Kind == string(uploads.KindImage) && targetProvider != "antigravity" {
+				imgBytes, err := a.db.ReadAttachmentBytes(att.StorageKey)
+				if err != nil {
+					return failure("storage_error", "Could not load project image.", err)
+				}
+				promptImages = append(promptImages, provider.ImageAttachment{
+					Name:     att.OriginalName,
+					MIMEType: att.MIMEType,
+					Data:     imgBytes,
+				})
+			}
+		}
+	}
+
 	resumeSessionID := ""
 	effectivePrompt := req.Prompt
+	if len(projectAtts) > 0 {
+		effectivePrompt = buildProjectPromptWithAttachments(effectivePrompt, projectAtts, a.config.EffectiveMaxAttachmentContextBytes())
+	}
 	if urls := webfetch.ExtractURLs(req.Prompt, webfetch.MaxURLsPerMessage); len(urls) > 0 && a.webfetcher != nil {
 		pages := a.webfetcher.FetchAll(runCtx, urls)
 		if len(pages) > 0 {
@@ -633,7 +660,7 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 		}
 		prompt = buildHandoffPromptWithAttachments(prior, priorAtts, prompt)
 	}
-	instructions, err := a.userInstructions(runCtx, userID, shared)
+	instructions, err := a.userInstructions(runCtx, userID, shared, projectPrompt)
 	if err != nil {
 		return failure("storage_error", "Could not load your profile.", err)
 	}

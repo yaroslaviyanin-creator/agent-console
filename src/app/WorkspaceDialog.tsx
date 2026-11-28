@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, ChevronRight, Copy, Laptop, Link2, LogOut, Monitor, Palette, Trash2, Upload, User, X } from 'lucide-react'
-import type { ServerDirectoryUser, ShareAccess, UserProfile, UserProfilePatch, Workspace } from '../protocol/types'
+import type { PromptTemplate, ServerDirectoryUser, ShareAccess, UserProfile, UserProfilePatch, Workspace } from '../protocol/types'
 import { getTelegramUserId } from '../platform/telegram'
 import type { RemoteTransport } from '../transport/RemoteTransport'
 import { ACCENT_PRESETS, GRADIENT_PALETTES, resolveTheme, type ThemePreference, useAppearance } from './appearanceStore'
@@ -597,8 +597,153 @@ function ProfileSection({ w, remote }: { w: Workspace; remote: RemoteTransport |
         </>
       )}
 
+      <PromptTemplatesBlock />
       <IntegrationsBlock />
     </form>
+  )
+}
+
+const STARTER_TEMPLATES: readonly Omit<PromptTemplate, 'id'>[] = [
+  { slash: '/конспект', title: 'Структурированный конспект', content: 'Сделай краткий структурированный конспект с главными тезисами, выводами и списком действий:\n\n' },
+  { slash: '/ревью', title: 'Код-ревью', content: 'Проведи детальное код-ревью: укажи на возможные баги, крайние случаи, проблемы безопасности и предложи улучшения:\n\n' },
+  { slash: '/объясни', title: 'Простое объяснение', content: 'Объясни это простым языком с примерами, избегая лишнего жаргона:\n\n' },
+]
+
+function PromptTemplatesBlock() {
+  const templates = useAppearance(s => s.templates)
+  const setTemplates = useAppearance(s => s.setTemplates)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [slash, setSlash] = useState('')
+  const [title, setTitle] = useState('')
+  const [content, setContent] = useState('')
+  const [err, setErr] = useState('')
+
+  function resetForm() {
+    setEditingId(null)
+    setSlash('')
+    setTitle('')
+    setContent('')
+    setErr('')
+  }
+
+  function startEdit(t: PromptTemplate) {
+    setEditingId(t.id)
+    setSlash(t.slash)
+    setTitle(t.title)
+    setContent(t.content)
+    setErr('')
+  }
+
+  function saveTemplate() {
+    let cleanSlash = slash.trim()
+    if (!cleanSlash.startsWith('/')) cleanSlash = '/' + cleanSlash
+    if (cleanSlash.length < 2 || /\s/.test(cleanSlash) || cleanSlash.length > 32) {
+      setErr('Команда должна начинаться с /, без пробелов (2–32 символа).')
+      return
+    }
+    const cleanTitle = title.trim()
+    if (!cleanTitle || cleanTitle.length > 120) {
+      setErr('Укажите название шаблона.')
+      return
+    }
+    if (!content.trim() || content.length > 4096) {
+      setErr('Укажите текст шаблона (до 4096 символов).')
+      return
+    }
+    if (editingId) {
+      setTemplates(templates.map(t => (t.id === editingId ? { ...t, slash: cleanSlash, title: cleanTitle, content } : t)))
+    } else {
+      if (templates.length >= 30) {
+        setErr('Достигнут лимит в 30 шаблонов.')
+        return
+      }
+      setTemplates([...templates, { id: crypto.randomUUID(), slash: cleanSlash, title: cleanTitle, content }])
+    }
+    resetForm()
+  }
+
+  function addExamples() {
+    const existing = new Set(templates.map(t => t.slash.toLowerCase()))
+    const added = STARTER_TEMPLATES
+      .filter(ex => !existing.has(ex.slash.toLowerCase()))
+      .slice(0, Math.max(0, 30 - templates.length))
+      .map(ex => ({ ...ex, id: crypto.randomUUID() }))
+    if (added.length > 0) setTemplates([...templates, ...added])
+  }
+
+  return (
+    <div className="templates-block">
+      <div className="templates-block-head">
+        <div>
+          <strong>Шаблоны /команд ({templates.length}/30)</strong>
+          <small>Быстрая вставка в поле ввода по символу /</small>
+        </div>
+        <button type="button" className="alt-action" onClick={addExamples} disabled={templates.length >= 30}>
+          Добавить примеры
+        </button>
+      </div>
+
+      {templates.length > 0 && (
+        <ul className="templates-list">
+          {templates.map(t => (
+            <li key={t.id} className="template-item">
+              <div className="template-item-info">
+                <span className="slash-menu-cmd">{t.slash}</span>
+                <span className="template-item-title">{t.title}</span>
+              </div>
+              <div className="template-item-actions">
+                <button type="button" className="text-action" onClick={() => startEdit(t)}>Изменить</button>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  aria-label={`Удалить шаблон ${t.slash}`}
+                  onClick={() => setTemplates(templates.filter(item => item.id !== t.id))}
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="template-editor">
+        <div className="template-editor-row">
+          <input
+            type="text"
+            value={slash}
+            placeholder="/команда"
+            maxLength={32}
+            aria-label="Команда шаблона"
+            onChange={e => setSlash(e.target.value)}
+          />
+          <input
+            type="text"
+            value={title}
+            placeholder="Название"
+            maxLength={120}
+            aria-label="Название шаблона"
+            onChange={e => setTitle(e.target.value)}
+          />
+        </div>
+        <textarea
+          rows={2}
+          value={content}
+          placeholder="Текст шаблона, который вставится при выборе…"
+          aria-label="Текст шаблона"
+          onChange={e => setContent(e.target.value)}
+        />
+        {err && <p className="auth-error" role="alert">{err}</p>}
+        <div className="template-editor-actions">
+          {editingId && (
+            <button type="button" className="alt-action" onClick={resetForm}>Отмена</button>
+          )}
+          <button type="button" className="alt-action" onClick={saveTemplate}>
+            {editingId ? 'Обновить шаблон' : 'Добавить шаблон'}
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }
 

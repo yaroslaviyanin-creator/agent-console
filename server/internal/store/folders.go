@@ -3,18 +3,23 @@ package store
 import (
 	"context"
 	"database/sql"
+	"os"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"agent-console/server/internal/uploads"
 )
 
 type Folder struct {
-	ID        string `json:"id"`
-	UserID    string `json:"userId,omitempty"`
-	Name      string `json:"name"`
-	Color     string `json:"color"`
-	SortOrder int    `json:"sortOrder"`
-	CreatedAt int64  `json:"createdAt"`
+	ID              string `json:"id"`
+	UserID          string `json:"userId,omitempty"`
+	Name            string `json:"name"`
+	Color           string `json:"color"`
+	SortOrder       int    `json:"sortOrder"`
+	SystemPrompt    string `json:"systemPrompt"`
+	AttachmentCount int    `json:"attachmentCount"`
+	CreatedAt       int64  `json:"createdAt"`
 }
 
 type SearchResult struct {
@@ -27,8 +32,10 @@ type SearchResult struct {
 }
 
 func (s *Store) ListFolders(ctx context.Context, userID string) ([]Folder, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,user_id,name,color,sort_order,created_at
-		FROM chat_folders WHERE user_id=? ORDER BY sort_order ASC, created_at ASC`, userID)
+	rows, err := s.db.QueryContext(ctx, `SELECT f.id, f.user_id, f.name, f.color, f.sort_order, f.system_prompt,
+		(SELECT COUNT(*) FROM folder_attachments fa WHERE fa.folder_id = f.id),
+		f.created_at
+		FROM chat_folders f WHERE f.user_id=? ORDER BY f.sort_order ASC, f.created_at ASC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -37,7 +44,7 @@ func (s *Store) ListFolders(ctx context.Context, userID string) ([]Folder, error
 	folders := []Folder{}
 	for rows.Next() {
 		var f Folder
-		if err := rows.Scan(&f.ID, &f.UserID, &f.Name, &f.Color, &f.SortOrder, &f.CreatedAt); err != nil {
+		if err := rows.Scan(&f.ID, &f.UserID, &f.Name, &f.Color, &f.SortOrder, &f.SystemPrompt, &f.AttachmentCount, &f.CreatedAt); err != nil {
 			return nil, err
 		}
 		folders = append(folders, f)
@@ -45,27 +52,38 @@ func (s *Store) ListFolders(ctx context.Context, userID string) ([]Folder, error
 	return folders, rows.Err()
 }
 
-func (s *Store) CreateFolder(ctx context.Context, userID, name, color string) (Folder, error) {
+func (s *Store) GetFolder(ctx context.Context, userID, folderID string) (Folder, error) {
+	var f Folder
+	err := s.db.QueryRowContext(ctx, `SELECT f.id, f.user_id, f.name, f.color, f.sort_order, f.system_prompt,
+		(SELECT COUNT(*) FROM folder_attachments fa WHERE fa.folder_id = f.id),
+		f.created_at
+		FROM chat_folders f WHERE f.id=? AND f.user_id=?`, folderID, userID).
+		Scan(&f.ID, &f.UserID, &f.Name, &f.Color, &f.SortOrder, &f.SystemPrompt, &f.AttachmentCount, &f.CreatedAt)
+	return f, err
+}
+
+func (s *Store) CreateFolder(ctx context.Context, userID, name, color, systemPrompt string) (Folder, error) {
 	now := time.Now().UnixMilli()
 	var maxOrder int
 	_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(sort_order), -1) FROM chat_folders WHERE user_id=?`, userID).Scan(&maxOrder)
 	f := Folder{
-		ID:        randomHex(16),
-		UserID:    userID,
-		Name:      name,
-		Color:     color,
-		SortOrder: maxOrder + 1,
-		CreatedAt: now,
+		ID:           randomHex(16),
+		UserID:       userID,
+		Name:         name,
+		Color:        color,
+		SortOrder:    maxOrder + 1,
+		SystemPrompt: systemPrompt,
+		CreatedAt:    now,
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO chat_folders (id,user_id,name,color,sort_order,created_at) VALUES (?,?,?,?,?,?)`,
-		f.ID, f.UserID, f.Name, f.Color, f.SortOrder, f.CreatedAt)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO chat_folders (id,user_id,name,color,sort_order,system_prompt,created_at) VALUES (?,?,?,?,?,?,?)`,
+		f.ID, f.UserID, f.Name, f.Color, f.SortOrder, f.SystemPrompt, f.CreatedAt)
 	if err != nil {
 		return Folder{}, err
 	}
 	return f, nil
 }
 
-func (s *Store) UpdateFolder(ctx context.Context, userID, folderID string, name *string, color *string, sortOrder *int) (Folder, error) {
+func (s *Store) UpdateFolder(ctx context.Context, userID, folderID string, name *string, color *string, sortOrder *int, systemPrompt *string) (Folder, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Folder{}, err
@@ -73,8 +91,11 @@ func (s *Store) UpdateFolder(ctx context.Context, userID, folderID string, name 
 	defer tx.Rollback()
 
 	var f Folder
-	err = tx.QueryRowContext(ctx, `SELECT id,user_id,name,color,sort_order,created_at FROM chat_folders WHERE id=? AND user_id=?`,
-		folderID, userID).Scan(&f.ID, &f.UserID, &f.Name, &f.Color, &f.SortOrder, &f.CreatedAt)
+	err = tx.QueryRowContext(ctx, `SELECT f.id, f.user_id, f.name, f.color, f.sort_order, f.system_prompt,
+		(SELECT COUNT(*) FROM folder_attachments fa WHERE fa.folder_id = f.id),
+		f.created_at
+		FROM chat_folders f WHERE f.id=? AND f.user_id=?`,
+		folderID, userID).Scan(&f.ID, &f.UserID, &f.Name, &f.Color, &f.SortOrder, &f.SystemPrompt, &f.AttachmentCount, &f.CreatedAt)
 	if err != nil {
 		return Folder{}, err
 	}
@@ -87,8 +108,11 @@ func (s *Store) UpdateFolder(ctx context.Context, userID, folderID string, name 
 	if sortOrder != nil {
 		f.SortOrder = *sortOrder
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE chat_folders SET name=?, color=?, sort_order=? WHERE id=? AND user_id=?`,
-		f.Name, f.Color, f.SortOrder, folderID, userID); err != nil {
+	if systemPrompt != nil {
+		f.SystemPrompt = *systemPrompt
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE chat_folders SET name=?, color=?, sort_order=?, system_prompt=? WHERE id=? AND user_id=?`,
+		f.Name, f.Color, f.SortOrder, f.SystemPrompt, folderID, userID); err != nil {
 		return Folder{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -104,6 +128,25 @@ func (s *Store) DeleteFolder(ctx context.Context, userID, folderID string) error
 	}
 	defer tx.Rollback()
 
+	rows, err := tx.QueryContext(ctx, `SELECT storage_key FROM folder_attachments WHERE folder_id=? AND user_id=?`, folderID, userID)
+	if err != nil {
+		return err
+	}
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			rows.Close()
+			return err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
 	if _, err := tx.ExecContext(ctx, `UPDATE chats SET folder_id=NULL WHERE folder_id=? AND user_id=?`, folderID, userID); err != nil {
 		return err
 	}
@@ -118,7 +161,143 @@ func (s *Store) DeleteFolder(ctx context.Context, userID, folderID string) error
 	if n == 0 {
 		return sql.ErrNoRows
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for _, key := range keys {
+		if diskPath, err := s.attachmentPath(key); err == nil {
+			_ = os.Remove(diskPath)
+		}
+	}
+	return nil
+}
+
+func (s *Store) CountFolderAttachments(ctx context.Context, folderID string) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM folder_attachments WHERE folder_id=?`, folderID).Scan(&count)
+	return count, err
+}
+
+func (s *Store) ListFolderAttachments(ctx context.Context, userID, folderID string) ([]Attachment, error) {
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM chat_folders WHERE id=? AND user_id=?)`, folderID, userID).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, sql.ErrNoRows
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, folder_id, user_id, original_name, mime_type, kind, size_bytes, sha256, storage_key, COALESCE(extracted_text, ''), warning, created_at
+		FROM folder_attachments WHERE folder_id=? AND user_id=? ORDER BY created_at ASC`, folderID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Attachment{}
+	for rows.Next() {
+		var a Attachment
+		if err := rows.Scan(&a.ID, &a.FolderID, &a.UserID, &a.OriginalName, &a.MIMEType, &a.Kind, &a.SizeBytes, &a.SHA256, &a.StorageKey, &a.ExtractedText, &a.Warning, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		a.URL = "/api/folders/" + folderID + "/attachments/" + a.ID
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CreateFolderAttachment(ctx context.Context, folderID, userID string, v uploads.ValidatedAttachment) (Attachment, error) {
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM chat_folders WHERE id=? AND user_id=?)`, folderID, userID).Scan(&exists); err != nil {
+		return Attachment{}, err
+	}
+	if !exists {
+		return Attachment{}, sql.ErrNoRows
+	}
+	id := randomHex(16)
+	storageKey, diskPath, sizeBytes, shaHex, err := s.stageValidatedAttachment(v)
+	if err != nil {
+		return Attachment{}, err
+	}
+	now := time.Now().UnixMilli()
+	var extracted any
+	if v.ExtractedText != "" {
+		extracted = v.ExtractedText
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO folder_attachments
+		(id,folder_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,warning,created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		id, folderID, userID, v.Filename, v.MIMEType, string(v.Kind), sizeBytes, shaHex, storageKey, extracted, v.Warning, now)
+	if err != nil {
+		_ = os.Remove(diskPath)
+		return Attachment{}, err
+	}
+	return Attachment{
+		ID:            id,
+		FolderID:      folderID,
+		UserID:        userID,
+		OriginalName:  v.Filename,
+		MIMEType:      v.MIMEType,
+		Kind:          string(v.Kind),
+		SizeBytes:     sizeBytes,
+		SHA256:        shaHex,
+		StorageKey:    storageKey,
+		ExtractedText: v.ExtractedText,
+		Warning:       v.Warning,
+		CreatedAt:     now,
+		URL:           "/api/folders/" + folderID + "/attachments/" + id,
+	}, nil
+}
+
+func (s *Store) GetFolderAttachment(ctx context.Context, userID, folderID, attachmentID string) (Attachment, error) {
+	var a Attachment
+	var extracted sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT fa.id, fa.folder_id, fa.user_id, fa.original_name, fa.mime_type, fa.kind, fa.size_bytes, fa.sha256, fa.storage_key, fa.extracted_text, fa.warning, fa.created_at
+		FROM folder_attachments fa
+		JOIN chat_folders f ON f.id = fa.folder_id
+		WHERE fa.id=? AND fa.folder_id=? AND f.user_id=?`, attachmentID, folderID, userID).
+		Scan(&a.ID, &a.FolderID, &a.UserID, &a.OriginalName, &a.MIMEType, &a.Kind, &a.SizeBytes, &a.SHA256, &a.StorageKey, &extracted, &a.Warning, &a.CreatedAt)
+	if err != nil {
+		return Attachment{}, err
+	}
+	a.ExtractedText = extracted.String
+	a.URL = "/api/folders/" + folderID + "/attachments/" + a.ID
+	return a, nil
+}
+
+func (s *Store) DeleteFolderAttachment(ctx context.Context, userID, folderID, attachmentID string) error {
+	var storageKey string
+	err := s.db.QueryRowContext(ctx, `DELETE FROM folder_attachments WHERE id=? AND folder_id=? AND user_id=? RETURNING storage_key`,
+		attachmentID, folderID, userID).Scan(&storageKey)
+	if err != nil {
+		return err
+	}
+	if diskPath, err := s.attachmentPath(storageKey); err == nil {
+		_ = os.Remove(diskPath)
+	}
+	return nil
+}
+
+// GetChatProjectContext returns the folder and its attachments ONLY when userID owns both the chat and the folder.
+func (s *Store) GetChatProjectContext(ctx context.Context, userID, chatID string) (Folder, []Attachment, error) {
+	var folderID sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT folder_id FROM chats WHERE id=? AND user_id=?`, chatID, userID).Scan(&folderID)
+	if err != nil {
+		return Folder{}, nil, err
+	}
+	if !folderID.Valid || strings.TrimSpace(folderID.String) == "" {
+		return Folder{}, nil, nil
+	}
+	folder, err := s.GetFolder(ctx, userID, folderID.String)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return Folder{}, nil, nil
+		}
+		return Folder{}, nil, err
+	}
+	atts, err := s.ListFolderAttachments(ctx, userID, folder.ID)
+	if err != nil {
+		return Folder{}, nil, err
+	}
+	return folder, atts, nil
 }
 
 // SearchMessages searches accessible chats (owned or shared) by chat title and message text with Unicode case-folding.

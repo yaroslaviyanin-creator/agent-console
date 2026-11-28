@@ -115,6 +115,8 @@ export interface ChatFolder {
   name: string
   color: string
   sortOrder: number
+  systemPrompt?: string
+  attachmentCount?: number
   createdAt: number
 }
 export interface SearchResult {
@@ -259,6 +261,13 @@ export interface ServerMessage {
 }
 export interface ServerError { code: string; message: string }
 
+export interface PromptTemplate {
+  id: string
+  slash: string
+  title: string
+  content: string
+}
+
 export interface UISettings {
   theme?: 'dark' | 'light' | 'system'
   accent?: 'mint' | 'ocean' | 'violet' | 'amber' | 'rose' | 'graphite' | 'custom'
@@ -267,6 +276,7 @@ export interface UISettings {
   gradientPalette?: 'accent' | 'indigo' | 'ocean' | 'emerald' | 'sunset' | 'monochrome' | 'custom'
   gradientCustomColor?: string
   gradientCustomColor2?: string
+  templates?: PromptTemplate[]
 }
 
 export interface UserProfile {

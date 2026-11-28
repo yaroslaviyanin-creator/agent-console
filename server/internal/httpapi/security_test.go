@@ -195,7 +195,7 @@ func TestAvatarUploadSecurityAndPromptIsolation(t *testing.T) {
 
 	// 3. Prompt isolation: avatar_data never enters userInstructions.
 	api := &API{db: db}
-	instr, err := api.userInstructions(ctx, u1.ID, false)
+	instr, err := api.userInstructions(ctx, u1.ID, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

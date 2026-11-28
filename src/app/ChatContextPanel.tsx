@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Download, ExternalLink, FileArchive, FileCode, FileText, Image as ImageIcon, Link2, Paperclip, Plus, Sparkles, X } from 'lucide-react'
-import type { MessageAttachment, MessageUsage, ServerModel, ServerProvider, WebSource } from '../protocol/types'
+import { Download, ExternalLink, FileArchive, FileCode, FileText, Folder, Image as ImageIcon, Link2, Paperclip, Plus, Sparkles, X } from 'lucide-react'
+import type { ChatFolder, MessageAttachment, MessageUsage, ServerModel, ServerProvider, WebSource } from '../protocol/types'
 import type { RemoteTransport } from '../transport/RemoteTransport'
 import { resolveModelDisplay, type Turn } from './chatStore'
 import { formatAttachmentSize, isRenderableImageAttachment } from './attachments'
@@ -394,6 +394,8 @@ export function ChatContextPanel({
   canAttach,
   onAttachClick,
   onExportMarkdown,
+  projectFolder,
+  projectFiles,
   onClose,
 }: {
   turns: Turn[]
@@ -405,12 +407,15 @@ export function ChatContextPanel({
   canAttach: boolean
   onAttachClick: () => void
   onExportMarkdown?: (() => void) | undefined
+  projectFolder?: ChatFolder | null
+  projectFiles?: MessageAttachment[] | undefined
   onClose: () => void
 }) {
   const attachments = collectChatAttachments(turns)
   const links = collectChatWebLinks(turns)
   const summary = summarizeChatContext(turns, providerLabel, modelLabel, serverModelsByProvider, defaultProviderId)
   const showBreakdown = summary.byProvider.length >= 2 || (summary.byProvider[0]?.models.length ?? 0) >= 2
+  const hasProjectContext = !!projectFolder && (Boolean(projectFolder.systemPrompt?.trim()) || (projectFiles?.length ?? 0) > 0 || (projectFolder.attachmentCount ?? 0) > 0)
 
   return (
     <div className="context-panel-inner">
@@ -420,6 +425,35 @@ export function ChatContextPanel({
           <X size={16} />
         </button>
       </div>
+
+      {hasProjectContext && projectFolder && (
+        <section className="context-section context-project-section">
+          <div className="context-section-head">
+            <span className="context-section-title">
+              <Folder size={13} style={{ color: projectFolder.color }} aria-hidden="true" />
+              Проект: {projectFolder.name}
+            </span>
+          </div>
+          {projectFolder.systemPrompt?.trim() && (
+            <p className="context-project-prompt" title={projectFolder.systemPrompt}>
+              Инструкции проекта активны
+            </p>
+          )}
+          {(projectFiles?.length ?? 0) > 0 && (
+            <ul className="context-file-list">
+              {projectFiles!.map((att, idx) => (
+                <PanelAttachmentThumb
+                  key={att.id ?? `${att.name}-${idx}`}
+                  att={att}
+                  remote={remote}
+                  onOpen={() => useFileViewer.getState().openFile(att)}
+                  onDownload={() => { if (remote) void remote.downloadAttachment(att) }}
+                />
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
 
       <section className={`context-section${attachments.length === 0 ? ' is-empty' : ''}`}>
         <div className="context-section-head">

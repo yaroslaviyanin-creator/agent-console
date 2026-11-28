@@ -203,7 +203,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version == 23 {
+	if version == 24 {
 		return nil
 	}
 	// SQLite requires disabling foreign keys outside the transaction on this connection.
@@ -220,7 +220,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	switch version {
 	case 0:
-		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=23;"); err != nil {
+		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=24;"); err != nil {
 			return err
 		}
 	case 1:
@@ -603,7 +603,38 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=23;`); err != nil {
 			return err
 		}
+		fallthrough
 	case 23:
+		var sysPromptExists bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chat_folders') WHERE name='system_prompt')").Scan(&sysPromptExists); err != nil {
+			return err
+		}
+		if !sysPromptExists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE chat_folders ADD COLUMN system_prompt TEXT NOT NULL DEFAULT '';`); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS folder_attachments (
+			id TEXT PRIMARY KEY,
+			folder_id TEXT NOT NULL REFERENCES chat_folders(id) ON DELETE CASCADE,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			original_name TEXT NOT NULL,
+			mime_type TEXT NOT NULL,
+			kind TEXT NOT NULL CHECK (kind IN ('image', 'text', 'pdf', 'archive', 'document')),
+			size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+			sha256 TEXT NOT NULL,
+			storage_key TEXT NOT NULL UNIQUE,
+			extracted_text TEXT,
+			warning TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS folder_attachments_by_folder ON folder_attachments (folder_id, created_at);`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=24;`); err != nil {
+			return err
+		}
+	case 24:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}

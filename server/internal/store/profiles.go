@@ -13,7 +13,8 @@ import (
 	"agent-console/server/internal/uploads"
 )
 
-const MaxUISettingsBytes = 8192
+const MaxUISettingsBytes = 32768
+const maxUITemplates = 30
 
 var hexColorRE = regexp.MustCompile(`^#[0-9a-fA-F]{6}$`)
 
@@ -115,6 +116,47 @@ func ValidateAndNormalizeUISettings(raw json.RawMessage) (string, error) {
 				return "", ErrInvalidUISettings
 			}
 			normalized[k] = b
+		case "templates":
+			arr, ok := v.([]any)
+			if !ok || len(arr) > maxUITemplates {
+				return "", ErrInvalidUISettings
+			}
+			cleanTemplates := make([]map[string]string, 0, len(arr))
+			for _, item := range arr {
+				m, ok := item.(map[string]any)
+				if !ok || len(m) != 4 {
+					return "", ErrInvalidUISettings
+				}
+				id, okID := m["id"].(string)
+				slash, okSlash := m["slash"].(string)
+				title, okTitle := m["title"].(string)
+				content, okContent := m["content"].(string)
+				if !okID || !okSlash || !okTitle || !okContent {
+					return "", ErrInvalidUISettings
+				}
+				id = strings.TrimSpace(id)
+				slash = strings.TrimSpace(slash)
+				title = strings.TrimSpace(title)
+				if id == "" || len(id) > 64 || !utf8.ValidString(id) || strings.ContainsRune(id, 0) {
+					return "", ErrInvalidUISettings
+				}
+				if !strings.HasPrefix(slash, "/") || len(slash) < 2 || len(slash) > 32 || strings.ContainsAny(slash, " \t\r\n") || !utf8.ValidString(slash) {
+					return "", ErrInvalidUISettings
+				}
+				if title == "" || len(title) > 120 || !utf8.ValidString(title) || strings.ContainsRune(title, 0) {
+					return "", ErrInvalidUISettings
+				}
+				if strings.TrimSpace(content) == "" || len(content) > 4096 || !utf8.ValidString(content) || strings.ContainsRune(content, 0) {
+					return "", ErrInvalidUISettings
+				}
+				cleanTemplates = append(cleanTemplates, map[string]string{
+					"id":      id,
+					"slash":   slash,
+					"title":   title,
+					"content": content,
+				})
+			}
+			normalized[k] = cleanTemplates
 		default:
 			return "", ErrInvalidUISettings
 		}
