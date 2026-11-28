@@ -4,6 +4,7 @@ import type { MessageAttachment, MessageUsage, ServerModel, ServerProvider } fro
 import type { RemoteTransport } from '../transport/RemoteTransport'
 import { resolveModelDisplay, type Turn } from './chatStore'
 import { formatAttachmentSize, isRenderableImageAttachment } from './attachments'
+import { useFileViewer } from './fileViewerStore'
 
 const URL_RE = /https?:\/\/[^\s<>"'`]+/g
 const TRAILING_PUNCT_RE = /[.,;:!?)\]>]+$/
@@ -253,10 +254,12 @@ function PanelAttachmentThumb({
   att,
   remote,
   onOpen,
+  onDownload,
 }: {
   att: MessageAttachment
   remote: RemoteTransport | null
   onOpen: () => void
+  onDownload: () => void
 }) {
   const [thumbUrl, setThumbUrl] = useState('')
   const isImage = isRenderableImageAttachment(att) && !!att.url && !!remote
@@ -286,7 +289,19 @@ function PanelAttachmentThumb({
           : Paperclip
 
   return (
-    <li className="context-file-item" title={att.warning ? `${att.name}: ${att.warning}` : att.name}>
+    <li
+      className="context-file-item is-clickable"
+      role="button"
+      tabIndex={0}
+      title={att.warning ? `${att.name}: ${att.warning}` : `Открыть ${att.name}`}
+      onClick={onOpen}
+      onKeyDown={e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onOpen()
+        }
+      }}
+    >
       {isImage && thumbUrl ? (
         <img src={thumbUrl} alt={att.name} className="context-file-thumb" />
       ) : (
@@ -300,9 +315,12 @@ function PanelAttachmentThumb({
         <button
           type="button"
           className="icon-btn context-file-action"
-          aria-label={`Открыть или скачать ${att.name}`}
+          aria-label={`Скачать ${att.name}`}
           title={`Скачать ${att.name}`}
-          onClick={onOpen}
+          onClick={e => {
+            e.stopPropagation()
+            onDownload()
+          }}
         >
           <Download size={13} />
         </button>
@@ -387,7 +405,8 @@ export function ChatContextPanel({
                 key={att.id ?? `${att.name}-${idx}`}
                 att={att}
                 remote={remote}
-                onOpen={() => { if (remote) void remote.downloadAttachment(att) }}
+                onOpen={() => { useFileViewer.getState().openFile(att) }}
+                onDownload={() => { if (remote) void remote.downloadAttachment(att) }}
               />
             ))}
           </ul>

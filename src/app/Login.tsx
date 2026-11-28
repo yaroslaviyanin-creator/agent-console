@@ -19,21 +19,28 @@ export function Login() {
   const [device, setDevice] = useState('Рабочий ноутбук')
   const [qr, setQr] = useState(false)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
   useTelegramBack(demo && qr, () => setQr(false))
   async function enter(quick: boolean) {
     setError('')
+    setNotice('')
     if (registering && password !== confirmation) {
       setError('Пароли не совпадают.')
       return
     }
     setBusy(true)
     try {
-      await login({
+      const res = await login({
         connection: demo ? quick ? connection : mockAddress : server,
         login: quick ? 'demo' : username, password: quick ? 'demo' : password,
         deviceName: quick ? device.trim() || 'Рабочий ноутбук' : device,
       }, registering)
+      if (res && res.pending) {
+        setPassword('')
+        setConfirmation('')
+        setNotice('Аккаунт создан и ожидает одобрения администратора.')
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Не удалось подключиться.')
     } finally {
@@ -102,9 +109,10 @@ export function Login() {
           </div>
         </div>
         <label>Название устройства<input required maxLength={80} value={device} onChange={e => setDevice(e.target.value)}/></label>
-        <div className="auth-collapse" data-open={!!activeError} aria-hidden={!activeError}>
+        <div className="auth-collapse" data-open={!!activeError || !!notice} aria-hidden={!activeError && !notice}>
           <div className="auth-collapse-inner">
             {activeError && <p className="auth-error" role="alert">{activeError}</p>}
+            {!activeError && notice && <p className="notice" role="status">{notice}</p>}
           </div>
         </div>
         <button className="primary-action" disabled={busy}>{busy ? 'Подключаюсь…' : registering ? 'Зарегистрироваться' : 'Подключиться'}<ArrowRight size={15}/></button>

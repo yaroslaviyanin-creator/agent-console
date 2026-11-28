@@ -267,8 +267,12 @@ func TestWebSocketChatLifecycle(t *testing.T) {
 	}
 	var directory []store.DirectoryUser
 	api("GET", "/api/users", bobToken, "", 200, &directory)
-	if len(directory) != 2 {
-		t.Fatalf("directory: %+v", directory)
+	if len(directory) != 0 {
+		t.Fatalf("empty query directory must return []: %+v", directory)
+	}
+	api("GET", "/api/users?q=al&limit=1", bobToken, "", 200, &directory)
+	if len(directory) != 1 || directory[0].Username != "alice" {
+		t.Fatalf("directory search: %+v", directory)
 	}
 	chatPath := "/api/chats/" + chat.ID
 	sharePath := chatPath + "/shares/" + bobID

@@ -21,7 +21,7 @@ const statusOf = (user: AdminUser) => !user.isActive ? 'blocked' : user.role ===
 const failure = (error: unknown) => error instanceof Error ? error.message : 'Операция не выполнена.'
 const generatePassword = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')
 
-type UserAction = { user: AdminUser; type: 'password' | 'block' | 'revoke' }
+type UserAction = { user: AdminUser; type: 'password' | 'block' | 'revoke' | 'delete' }
 
 export function AdminDialog({ admin, userId, close }: { admin: ServerAdminAdapter; userId: string; close: () => void }) {
   const ref = useRef<HTMLDialogElement>(null)
@@ -86,10 +86,18 @@ export function AdminDialog({ admin, userId, close }: { admin: ServerAdminAdapte
     event.preventDefault()
     if (!action) return
     const { type, user } = action
-    const run = type === 'revoke' ? () => admin.revokeDevices(user.id)
+    const run = type === 'delete' ? () => admin.delete?.(user.id) ?? Promise.resolve()
+      : type === 'revoke' ? () => admin.revokeDevices(user.id)
       : () => admin.update(user.id, type === 'password' ? { newPassword: password } : { isActive: false })
-    const message = type === 'revoke' ? 'Сессии завершены.' : type === 'password' ? 'Пароль изменён. Сессии завершены.' : 'Пользователь заблокирован.'
-    void mutate(run, message, () => { setAction(null); setPassword('') })
+    const message = type === 'delete' ? 'Пользователь удалён.'
+      : type === 'revoke' ? 'Сессии завершены.'
+      : type === 'password' ? 'Пароль изменён. Сессии завершены.'
+      : 'Пользователь заблокирован.'
+    void mutate(run, message, () => {
+      if (type === 'delete') setUsers(prev => prev.filter(u => u.id !== user.id))
+      setAction(null)
+      setPassword('')
+    })
   }
 
   const visibleUsers = users.filter(user => (filter === 'all' || statusOf(user) === filter) &&
@@ -187,15 +195,18 @@ export function AdminDialog({ admin, userId, close }: { admin: ServerAdminAdapte
                 else void mutate(() => admin.update(user.id, { isActive: true }), 'Пользователь разблокирован.')
               }}>{user.isActive ? 'Заблокировать' : 'Разблокировать'}</button>
               <button type="button" className="alt-action" onClick={() => setAction({ user, type: 'revoke' })}>Выгнать со всех устройств</button>
+              <button type="button" className="alt-action danger-action" onClick={() => setAction({ user, type: 'delete' })}>Удалить</button>
             </fieldset>}
             {action?.user.id === user.id && <form className="panel-form admin-confirm" onSubmit={confirm}>
               <fieldset disabled={busy}>
                 {action.type === 'password' ? <div className="admin-password">
                   <label>Новый пароль<input required maxLength={72} autoComplete="new-password" spellCheck={false} value={password} onChange={event => setPassword(event.target.value)}/></label>
                   <button type="button" className="alt-action" onClick={() => setPassword(generatePassword())}>Сгенерировать</button>
-                </div> : <p>{action.type === 'block' ? 'Заблокировать аккаунт и закрыть соединения?' : 'Завершить все сессии пользователя?'}</p>}
+                </div> : <p>{action.type === 'delete'
+                  ? `Удалить пользователя @${user.username} и все его чаты/файлы навсегда?`
+                  : action.type === 'block' ? 'Заблокировать аккаунт и закрыть соединения?' : 'Завершить все сессии пользователя?'}</p>}
                 <div className="admin-confirm-actions">
-                  <button className="alt-action" type="submit">{action.type === 'password' ? 'Сохранить пароль' : 'Подтвердить'}</button>
+                  <button className={action.type === 'delete' ? 'alt-action danger-action' : 'alt-action'} type="submit">{action.type === 'password' ? 'Сохранить пароль' : action.type === 'delete' ? 'Удалить' : 'Подтвердить'}</button>
                   <button className="alt-action" type="button" onClick={() => { setAction(null); setPassword('') }}>Отмена</button>
                 </div>
               </fieldset>

@@ -230,7 +230,7 @@ export function changeServerAddress(value: string) {
   saveConnection({ mode: 'server', address })
 }
 
-export async function login(request: LoginRequest, register = false) {
+export async function login(request: LoginRequest, register = false): Promise<{ pending?: boolean } | void> {
   const { mode } = useChats.getState()
   if (mode === 'demo') {
     loadWorkspace(await transport.workspace.login(request))
@@ -241,7 +241,15 @@ export async function login(request: LoginRequest, register = false) {
   saveConnection({ mode, address })
   const remote = new RemoteTransport(address)
   try {
-    attachRemote(remote, await (register ? remote.register(request) : remote.workspace.login(request)))
+    if (register) {
+      const res = await remote.register(request)
+      if ('pending' in res && res.pending) {
+        return { pending: true }
+      }
+      attachRemote(remote, res as Workspace)
+      return
+    }
+    attachRemote(remote, await remote.workspace.login(request))
   } catch (error) {
     void remote.workspace.logout()
     throw error
@@ -299,7 +307,10 @@ function attachRemote(remote: RemoteTransport, workspace: Workspace) {
     if (useChats.getState().remote !== remote) return
     switch (change.type) {
       case 'connection':
-        useChats.setState({ connected: change.connected })
+        useChats.setState({
+          connected: change.connected,
+          ...(change.connected ? { connectionError: '' } : {}),
+        })
         if (change.connected) {
           void refreshRemote(remote)
           void refreshQuota(remote)
@@ -391,9 +402,6 @@ function startRemote(remote: RemoteTransport) {
   if (remote.provider !== 'stub') {
     void refreshServerModels(remote.provider, false, remote)
   }
-  if (remote.provider === 'codex') {
-    void refreshCodexIndex()
-  }
 }
 
 export async function refreshServerProviders(targetRemote = useChats.getState().remote) {
@@ -420,9 +428,6 @@ export async function refreshServerProviders(targetRemote = useChats.getState().
       if (state.serverModelsByProvider[p] === undefined && !state.modelsLoadingByProvider[p]) {
         void refreshServerModels(p, false, targetRemote)
       }
-    }
-    if (res.providers.some(p => p.id === 'codex' && p.available) && state.codexIndex === 'hidden') {
-      void refreshCodexIndex()
     }
   } catch {
     if (useChats.getState().remote !== targetRemote) return
@@ -529,19 +534,12 @@ export async function refreshServerModels(
   }
 }
 
-export async function refreshCodexIndex() {
-  const { remote, codexIndex, serverProviders, providersLoaded } = useChats.getState()
-  const codexAvailable = remote?.provider === 'codex' || (providersLoaded && serverProviders.some(p => p.id === 'codex' && p.available))
-  if (!remote || !codexAvailable || codexIndex === 'loading' || useChats.getState().workspace?.user.role === 'pending') return
-  useChats.setState({ codexIndex: 'loading' })
-  try {
-    const workspace = await remote.refreshCodexIndex()
-    if (useChats.getState().remote !== remote) return
-    if (workspace) applyRemoteWorkspace(remote, workspace)
-    useChats.setState({ codexIndex: workspace ? 'ready' : 'hidden' })
-  } catch {
-    if (useChats.getState().remote === remote) useChats.setState({ codexIndex: 'error' })
-  }
+export async function logoutAllOtherDevices() {
+  const { remote } = useChats.getState()
+  if (!remote) return
+  const workspace = await remote.logoutAllDevices(false)
+  if (useChats.getState().remote !== remote) return
+  if (workspace) applyRemoteWorkspace(remote, workspace)
 }
 
 function applyRemoteWorkspace(remote: RemoteTransport, workspace: Workspace, preferred?: string) {
@@ -714,6 +712,12 @@ function restoreTurns(messages: ServerMessage[], local: Turn[], label: string): 
   }
   for (const turn of local) if (!turns.has(turn.id)) turns.set(turn.id, turn)
   return [...turns.values()]
+}
+
+export function reconnectServer() {
+  const { remote } = useChats.getState()
+  useChats.setState({ connectionError: '' })
+  remote?.reconnectNow()
 }
 
 export function retryHistory() {
@@ -1438,7 +1442,10 @@ export function retryAnswer(chatId: string, turnId: string, modelId: string) {
 async function startRun(id: string, input: string, retry?: { turnId: string; modelId: string }) {
   const { workspace, chats, remote, connected, serverModelsByProvider, serverProviders, providersLoaded } = useChats.getState()
   const c = chats.find(item => item.id === id)
-  if (remote && (!connected || !c?.historyLoaded || retry)) return
+  if (remote && (!connected || !c?.historyLoaded || retry)) {
+    if (remote && !connected) remote.reconnectNow()
+    return
+  }
   if (!workspace || !c || runs.has(id) || (c.access !== 'owner' && c.access !== 'write')) return
   const index = retry ? c.turns.findIndex(t => t.id === retry.turnId) : -1
   const source = c.turns[index]

@@ -26,6 +26,20 @@ type Store struct {
 	db            *sql.DB
 	uploadsDir    string
 	ownUploadsDir bool
+	sessionTTL    time.Duration
+}
+
+func (s *Store) SetSessionTTL(d time.Duration) {
+	if d > 0 {
+		s.sessionTTL = d
+	}
+}
+
+func (s *Store) effectiveSessionTTL() time.Duration {
+	if s.sessionTTL > 0 {
+		return s.sessionTTL
+	}
+	return deviceLifetime
 }
 
 type User struct {
@@ -594,7 +608,7 @@ func (s *Store) IssueDevice(ctx context.Context, userID, name string) (Device, s
 	return s.IssueDeviceForLogin(ctx, userID, name, nil)
 }
 
-const deviceLifetime = 30 * 24 * time.Hour
+const deviceLifetime = 7 * 24 * time.Hour
 
 // Match the verified hash at insert time so a concurrent password reset cannot mint a token.
 func (s *Store) IssueDeviceForLogin(ctx context.Context, userID, name string, verifiedHash []byte) (Device, string, error) {
@@ -603,7 +617,7 @@ func (s *Store) IssueDeviceForLogin(ctx context.Context, userID, name string, ve
 		return Device{}, "", err
 	}
 	defer tx.Rollback()
-	device, token, err := issueDevice(ctx, tx, userID, name, verifiedHash)
+	device, token, err := issueDeviceWithTTL(ctx, tx, userID, name, verifiedHash, s.effectiveSessionTTL())
 	if err == nil {
 		err = tx.Commit()
 	}
@@ -611,6 +625,10 @@ func (s *Store) IssueDeviceForLogin(ctx context.Context, userID, name string, ve
 }
 
 func issueDevice(ctx context.Context, tx *sql.Tx, userID, name string, verifiedHash []byte) (Device, string, error) {
+	return issueDeviceWithTTL(ctx, tx, userID, name, verifiedHash, deviceLifetime)
+}
+
+func issueDeviceWithTTL(ctx context.Context, tx *sql.Tx, userID, name string, verifiedHash []byte, ttl time.Duration) (Device, string, error) {
 	token := randomHex(32)
 	hash := sha256.Sum256([]byte(token))
 	now := time.Now().UnixMilli()
@@ -624,7 +642,7 @@ func issueDevice(ctx context.Context, tx *sql.Tx, userID, name string, verifiedH
 	}
 	err := tx.QueryRowContext(ctx, `INSERT INTO devices (id,user_id,name,token_hash,last_seen_at,created_at,expires_at)
   SELECT ?, id, ?, ?, ?, ?, ? FROM users WHERE id=? AND is_active=1 AND (? IS NULL OR password_hash=?)
-		RETURNING id`, device.ID, name, hash[:], now, now, now+deviceLifetime.Milliseconds(), userID, expected, expected).Scan(&device.ID)
+		RETURNING id`, device.ID, name, hash[:], now, now, now+ttl.Milliseconds(), userID, expected, expected).Scan(&device.ID)
 	if errors.Is(err, sql.ErrNoRows) {
 		var active bool
 		if lookup := tx.QueryRowContext(ctx, "SELECT is_active FROM users WHERE id=?", userID).Scan(&active); lookup == nil && !active {
@@ -645,7 +663,7 @@ func (s *Store) Authenticate(ctx context.Context, token string) (User, Device, e
 	err = s.db.QueryRowContext(ctx, `UPDATE devices SET last_seen_at=?, expires_at=?
   WHERE id=? AND last_seen_at <= ? AND (expires_at=0 OR expires_at>?)
    AND user_id IN (SELECT id FROM users WHERE id=? AND is_active=1)
-  RETURNING last_seen_at`, now, now+deviceLifetime.Milliseconds(), device.ID, cutoff, now, user.ID).Scan(&device.LastSeenAt)
+  RETURNING last_seen_at`, now, now+s.effectiveSessionTTL().Milliseconds(), device.ID, cutoff, now, user.ID).Scan(&device.LastSeenAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		// A concurrent refresh or revocation can change the row after the initial read.
 		return activeDevice(ctx, s.db, "d.token_hash=?", now, hash[:])

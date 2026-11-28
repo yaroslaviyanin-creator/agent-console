@@ -5,7 +5,10 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"os"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type Subscription struct {
@@ -79,7 +82,7 @@ func createUser(ctx context.Context, db rowQuerier, username string, hash []byte
 	return u, err
 }
 
-func (s *Store) Register(ctx context.Context, username string, hash []byte, deviceName string) (User, Device, string, error) {
+func (s *Store) Register(ctx context.Context, username string, hash []byte, _ string) (User, Device, string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return User{}, Device{}, "", err
@@ -89,11 +92,10 @@ func (s *Store) Register(ctx context.Context, username string, hash []byte, devi
 	if err != nil {
 		return User{}, Device{}, "", err
 	}
-	device, token, err := issueDevice(ctx, tx, user.ID, deviceName, nil)
-	if err == nil {
-		err = tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return User{}, Device{}, "", err
 	}
-	return user.User, device, token, err
+	return user.User, Device{}, "", nil
 }
 
 type AdminChat struct {
@@ -138,9 +140,28 @@ type DirectoryUser struct {
 	AvatarData  string `json:"avatarData,omitempty"`
 }
 
-func (s *Store) DirectoryUsers(ctx context.Context) ([]DirectoryUser, error) {
+func escapeLikePattern(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
+}
+
+func (s *Store) DirectoryUsers(ctx context.Context, excludeUserID, query string, limit int) ([]DirectoryUser, error) {
+	q := strings.TrimSpace(query)
+	if utf8.RuneCountInString(q) < 2 {
+		return []DirectoryUser{}, nil
+	}
+	if limit <= 0 {
+		limit = 10
+	} else if limit > 20 {
+		limit = 20
+	}
+	pattern := "%" + escapeLikePattern(q) + "%"
 	rows, err := s.db.QueryContext(ctx, `SELECT id,username,display_name,avatar_data FROM users
-		WHERE is_active=1 AND role IN ('user','admin') ORDER BY username`)
+		WHERE is_active=1 AND role='user' AND id!=?
+		  AND (LOWER(username) LIKE LOWER(?) ESCAPE '\' OR LOWER(display_name) LIKE LOWER(?) ESCAPE '\')
+		ORDER BY username LIMIT ?`, excludeUserID, pattern, pattern, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -211,6 +232,83 @@ func (s *Store) RevokeUserDevices(ctx context.Context, id string) error {
 	}
 	_, err := s.db.ExecContext(ctx, "DELETE FROM devices WHERE user_id=?", id)
 	return err
+}
+
+func (s *Store) RevokeOtherDevices(ctx context.Context, userID, currentDeviceID string) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM devices WHERE user_id=? AND id!=?", userID, currentDeviceID)
+	return err
+}
+
+var ErrLastAdmin = errors.New("cannot delete last active admin")
+
+func (s *Store) DeleteAdminUser(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var role string
+	var isActive int
+	if err := tx.QueryRowContext(ctx, "SELECT role, is_active FROM users WHERE id=?", id).Scan(&role, &isActive); err != nil {
+		return err
+	}
+	if role == "admin" && isActive == 1 {
+		var otherAdmins int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE role='admin' AND is_active=1 AND id<>?", id).Scan(&otherAdmins); err != nil {
+			return err
+		}
+		if otherAdmins == 0 {
+			return ErrLastAdmin
+		}
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT storage_key FROM chat_attachments WHERE user_id=? OR chat_id IN (SELECT id FROM chats WHERE user_id=?)`, id, id)
+	if err != nil {
+		return err
+	}
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			rows.Close()
+			return err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	stmts := []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM chat_attachments WHERE user_id=? OR chat_id IN (SELECT id FROM chats WHERE user_id=?)`, []any{id, id}},
+		{`DELETE FROM usage_events WHERE user_id=? OR chat_id IN (SELECT id FROM chats WHERE user_id=?)`, []any{id, id}},
+		{`DELETE FROM chat_shares WHERE user_id=? OR chat_id IN (SELECT id FROM chats WHERE user_id=?)`, []any{id, id}},
+		{`DELETE FROM chat_messages WHERE chat_id IN (SELECT id FROM chats WHERE user_id=?)`, []any{id}},
+		{`DELETE FROM chats WHERE user_id=?`, []any{id}},
+		{`DELETE FROM devices WHERE user_id=?`, []any{id}},
+		{`DELETE FROM users WHERE id=?`, []any{id}},
+	}
+	for _, st := range stmts {
+		if _, err := tx.ExecContext(ctx, st.query, st.args...); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for _, key := range keys {
+		if diskPath, err := s.attachmentPath(key); err == nil {
+			_ = os.Remove(diskPath)
+		}
+	}
+	return nil
 }
 
 func (s *Store) UserDevices(ctx context.Context, userID string) ([]Device, error) {

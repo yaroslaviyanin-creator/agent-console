@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { AlertTriangle, Download, FileArchive, FileCode, FileText, Image as ImageIcon, LoaderCircle, Paperclip, X } from 'lucide-react'
 import type { MessageAttachment } from '../protocol/types'
 import type { RemoteTransport } from '../transport/RemoteTransport'
 import { type DraftAttachment, formatAttachmentSize, isRenderableImageAttachment } from './attachments'
+import { useFileViewer } from './fileViewerStore'
 
 function attachmentFileIcon(att: Pick<MessageAttachment, 'kind' | 'name'>) {
   if (att.kind === 'archive' || att.name.toLowerCase().endsWith('.zip')) return FileArchive
@@ -18,7 +19,7 @@ function AuthenticatedImage({
 }: {
   att: MessageAttachment
   remote: RemoteTransport | null
-  onPreview: (src: string, name: string) => void
+  onPreview: (att: MessageAttachment) => void
 }) {
   const [blobUrl, setBlobUrl] = useState<string>('')
   const [failed, setFailed] = useState(false)
@@ -58,7 +59,7 @@ function AuthenticatedImage({
     <button
       type="button"
       className="att-image-thumb-btn"
-      onClick={() => onPreview(blobUrl, att.name)}
+      onClick={() => onPreview(att)}
       title={`Открыть ${att.name}`}
     >
       <img src={blobUrl} alt={att.name} className="att-image-thumb" />
@@ -73,15 +74,8 @@ export function TurnAttachments({
   attachments: MessageAttachment[]
   remote: RemoteTransport | null
 }) {
-  const [lightbox, setLightbox] = useState<{ src: string; name: string } | null>(null)
-  const dialogRef = useRef<HTMLDialogElement>(null)
-
-  useEffect(() => {
-    const dialog = dialogRef.current
-    if (!dialog) return
-    if (lightbox && !dialog.open) dialog.showModal()
-    if (!lightbox && dialog.open) dialog.close()
-  }, [lightbox])
+  const openFile = useFileViewer(s => s.openFile)
+  const activeFile = useFileViewer(s => s.file)
 
   const images = attachments.filter(att => isRenderableImageAttachment(att) && !!att.url)
   const files = attachments.filter(att => !(isRenderableImageAttachment(att) && !!att.url))
@@ -95,7 +89,7 @@ export function TurnAttachments({
               key={att.id ?? `${att.name}-${index}`}
               att={att}
               remote={remote}
-              onPreview={(src, name) => setLightbox({ src, name })}
+              onPreview={openFile}
             />
           ))}
         </div>
@@ -105,8 +99,22 @@ export function TurnAttachments({
           {files.map((att, index) => {
             const Icon = att.kind === 'image' ? ImageIcon : attachmentFileIcon(att)
             const sizeLabel = formatAttachmentSize(att.sizeBytes)
+            const isSelected = !!activeFile && (activeFile.id ? activeFile.id === att.id : activeFile.name === att.name && activeFile.url === att.url)
             return (
-              <li key={att.id ?? `${att.name}-${index}`} title={att.warning ? `${att.name}: ${att.warning}` : att.name}>
+              <li
+                key={att.id ?? `${att.name}-${index}`}
+                className={`is-clickable${isSelected ? ' is-selected' : ''}`}
+                role="button"
+                tabIndex={0}
+                title={att.warning ? `${att.name}: ${att.warning}` : `Открыть ${att.name}`}
+                onClick={() => openFile(att)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    openFile(att)
+                  }
+                }}
+              >
                 <Icon size={14} aria-hidden="true" />
                 <span className="att-file-name">{att.name}</span>
                 {sizeLabel && <small className="att-file-size">{sizeLabel}</small>}
@@ -121,7 +129,10 @@ export function TurnAttachments({
                     className="att-download-btn"
                     aria-label={`Скачать ${att.name}`}
                     title={`Скачать ${att.name}`}
-                    onClick={() => { void remote.downloadAttachment(att) }}
+                    onClick={e => {
+                      e.stopPropagation()
+                      void remote.downloadAttachment(att)
+                    }}
                   >
                     <Download size={13} aria-hidden="true" />
                   </button>
@@ -131,25 +142,6 @@ export function TurnAttachments({
           })}
         </ul>
       )}
-      <dialog
-        ref={dialogRef}
-        className="att-lightbox"
-        aria-label={lightbox?.name ?? 'Просмотр изображения'}
-        onCancel={() => setLightbox(null)}
-        onClick={e => { if (e.target === dialogRef.current) setLightbox(null) }}
-      >
-        {lightbox && (
-          <div className="att-lightbox-inner">
-            <div className="att-lightbox-head">
-              <span>{lightbox.name}</span>
-              <button type="button" className="icon-btn" aria-label="Закрыть" onClick={() => setLightbox(null)}>
-                <X size={18} />
-              </button>
-            </div>
-            <img src={lightbox.src} alt={lightbox.name} className="att-lightbox-img" />
-          </div>
-        )}
-      </dialog>
     </>
   )
 }

@@ -45,10 +45,10 @@ export function Sidebar({
   openAdmin?: (() => void) | undefined
   openShare: (chatId: string) => void
 }) {
-  const { chats, activeId, mode, connected, workspace, remote } = useChats()
+  const { chats, activeId, mode, connected, connectionError, workspace, remote } = useChats()
   const mobileQuotaRef = useRef<HTMLDetailsElement>(null)
   const serverQuota = useAccountStore(s => s.serverQuota)
-  const online = mode === 'demo' || connected
+  const online = mode === 'demo' || (connected && !connectionError)
   const [menu, setMenu] = useState<MenuState | null>(null)
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [renamingId, setRenamingId] = useState<string | null>(null)
@@ -402,7 +402,7 @@ export function Sidebar({
             <Radio size={14} />
             <span>{mode === 'demo' ? 'Mock-транспорт' : 'Сервер'}</span>
             <span className={'connection-pill ' + (online ? 'is-online' : 'is-connecting')}>
-              <i />{online ? 'Онлайн' : 'Подключение…'}
+              <i />{online ? 'Онлайн' : 'Переподключение…'}
             </span>
           </div>
         </div>

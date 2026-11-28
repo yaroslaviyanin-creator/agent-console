@@ -12,13 +12,14 @@ import (
 )
 
 func (a *API) RequireAdmin(next func(http.ResponseWriter, *http.Request, session)) http.HandlerFunc {
-	return a.withAuth(func(w http.ResponseWriter, r *http.Request, s session) {
-		if s.User.Role != "admin" {
-			fail(w, http.StatusForbidden, "admin_required", "Administrator access is required.")
+	return func(w http.ResponseWriter, r *http.Request) {
+		s, err := a.authenticate(r.Context(), bearerToken(r))
+		if err != nil || s.User.Role != "admin" {
+			fail(w, http.StatusNotFound, "not_found", "Not found")
 			return
 		}
 		next(w, r, s)
-	})
+	}
 }
 
 func (a *API) adminUsers(w http.ResponseWriter, r *http.Request, _ session) {
@@ -116,6 +117,24 @@ func (a *API) adminUpdateUser(w http.ResponseWriter, r *http.Request, s session)
 func (a *API) adminRevokeDevices(w http.ResponseWriter, r *http.Request, _ session) {
 	id := r.PathValue("id")
 	if err := a.db.RevokeUserDevices(r.Context(), id); err != nil {
+		a.adminUserError(w, r, err)
+		return
+	}
+	a.live.disconnectUser(id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) adminDeleteUser(w http.ResponseWriter, r *http.Request, s session) {
+	id := r.PathValue("id")
+	if id == s.User.ID {
+		fail(w, http.StatusBadRequest, "self_delete_forbidden", "You cannot delete your own account.")
+		return
+	}
+	if err := a.db.DeleteAdminUser(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrLastAdmin) {
+			fail(w, http.StatusBadRequest, "last_admin_forbidden", "Cannot delete the last active admin.")
+			return
+		}
 		a.adminUserError(w, r, err)
 		return
 	}

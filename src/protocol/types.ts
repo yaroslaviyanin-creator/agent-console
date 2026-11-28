@@ -171,6 +171,7 @@ export interface AdminAdapter {
   create(user: CreateAdminUser): Promise<AdminUser>
   update(id: string, changes: UpdateAdminUser): Promise<void>
   revokeDevices(id: string): Promise<void>
+  delete?(id: string): Promise<void>
 }
 export interface ServerAdminAdapter extends AdminAdapter {
   chats(userId: string, signal?: AbortSignal): Promise<AdminChat[]>

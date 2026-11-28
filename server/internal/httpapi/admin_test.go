@@ -3,10 +3,12 @@ package httpapi
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -15,6 +17,7 @@ import (
 
 	"agent-console/server/internal/config"
 	"agent-console/server/internal/store"
+	"agent-console/server/internal/uploads"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -70,7 +73,7 @@ func TestAdminUsersLifecycle(t *testing.T) {
 		return result.Token, result.User
 	}
 	const users = "/api/admin/users"
-	request("GET", users, "", "", 401, nil)
+	request("GET", users, "", "", 404, nil)
 	adminToken, adminUser := login(`{"username":"root","password":"admin-pass","deviceName":"Mac"}`, 200)
 	if adminUser.Role != "admin" || !adminUser.IsActive {
 		t.Fatalf("incorrect login user: %+v", adminUser)
@@ -90,7 +93,11 @@ func TestAdminUsersLifecycle(t *testing.T) {
 	request("POST", users, adminToken, `{"username":"invalid","password":"original-pass","role":"user","planTier":"unknown"}`, 400, nil)
 	const loginAlice = `{"username":"alice","password":"original-pass","deviceName":"Telegram"}`
 	aliceToken, _ := login(loginAlice, 200)
-	request("GET", users, aliceToken, "", 403, nil)
+	for _, method := range []string{"GET", "POST", "PATCH", "DELETE"} {
+		request(method, "/api/admin", aliceToken, "", 404, nil)
+		request(method, "/api/admin/users/123", aliceToken, "", 404, nil)
+		request(method, users, aliceToken, "", 404, nil)
+	}
 	chat, err := db.CreateChat(ctx, alice.ID, "Fixture", "stub", "default")
 	if err != nil {
 		t.Fatal(err)
@@ -110,7 +117,7 @@ func TestAdminUsersLifecycle(t *testing.T) {
 		t.Fatalf("incorrect admin messages: %+v", messages)
 	}
 	request("GET", users+"/"+admin.ID+"/chats/"+chat.ID+"/messages", adminToken, "", 404, nil)
-	request("GET", chatListPath, aliceToken, "", 403, nil)
+	request("GET", chatListPath, aliceToken, "", 404, nil)
 	expired, _, err := db.IssueDevice(ctx, alice.ID, "Expired")
 	if err != nil {
 		t.Fatal(err)
@@ -148,12 +155,16 @@ func TestAdminUsersLifecycle(t *testing.T) {
 		t.Fatalf("unexpected user quota: %+v", quota)
 	}
 	var pending struct {
-		session
-		Token string
+		User    store.User `json:"user"`
+		Pending bool       `json:"pending"`
+		Token   string     `json:"token"`
 	}
 	request("POST", "/api/auth/register", "",
 		`{"username":"pending-user","password":"pending-pass","deviceName":"Browser"}`, 201, &pending)
-	request("GET", quotaPath, pending.Token, "", 403, nil)
+	if pending.Token != "" || !pending.Pending {
+		t.Fatalf("expected pending registration without token, got %+v", pending)
+	}
+	request("GET", quotaPath, pending.Token, "", 401, nil)
 	var list []store.AdminUser
 	request("GET", users, adminToken, "", 200, &list)
 	if len(list) != 3 || list[0].ID != alice.ID || list[0].DevicesCount != 1 || list[0].ChatsCount != 1 || list[0].CreatedAt == 0 {
@@ -296,14 +307,6 @@ func TestPendingRegistration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	admin, err := db.CreateUserWithRole(ctx, "root", []byte("fixture"), "admin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, adminToken, err := db.IssueDevice(ctx, admin.ID, "Admin")
-	if err != nil {
-		t.Fatal(err)
-	}
 	api, err := New(ctx, db, config.Config{Provider: "stub", CORSOrigin: "*"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -325,37 +328,75 @@ func TestPendingRegistration(t *testing.T) {
 	const register = "/api/auth/register"
 	const body = `{"username":"self","password":"test-password","deviceName":"Browser"}`
 	var account struct {
-		session
-		Token string
+		User    store.User `json:"user"`
+		Pending bool       `json:"pending"`
+		Token   string     `json:"token"`
 	}
 	if err := json.Unmarshal(call("POST", register, "", body, 201, ""), &account); err != nil {
 		t.Fatal(err)
 	}
-	if account.Token == "" || account.Device.ID == "" || account.User.Role != "pending" || account.User.PlanTier != "none" || !account.User.IsActive {
-		t.Fatalf("incorrect pending account: %+v", account.User)
+	if account.Token != "" || !account.Pending || account.User.Role != "pending" || account.User.PlanTier != "none" || !account.User.IsActive {
+		t.Fatalf("incorrect pending account: %+v", account)
 	}
-	for _, path := range []string{"/api/health", "/api/auth/me", "/api/devices"} {
-		call("GET", path, account.Token, "", 200, "")
-	}
-	for _, path := range []string{"/api/chats", "/api/models", "/api/codex/chats", "/api/admin/users", "/ws"} {
-		call("GET", path, account.Token, "", 403, "account_pending")
-	}
-	call("POST", "/api/ws/ticket", account.Token, "", 403, "account_pending")
-	call("PATCH", "/api/admin/users/"+account.User.ID, adminToken, `{"role":"user","planTier":"pro"}`, 204, "")
-	call("GET", "/api/chats", account.Token, "", 200, "")
-	ticket := call("POST", "/api/ws/ticket", account.Token, "", 200, "")
-	var ws struct{ Ticket string }
-	if err := json.Unmarshal(ticket, &ws); err != nil {
-		t.Fatal(err)
-	}
-	call("PATCH", "/api/admin/users/"+account.User.ID, adminToken, `{"role":"pending"}`, 204, "")
-	call("GET", "/ws?ticket="+ws.Ticket, "", "", 403, "account_pending")
-	call("POST", "/api/auth/logout", account.Token, "", 204, "")
 	call("POST", register, "", body, 409, "username_taken")
 	for range 3 {
 		call("POST", register, "", `{}`, 400, "invalid_registration")
 	}
-	call("POST", register, "", body, 429, "rate_limited")
+	r429 := httptest.NewRequest(http.MethodPost, register, strings.NewReader(body))
+	r429.Header.Set("Content-Type", "application/json")
+	w429 := httptest.NewRecorder()
+	api.ServeHTTP(w429, r429)
+	if w429.Code != 429 || w429.Header().Get("Retry-After") == "" {
+		t.Fatalf("expected 429 with Retry-After, got %d header=%q", w429.Code, w429.Header().Get("Retry-After"))
+	}
+}
+
+func TestLogoutAllEndpoint(t *testing.T) {
+	ctx := t.Context()
+	db, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	hash, _ := bcrypt.GenerateFromPassword([]byte("pass12345"), bcrypt.MinCost)
+	u, err := db.CreateUserWithRole(ctx, "bob", hash, "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, tok1, err := db.IssueDevice(ctx, u.ID, "Dev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, tok2, err := db.IssueDevice(ctx, u.ID, "Dev2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := newHandler(ctx, db, config.Config{Provider: "stub"}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/logout-all", strings.NewReader(`{"includeCurrent":false}`))
+	req.Header.Set("Authorization", "Bearer "+tok1)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	if w.Code != 204 {
+		t.Fatalf("logout-all: got %d", w.Code)
+	}
+
+	// tok2 is invalidated immediately, tok1 remains valid.
+	r2 := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	r2.Header.Set("Authorization", "Bearer "+tok2)
+	w2 := httptest.NewRecorder()
+	api.ServeHTTP(w2, r2)
+	if w2.Code != 401 {
+		t.Fatalf("expected revoked tok2 to get 401, got %d", w2.Code)
+	}
+	r1 := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	r1.Header.Set("Authorization", "Bearer "+tok1)
+	w1 := httptest.NewRecorder()
+	api.ServeHTTP(w1, r1)
+	if w1.Code != 200 {
+		t.Fatalf("expected current tok1 to stay 200, got %d", w1.Code)
+	}
 }
 
 func TestProfileEndpoints(t *testing.T) {
@@ -460,4 +501,106 @@ func TestNewRejectsUnimplementedProviders(t *testing.T) {
 			t.Fatalf("New(%q) expected error, got nil", unsupported)
 		}
 	}
+}
+
+func TestAdminDeleteUser(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	db, err := store.Open(ctx, filepath.Join(dir, "app.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	admin, err := db.CreateUserWithRole(ctx, "admin", []byte("hash"), "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, adminToken, err := db.IssueDevice(ctx, admin.ID, "admin-dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := db.CreateUserWithRole(ctx, "alice", []byte("hash"), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, userToken, err := db.IssueDevice(ctx, user.ID, "alice-dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := db.CreateUserWithRole(ctx, "bob", []byte("hash"), "pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	chat, err := db.CreateChat(ctx, user.ID, "Alice Chat", "stub", "stub-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(db.UploadsDir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	storageKey := "alice-file.txt"
+	diskPath := filepath.Join(db.UploadsDir(), storageKey)
+	if err := os.WriteFile(diskPath, []byte("hello"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	att, err := db.CreateAttachment(ctx, chat.ID, user.ID, uploads.ValidatedAttachment{
+		Filename: "hello.txt",
+		MIMEType: "text/plain",
+		Kind:     uploads.KindText,
+		Size:     5,
+		Data:     []byte("hello"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskPath = filepath.Join(db.UploadsDir(), att.StorageKey)
+	if _, err := os.Stat(diskPath); err != nil {
+		t.Fatalf("expected attachment file %s to exist before delete: %v", diskPath, err)
+	}
+
+	handler, err := New(ctx, db, config.Config{Provider: "stub", CORSOrigin: "*"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	call := func(method, path, token string, want int) {
+		t.Helper()
+		r := httptest.NewRequest(method, path, nil)
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Code != want {
+			t.Fatalf("%s %s got %d want %d: %s", method, path, w.Code, want, w.Body.String())
+		}
+	}
+
+	// Non-admin receives 404
+	call("DELETE", "/api/admin/users/"+pending.ID, userToken, 404)
+
+	// Self-delete returns 400
+	call("DELETE", "/api/admin/users/"+admin.ID, adminToken, 400)
+
+	// Last active admin cannot be deleted
+	if err := db.DeleteAdminUser(ctx, admin.ID); !errors.Is(err, store.ErrLastAdmin) {
+		t.Fatalf("DeleteAdminUser(last admin) got %v want ErrLastAdmin", err)
+	}
+
+	// Delete pending user -> 204
+	call("DELETE", "/api/admin/users/"+pending.ID, adminToken, 204)
+	call("DELETE", "/api/admin/users/"+pending.ID, adminToken, 404)
+
+	// Delete regular user -> 204, cleans up chats, devices, and disk attachment
+	call("DELETE", "/api/admin/users/"+user.ID, adminToken, 204)
+	if _, err := os.Stat(diskPath); !os.IsNotExist(err) {
+		t.Fatalf("expected attachment file %s to be deleted, err=%v", diskPath, err)
+	}
+	call("GET", "/api/chats", userToken, 401)
+	if devices, err := db.UserDevices(ctx, user.ID); err != nil || len(devices) != 0 {
+		t.Fatalf("expected deleted user's devices to be gone, got %+v (%v)", devices, err)
+	}
+	call("DELETE", "/api/admin/users/"+user.ID, adminToken, 404)
 }

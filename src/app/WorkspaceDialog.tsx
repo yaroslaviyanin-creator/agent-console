@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, ChevronRight, Copy, Laptop, Link2, LogOut, Monitor, Palette, Trash2, Upload, User, X } from 'lucide-react'
-import type { ShareAccess, UserProfile, UserProfilePatch, Workspace } from '../protocol/types'
+import type { ServerDirectoryUser, ShareAccess, UserProfile, UserProfilePatch, Workspace } from '../protocol/types'
 import { getTelegramUserId } from '../platform/telegram'
 import type { RemoteTransport } from '../transport/RemoteTransport'
 import { ACCENT_PRESETS, GRADIENT_PALETTES, resolveTheme, type ThemePreference, useAppearance } from './appearanceStore'
 import { ColorWheelPicker } from './ColorWheelPicker'
-import { changeServerAddress, logout, refreshServerDevices, revokeDevice, setConnectionMode, setShare, updateSelfProfileMember, useChats } from './chatStore'
+import { changeServerAddress, logout, logoutAllOtherDevices, refreshServerDevices, revokeDevice, setConnectionMode, setShare, updateSelfProfileMember, useChats } from './chatStore'
 import { ConnectionMode } from './ConnectionMode'
 import { SelectMenu } from './SelectMenu'
 import { UserAvatar } from './UserAvatar'
@@ -61,17 +61,53 @@ async function compressAvatarFile(file: File): Promise<string> {
 
 function ShareForm({ w, chatId }: { w: Workspace; chatId: string }) {
   const mode = useChats(state => state.mode)
+  const remote = useChats(state => state.remote)
   const room = w.chats.find(c => c.id === chatId)
-  const others = w.users.filter(u => u.id !== w.user.id)
+  const demoOthers = w.users.filter(u => u.id !== w.user.id)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState<ServerDirectoryUser[]>([])
+  const [searching, setSearching] = useState(false)
   const [selected, setSelected] = useState('')
   const [draft, setDraft] = useState<{ access: ShareAccess; trusted: boolean }>()
   const [status, setStatus] = useState('')
   const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (mode !== 'server' || !remote) return
+    const trimmed = searchQuery.trim()
+    if (trimmed.length < 2) {
+      setSearchResults([])
+      setSearching(false)
+      return
+    }
+    const controller = new AbortController()
+    setSearching(true)
+    const timer = window.setTimeout(() => {
+      void remote.searchUsers(trimmed, 10, controller.signal)
+        .then(users => {
+          if (!controller.signal.aborted) setSearchResults(users)
+        })
+        .catch(() => {
+          if (!controller.signal.aborted) setSearchResults([])
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setSearching(false)
+        })
+    }, 250)
+    return () => {
+      controller.abort()
+      clearTimeout(timer)
+    }
+  }, [mode, remote, searchQuery])
+
   if (!room || room.access !== 'owner') return null
 
+  const others = mode === 'server'
+    ? searchResults.map(u => ({ id: u.id, name: u.displayName?.trim() || u.username }))
+    : demoOthers
   const user = selected || others[0]?.id || ''
   const existing = room.grants.find(g => g.userId === user)
-  const eligible = others.some(u => u.id === user)
+  const eligible = others.some(u => u.id === user) || (mode === 'server' && !!selected && !!existing)
   const access = draft?.access ?? existing?.access ?? 'read'
   const trusted = draft?.trusted ?? !!existing?.trustedDeviceId
   function choose(id: string) {
@@ -91,9 +127,24 @@ function ShareForm({ w, chatId }: { w: Workspace; chatId: string }) {
     finally { setSaving(false) }
   }
   return <form className="panel-form" onSubmit={e => { e.preventDefault(); void save() }}>
-    {others.length === 0 && <p className="form-help">На сервере пока нет других пользователей</p>}
+    {mode === 'server' ? (
+      <label>Поиск пользователя
+        <input
+          type="search"
+          placeholder="Введите логин или имя (от 2 символов)..."
+          value={searchQuery}
+          disabled={saving}
+          onChange={e => setSearchQuery(e.target.value)}
+        />
+      </label>
+    ) : (
+      demoOthers.length === 0 && <p className="form-help">На сервере пока нет других пользователей</p>
+    )}
+    {mode === 'server' && searchQuery.trim().length >= 2 && !searching && others.length === 0 && (
+      <p className="form-help">Пользователи не найдены.</p>
+    )}
     {(others.length > 0 || existing) && <>
-      <div className="field-group"><span>Пользователь сервера</span><SelectMenu ariaLabel="Пользователь сервера" variant="field" disabled={saving} value={user} options={[...(!eligible ? [{ value: user, label: `Недоступный пользователь (${user})` }] : []), ...others.map(u => ({ value: u.id, label: mode === 'server' ? u.name : `${u.name} (@${u.id})` }))]} onChange={choose} /></div>
+      <div className="field-group"><span>Пользователь сервера</span><SelectMenu ariaLabel="Пользователь сервера" variant="field" disabled={saving} value={user} options={[...(!others.some(u => u.id === user) && user ? [{ value: user, label: `Выбранный пользователь (${user})` }] : []), ...others.map(u => ({ value: u.id, label: mode === 'server' ? u.name : `${u.name} (@${u.id})` }))]} onChange={choose} /></div>
       <div className="field-group"><span>Права в чате</span><SelectMenu ariaLabel="Права в чате" variant="field" disabled={!eligible || saving} value={access} options={Object.entries(rights).map(([k, v]) => ({ value: k as ShareAccess, label: v }))} onChange={nextAccess => { setSelected(user); setDraft({ access: nextAccess, trusted: false }); setStatus('') }} /></div>
       {mode === 'demo' && <>
         <label className="trust-check"><input type="checkbox" disabled={access !== 'write' || saving} checked={trusted} onChange={e => { setSelected(user); setDraft({ access, trusted: e.target.checked }); setStatus('') }}/>Доверенный режим для команд на моём ПК</label>
@@ -112,6 +163,7 @@ function DevicesSection({ w }: { w: Workspace }) {
   const { mode, address, connected } = useChats()
   const [server, setServer] = useState(address)
   const [confirm, setConfirm] = useState('')
+  const [confirmAll, setConfirmAll] = useState(false)
   const [error, setError] = useState('')
   const [revoking, setRevoking] = useState(false)
   useEffect(() => {
@@ -199,6 +251,37 @@ function DevicesSection({ w }: { w: Workspace }) {
       </div>
 
       {error && <p className="auth-error" role="alert">{error}</p>}
+
+      {mode === 'server' && (
+        <div className="settings-row">
+          <div className="settings-row-info">
+            <strong>Другие устройства</strong>
+            <small>Завершить все активные сессии, кроме текущего устройства</small>
+          </div>
+          {!confirmAll ? (
+            <button type="button" className="alt-action" disabled={revoking} onClick={() => setConfirmAll(true)}>
+              Выйти со всех других устройств
+            </button>
+          ) : (
+            <div className="device-confirm">
+              <span>Завершить остальные сессии?</span>
+              <button type="button" className="alt-action danger-action" disabled={revoking} onClick={async () => {
+                setError('')
+                setRevoking(true)
+                try {
+                  await logoutAllOtherDevices()
+                  setConfirmAll(false)
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : 'Не удалось завершить другие сессии.')
+                } finally {
+                  setRevoking(false)
+                }
+              }}>Да</button>
+              <button type="button" className="alt-action" disabled={revoking} onClick={() => setConfirmAll(false)}>Отмена</button>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="settings-row settings-row-footer">
         <div className="settings-row-info">

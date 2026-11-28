@@ -277,7 +277,7 @@ test('registration and session restore stay offline until the account is approve
     if (route === 'POST /api/auth/register') {
       assert.equal(authorization, null)
       assert.deepEqual(JSON.parse(String(init.body)), { username: 'alice', password: 'a-password', deviceName: 'Browser' })
-      return Response.json({ user, device, token: 'registered-token' }, { status: 201 })
+      return Response.json({ user, pending: true }, { status: 201 })
     }
     assert.equal(authorization, 'Bearer registered-token')
     switch (route) {
@@ -297,10 +297,10 @@ test('registration and session restore stay offline until the account is approve
   const remote = new RemoteTransport('https://example.test')
   const restored = new RemoteTransport(remote.address)
   t.after(() => { remote.close(); restored.close() })
-  const workspace = await remote.register({ connection: remote.address, login: 'alice', password: 'a-password', deviceName: 'Browser' })
-  assert.equal(workspace.user.role, 'pending')
-  assert.equal(remote.sessionToken, 'registered-token')
-  assert.equal((await restored.restore(remote.sessionToken)).user.role, 'pending')
+  const regRes = await remote.register({ connection: remote.address, login: 'alice', password: 'a-password', deviceName: 'Browser' })
+  assert.ok('pending' in regRes && regRes.pending)
+  assert.equal(remote.sessionToken, '')
+  await restored.restore('registered-token')
   await remote.connect()
   await restored.connect()
   const pendingQuota = restored.sessionQuota
@@ -310,7 +310,7 @@ test('registration and session restore stay offline until the account is approve
   user.planTier = 'pro'
   assert.equal((await restored.checkStatus()).user.role, 'user')
   assert.equal(restored.sessionQuota?.bypass5hLimit, true)
-  assert.deepEqual(requests.sort(), ['GET /api/auth/me', 'GET /api/chats', 'GET /api/devices', 'GET /api/health', 'GET /api/quotas/current', 'GET /api/users'])
+  assert.deepEqual(requests.sort(), ['GET /api/auth/me', 'GET /api/chats', 'GET /api/devices', 'GET /api/health', 'GET /api/quotas/current'])
 })
 
 test('remote workspace lists members, updates grants and forks shared chats', async t => {
@@ -355,14 +355,18 @@ test('remote workspace lists members, updates grants and forks shared chats', as
   const workspace = await remote.workspace.login({
     connection: remote.address, login: alice.username, password: 'password', deviceName: 'Browser',
   })
-  assert.deepEqual(workspace.users.map(user => [user.id, user.name]), [[alice.id, alice.username], [bob.id, bob.username]])
+  assert.deepEqual(workspace.users.map(user => [user.id, user.name]), [[alice.id, alice.username]])
+  assert.equal(directoryLoads, 0)
+  const found = await remote.searchUsers('бо')
+  assert.deepEqual(found, [alice, bob])
+  assert.equal(directoryLoads, 1)
   assert.deepEqual(workspace.chats[1], { id: shared.id, ownerId: bob.id, access: 'fork', grants: [] })
   const granted = await remote.workspace.setShare(owner.id, bob.id, 'write', true)
   assert.deepEqual(granted.chats[0]?.grants, grant)
   const revoked = await remote.workspace.setShare(owner.id, bob.id, null, false)
   assert.deepEqual(revoked.chats[0]?.grants, [])
   await remote.refreshChats()
-  assert.equal(directoryLoads, 4)
+  assert.equal(directoryLoads, 1)
   const copy = await remote.workspace.createChat(shared.id)
   assert.equal(copy.id, fork.id)
   assert.deepEqual(copy.workspace.chats[0], { id: fork.id, ownerId: alice.id, access: 'owner', grants: [] })
@@ -450,4 +454,91 @@ test('remote providers, scoped models, 404 fallback, and createChat with provide
   assert.equal(remote.chats[0]?.provider, 'codex')
   const postCall = calls.find(c => c.route === 'POST /api/chats')
   assert.deepEqual(postCall?.body, { provider: 'codex', model: 'gpt-5.2-codex', title: 'Codex chat' })
+})
+
+test('RemoteTransport reconnectNow() recovers WebSocket connection and emits connected: true', async (t) => {
+  const prevFetch = globalThis.fetch
+  const prevWS = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket')
+  t.after(() => {
+    globalThis.fetch = prevFetch
+    if (prevWS) Object.defineProperty(globalThis, 'WebSocket', prevWS)
+    else Reflect.deleteProperty(globalThis, 'WebSocket')
+  })
+
+  const sockets: Array<{
+    url: string
+    readyState: number
+    onopen: (() => void) | null
+    onclose: (() => void) | null
+    onerror: (() => void) | null
+    onmessage: ((ev: { data: string }) => void) | null
+    close: () => void
+    send: (data: string) => void
+  }> = []
+
+  class FakeWebSocket {
+    static OPEN = 1
+    static CLOSED = 3
+    url: string
+    readyState = 0
+    onopen: (() => void) | null = null
+    onclose: (() => void) | null = null
+    onerror: (() => void) | null = null
+    onmessage: ((ev: { data: string }) => void) | null = null
+    constructor(url: string) {
+      this.url = url
+      sockets.push(this)
+    }
+    close() {
+      this.readyState = FakeWebSocket.CLOSED
+    }
+    send() {}
+  }
+  Object.defineProperty(globalThis, 'WebSocket', { configurable: true, value: FakeWebSocket })
+
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url)
+    const route = url.pathname
+    if (route === '/api/auth/login') {
+      return Response.json({
+        token: 'tok-1',
+        user: { id: 'u1', username: 'demo', displayName: 'Demo', role: 'user', status: 'approved', avatar: '' },
+        device: { id: 'd1', name: 'Browser', kind: 'web', online: true },
+        chats: [],
+      })
+    }
+    if (route === '/api/ws/ticket') {
+      return Response.json({ ticket: `t-${sockets.length + 1}` })
+    }
+    return Response.json([])
+  }) as typeof fetch
+
+  const remote = new RemoteTransport('https://example.test')
+  t.after(() => remote.close())
+
+  const waitForSockets = async (count: number) => {
+    for (let i = 0; i < 30 && sockets.length < count; i++) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+  }
+
+  await remote.workspace.login({ connection: remote.address, login: 'demo', password: 'pw', deviceName: 'Browser' })
+  await remote.connect()
+  await waitForSockets(1)
+  assert.equal(sockets.length, 1)
+  sockets[0]!.readyState = FakeWebSocket.OPEN
+  sockets[0]!.onopen?.()
+  assert.equal(remote.connected, true)
+
+  sockets[0]!.readyState = FakeWebSocket.CLOSED
+  sockets[0]!.onclose?.()
+  assert.equal(remote.connected, false)
+
+  remote.reconnectNow()
+  await waitForSockets(2)
+  assert.equal(sockets.length, 2)
+  sockets[1]!.readyState = FakeWebSocket.OPEN
+  sockets[1]!.onopen?.()
+
+  assert.equal(remote.connected, true)
 })

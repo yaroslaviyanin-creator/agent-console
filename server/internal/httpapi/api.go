@@ -12,6 +12,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -101,6 +102,9 @@ func newRegistryHandler(ctx context.Context, db *store.Store, cfg config.Config,
 		uploads: newRateLimiter()}
 	api.live.db = db
 	api.live.logger = logger
+	if db != nil {
+		db.SetSessionTTL(cfg.EffectiveSessionTTL())
+	}
 	if db != nil && cfg.MemoryAutoUpdate && cfg.MemoryCheckInterval > 0 {
 		go api.runMemoryWorker(ctx)
 	}
@@ -114,15 +118,21 @@ func newRegistryHandler(ctx context.Context, db *store.Store, cfg config.Config,
 	mux.HandleFunc("POST /api/auth/telegram/verify", api.verifyTelegramInitData)
 	mux.HandleFunc("GET /api/auth/me", api.withPendingAuth(api.me))
 	mux.HandleFunc("POST /api/auth/logout", api.withPendingAuth(api.logout))
+	mux.HandleFunc("POST /api/auth/logout-all", api.withPendingAuth(api.logoutAll))
 	mux.HandleFunc("GET /api/devices", api.withPendingAuth(api.devices))
 	mux.HandleFunc("DELETE /api/devices/{id}", api.withPendingAuth(api.deleteDevice))
 	mux.HandleFunc("POST /api/ws/ticket", api.withAuth(api.issueWSTicket))
-	mux.HandleFunc("GET /api/admin/users/{id}/chats", api.RequireAdmin(api.adminUserChats))
-	mux.HandleFunc("GET /api/admin/users/{id}/chats/{chatId}/messages", api.RequireAdmin(api.adminChatMessages))
-	mux.HandleFunc("GET /api/admin/users", api.RequireAdmin(api.adminUsers))
-	mux.HandleFunc("POST /api/admin/users", api.RequireAdmin(api.adminCreateUser))
-	mux.HandleFunc("PATCH /api/admin/users/{id}", api.RequireAdmin(api.adminUpdateUser))
-	mux.HandleFunc("DELETE /api/admin/users/{id}/devices", api.RequireAdmin(api.adminRevokeDevices))
+
+	adminMux := http.NewServeMux()
+	adminMux.HandleFunc("GET /api/admin/users/{id}/chats", api.RequireAdmin(api.adminUserChats))
+	adminMux.HandleFunc("GET /api/admin/users/{id}/chats/{chatId}/messages", api.RequireAdmin(api.adminChatMessages))
+	adminMux.HandleFunc("GET /api/admin/users", api.RequireAdmin(api.adminUsers))
+	adminMux.HandleFunc("POST /api/admin/users", api.RequireAdmin(api.adminCreateUser))
+	adminMux.HandleFunc("PATCH /api/admin/users/{id}", api.RequireAdmin(api.adminUpdateUser))
+	adminMux.HandleFunc("DELETE /api/admin/users/{id}", api.RequireAdmin(api.adminDeleteUser))
+	adminMux.HandleFunc("DELETE /api/admin/users/{id}/devices", api.RequireAdmin(api.adminRevokeDevices))
+	mux.Handle("/api/admin", api.adminGuard(adminMux))
+	mux.Handle("/api/admin/", api.adminGuard(adminMux))
 	mux.HandleFunc("GET /api/codex/chats", api.withAuth(api.indexedChats))
 	mux.HandleFunc("GET /api/codex/chats/{id}/messages", api.withAuth(api.indexedMessages))
 	mux.HandleFunc("GET /api/quotas/current", api.withAuth(api.currentQuota))
@@ -223,8 +233,8 @@ type loginRequest struct {
 }
 
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
-	if !a.logins.allow("ip:"+a.clientIP(r), 10) {
-		loginRateLimited(w)
+	if allowed, retryAfter := a.logins.allowWindow("ip:"+a.clientIP(r), 10, time.Minute); !allowed {
+		loginRateLimited(w, retryAfter)
 		return
 	}
 	var req loginRequest
@@ -233,9 +243,11 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Username = strings.TrimSpace(req.Username)
 	req.DeviceName = strings.TrimSpace(req.DeviceName)
-	if identity.ValidUsername(req.Username) && !a.logins.allow("user:"+req.Username, 5) {
-		loginRateLimited(w)
-		return
+	if identity.ValidUsername(req.Username) {
+		if allowed, retryAfter := a.logins.allowWindow("user:"+req.Username, 5, time.Minute); !allowed {
+			loginRateLimited(w, retryAfter)
+			return
+		}
 	}
 	if !identity.ValidUsername(req.Username) || !identity.ValidPassword(req.Password) || !identity.ValidName(req.DeviceName, 80) {
 		fail(w, http.StatusBadRequest, "invalid_login", "Provide a username, password and device name.")
@@ -274,8 +286,8 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) register(w http.ResponseWriter, r *http.Request) {
-	if !a.logins.allow("register:"+a.clientIP(r), 5) {
-		loginRateLimited(w)
+	if allowed, retryAfter := a.logins.allowWindow("register:"+a.clientIP(r), 5, time.Minute); !allowed {
+		loginRateLimited(w, retryAfter)
 		return
 	}
 	var req loginRequest
@@ -299,6 +311,11 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, "username_taken", "Username is already taken.")
 	case err != nil:
 		a.internal(w, r, err)
+	case user.Role == "pending" || token == "":
+		reply(w, http.StatusCreated, struct {
+			User    store.User `json:"user"`
+			Pending bool       `json:"pending"`
+		}{User: user, Pending: true})
 	default:
 		replySession(w, http.StatusCreated, user, device, token)
 	}
@@ -311,7 +328,8 @@ func replySession(w http.ResponseWriter, status int, user store.User, device sto
 	}{session{user, device}, token})
 }
 
-func loginRateLimited(w http.ResponseWriter) {
+func loginRateLimited(w http.ResponseWriter, retryAfter int) {
+	w.Header().Set("Retry-After", strconv.Itoa(max(1, retryAfter)))
 	fail(w, http.StatusTooManyRequests, "rate_limited", "Too many login attempts. Try again later.")
 }
 
@@ -386,12 +404,57 @@ func (a *API) me(w http.ResponseWriter, _ *http.Request, s session) {
 	reply(w, http.StatusOK, s)
 }
 
+func (a *API) adminGuard(next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s, err := a.authenticate(r.Context(), bearerToken(r))
+		if err != nil || s.User.Role != "admin" {
+			fail(w, http.StatusNotFound, "not_found", "Not found")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
 func (a *API) logout(w http.ResponseWriter, r *http.Request, s session) {
 	if err := a.db.DeleteDeviceByToken(r.Context(), bearerToken(r)); err != nil {
 		a.internal(w, r, err)
 		return
 	}
 	a.live.disconnectDevice(s.User.ID, s.Device.ID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) logoutAll(w http.ResponseWriter, r *http.Request, s session) {
+	var req struct {
+		IncludeCurrent bool `json:"includeCurrent"`
+	}
+	if r.ContentLength != 0 {
+		if !decode(w, r, &req) {
+			return
+		}
+	}
+	if req.IncludeCurrent {
+		if err := a.db.RevokeUserDevices(r.Context(), s.User.ID); err != nil {
+			a.internal(w, r, err)
+			return
+		}
+		a.live.disconnectUser(s.User.ID)
+	} else {
+		devices, err := a.db.UserDevices(r.Context(), s.User.ID)
+		if err != nil {
+			a.internal(w, r, err)
+			return
+		}
+		if err := a.db.RevokeOtherDevices(r.Context(), s.User.ID, s.Device.ID); err != nil {
+			a.internal(w, r, err)
+			return
+		}
+		for _, d := range devices {
+			if d.ID != s.Device.ID {
+				a.live.disconnectDevice(s.User.ID, d.ID)
+			}
+		}
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -425,8 +488,15 @@ func (a *API) deleteDevice(w http.ResponseWriter, r *http.Request, s session) {
 	}
 }
 
-func (a *API) directoryUsers(w http.ResponseWriter, r *http.Request, _ session) {
-	users, err := a.db.DirectoryUsers(r.Context())
+func (a *API) directoryUsers(w http.ResponseWriter, r *http.Request, s session) {
+	q := r.URL.Query().Get("q")
+	limit := 10
+	if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+		if parsed, err := strconv.Atoi(rawLimit); err == nil {
+			limit = parsed
+		}
+	}
+	users, err := a.db.DirectoryUsers(r.Context(), s.User.ID, q, limit)
 	if err != nil {
 		a.internal(w, r, err)
 		return

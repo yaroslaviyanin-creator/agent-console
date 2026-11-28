@@ -188,8 +188,12 @@ func TestSubscriptionQuotas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current, _, err := db.Authenticate(ctx, token); err != nil || current != user || current.Role != "pending" || current.PlanTier != "none" {
-		t.Fatalf("registered user: %+v (%v)", current, err)
+	if token != "" || device.ID != "" || user.Role != "pending" || user.PlanTier != "none" {
+		t.Fatalf("registered user must be pending without token/device: user=%+v device=%+v token=%q", user, device, token)
+	}
+	device, _, err = db.IssueDevice(ctx, user.ID, "Browser")
+	if err != nil {
+		t.Fatal(err)
 	}
 	chat, err := db.CreateChat(ctx, user.ID, "Quota", "stub", "default")
 	if err != nil {
@@ -277,8 +281,11 @@ func TestChatSharingAndFork(t *testing.T) {
 	if _, err := db.db.ExecContext(ctx, "UPDATE users SET is_active=0 WHERE id=?", inactive); err != nil {
 		t.Fatal(err)
 	}
-	if members, err := db.DirectoryUsers(ctx); err != nil || len(members) != 2 || members[0].ID != alice || members[1].ID != bob {
-		t.Fatalf("directory: %+v (%v)", members, err)
+	if members, err := db.DirectoryUsers(ctx, "", "", 0); err != nil || len(members) != 0 {
+		t.Fatalf("empty query directory must return []: %+v (%v)", members, err)
+	}
+	if members, err := db.DirectoryUsers(ctx, bob, "al", 10); err != nil || len(members) != 1 || members[0].ID != alice {
+		t.Fatalf("filtered directory: %+v (%v)", members, err)
 	}
 	source, err := db.CreateChat(ctx, alice, "Shared", "stub", "default")
 	if err != nil {

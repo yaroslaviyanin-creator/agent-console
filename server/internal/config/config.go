@@ -35,6 +35,7 @@ type Config struct {
 	MaxAttachmentsPerMessage  int
 	MaxAttachmentsPerChat     int
 	MaxAttachmentContextBytes int
+	SessionTTLHours           int
 }
 
 const (
@@ -42,7 +43,15 @@ const (
 	DefaultMaxAttachmentsPerMessage  = 10
 	DefaultMaxAttachmentsPerChat     = 20
 	DefaultMaxAttachmentContextBytes = 256 << 10
+	DefaultSessionTTLHours           = 168
 )
+
+func (c Config) EffectiveSessionTTL() time.Duration {
+	if c.SessionTTLHours <= 0 {
+		return time.Duration(DefaultSessionTTLHours) * time.Hour
+	}
+	return time.Duration(c.SessionTTLHours) * time.Hour
+}
 
 func (c Config) EffectiveMaxAttachmentBytes() int64 {
 	mb := c.MaxAttachmentMB
@@ -255,6 +264,10 @@ func Load() (Config, error) {
 	cfg.MaxAttachmentContextBytes, err = strconv.Atoi(value("MAX_ATTACHMENT_CONTEXT_BYTES", strconv.Itoa(DefaultMaxAttachmentContextBytes)))
 	if err != nil || cfg.MaxAttachmentContextBytes < 1024 {
 		return Config{}, errors.New("MAX_ATTACHMENT_CONTEXT_BYTES must be an integer >= 1024")
+	}
+	cfg.SessionTTLHours, err = strconv.Atoi(value("SESSION_TTL_HOURS", strconv.Itoa(DefaultSessionTTLHours)))
+	if err != nil || cfg.SessionTTLHours < 1 {
+		return Config{}, errors.New("SESSION_TTL_HOURS must be an integer >= 1")
 	}
 	return cfg, nil
 }

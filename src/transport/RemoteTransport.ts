@@ -79,7 +79,7 @@ export class RemoteTransport implements TransportAdapter {
   private connecting = false
   private logoutRequest?: Promise<void>
   private reconnectTimer?: ReturnType<typeof setTimeout>
-  private reconnectDelay = 500
+  private reconnectDelay = 1000
   private readonly changes = new Set<(e: Change) => void>()
   private readonly responses = new Map<string, ReadableStreamDefaultController<RunEvent>>()
   private readonly lifetime = new AbortController()
@@ -93,6 +93,21 @@ export class RemoteTransport implements TransportAdapter {
 
   constructor(address: string) {
     this.address = normalizeServerAddress(address)
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('online', () => this.reconnectNow(), { signal: this.lifetime.signal })
+    }
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') this.reconnectNow()
+      }, { signal: this.lifetime.signal })
+    }
+  }
+
+  reconnectNow() {
+    if (this.socket || this.connecting || this.logoutRequest || this.lifetime.signal.aborted) return
+    this.reconnectDelay = 1000
+    clearTimeout(this.reconnectTimer)
+    void this.connect()
   }
 
   get sessionQuota() { return this.initialQuota }
@@ -142,6 +157,7 @@ export class RemoteTransport implements TransportAdapter {
     chats: (id, signal) => this.request<AdminChat[]>('/api/admin/users/' + encodeURIComponent(id) + '/chats', undefined, signal),
     messages: (id, chatId, signal) => this.request<ServerMessage[]>('/api/admin/users/' + encodeURIComponent(id) + '/chats/' + encodeURIComponent(chatId) + '/messages', undefined, signal),
     revokeDevices: async id => { await this.request('/api/admin/users/' + encodeURIComponent(id) + '/devices', undefined, undefined, 'DELETE') },
+    delete: async id => { await this.request('/api/admin/users/' + encodeURIComponent(id), undefined, undefined, 'DELETE') },
   }
 
   getProfile() {
@@ -267,7 +283,7 @@ export class RemoteTransport implements TransportAdapter {
     return this.request<void>('/api/attachments/' + encodeURIComponent(attachmentId), undefined, undefined, 'DELETE')
   }
 
-  async fetchAttachmentBlobUrl(urlPath: string, signal?: AbortSignal): Promise<string> {
+  async fetchAttachmentBlob(urlPath: string, signal?: AbortSignal): Promise<Blob> {
     const headers = new Headers()
     if (this.token) headers.set('Authorization', 'Bearer ' + this.token)
     const response = await fetch(this.address + urlPath, {
@@ -279,7 +295,11 @@ export class RemoteTransport implements TransportAdapter {
     if (!response.ok) {
       throw new RemoteError(response.status, 'Не удалось загрузить вложение.')
     }
-    const blob = await response.blob()
+    return response.blob()
+  }
+
+  async fetchAttachmentBlobUrl(urlPath: string, signal?: AbortSignal): Promise<string> {
+    const blob = await this.fetchAttachmentBlob(urlPath, signal)
     return URL.createObjectURL(blob)
   }
 
@@ -333,8 +353,15 @@ export class RemoteTransport implements TransportAdapter {
     return (response.status === 204 ? undefined : await response.json()) as T
   }
 
-  register(request: LoginRequest) {
-    return this.authenticate(request, 'register')
+  async register(request: LoginRequest): Promise<Workspace | { pending: true; user: ServerLoginResponse['user'] }> {
+    const res = await this.request<ServerLoginResponse | { user: ServerLoginResponse['user']; pending: true }>('/api/auth/register', {
+      username: request.login, password: request.password, deviceName: request.deviceName,
+    })
+    if ('pending' in res && res.pending) {
+      return { pending: true, user: res.user }
+    }
+    const session = res as ServerLoginResponse
+    return this.openSession(session, session.token)
   }
 
   private async authenticate(request: LoginRequest, action: 'login' | 'register') {
@@ -396,12 +423,28 @@ export class RemoteTransport implements TransportAdapter {
   }
 
   private async loadChatsAndUsers() {
-    const [chats, users] = await Promise.all([
-      this.request<ServerChat[]>('/api/chats'),
-      this.request<ServerDirectoryUser[]>('/api/users'),
-    ])
-    this.chatList = chats
-    this.users = users
+    this.chatList = await this.request<ServerChat[]>('/api/chats')
+  }
+
+  searchUsers(q: string, limit = 10, signal?: AbortSignal) {
+    const trimmed = q.trim()
+    if (trimmed.length < 2) return Promise.resolve([] as ServerDirectoryUser[])
+    return this.request<ServerDirectoryUser[]>(
+      `/api/users?q=${encodeURIComponent(trimmed)}&limit=${Math.min(20, Math.max(1, limit))}`,
+      undefined,
+      signal,
+    )
+  }
+
+  logoutAllDevices(includeCurrent = false) {
+    return this.updateWorkspace(async () => {
+      await this.request('/api/auth/logout-all', { includeCurrent }, undefined, 'POST')
+      if (includeCurrent) {
+        this.close()
+        return null
+      }
+      return this.loadDevices()
+    })
   }
 
   refreshDevices() {
@@ -502,19 +545,8 @@ export class RemoteTransport implements TransportAdapter {
     return this.request<ServerModel[]>('/api/models' + query, undefined, signal)
   }
 
-  async refreshCodexIndex() {
-    try {
-      this.indexedChats = await this.request<IndexedCodexChat[]>('/api/codex/chats')
-    } catch (error) {
-      if (error instanceof RemoteError && error.status === 404) return undefined
-      throw error
-    }
-    return this.snapshot()
-  }
-
   messages(chatId: string, signal: AbortSignal) {
-    const collection = chatId.startsWith('codex-') ? '/api/codex/chats/' : '/api/chats/'
-    return this.request<ServerMessage[]>(collection + encodeURIComponent(chatId) + '/messages', undefined, signal)
+    return this.request<ServerMessage[]>('/api/chats/' + encodeURIComponent(chatId) + '/messages', undefined, signal)
   }
 
   private snapshot(): Workspace {
@@ -585,7 +617,7 @@ export class RemoteTransport implements TransportAdapter {
     socket.onopen = () => {
       clearTimeout(opening)
       if (this.socket !== socket) return
-      this.reconnectDelay = 500
+      this.reconnectDelay = 1000
       this.emit({ type: 'connection', connected: true })
     }
     socket.onmessage = ({ data }) => {
@@ -621,8 +653,10 @@ export class RemoteTransport implements TransportAdapter {
   private scheduleReconnect() {
     if (this.logoutRequest || this.lifetime.signal.aborted) return
     clearTimeout(this.reconnectTimer)
-    this.reconnectTimer = setTimeout(() => void this.connect(), this.reconnectDelay)
-    this.reconnectDelay = Math.min(this.reconnectDelay * 2, 5000)
+    const jitter = 0.85 + Math.random() * 0.3
+    const delay = Math.round(this.reconnectDelay * jitter)
+    this.reconnectTimer = setTimeout(() => void this.connect(), delay)
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, 15_000)
   }
 
   private async logout() {

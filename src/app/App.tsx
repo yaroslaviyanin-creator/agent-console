@@ -8,12 +8,16 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Hourglass, Laptop, Menu, PanelLeft, PanelRight, Paperclip, Receipt, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
-import { clearChatAttachmentError, demoPrompt, availableDevices, editAndResendPrompt, models, providerLabels, checkAccountStatus, logout, newChat, removeChatAttachment, resolveAvailableProviders, resolveModelDisplay, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, stopChat, switchChatProvider, updateChat, uploadChatFiles, useChats } from './chatStore'
+import { clearChatAttachmentError, demoPrompt, availableDevices, editAndResendPrompt, models, providerLabels, checkAccountStatus, logout, newChat, reconnectServer, removeChatAttachment, resolveAvailableProviders, resolveModelDisplay, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, stopChat, switchChatProvider, updateChat, uploadChatFiles, useChats } from './chatStore'
 import type { Chat, Turn } from './chatStore'
 import type { Provider, ServerProvider } from '../protocol/types'
 import { CHAT_ATTACHMENT_ACCEPT, MAX_CHAT_ATTACHMENTS } from './attachments'
 import { DraftAttachmentsBar, TurnAttachments } from './AttachmentViews'
 import { ChatContextPanel, collectChatAttachments, extractChatLinks, formatUsageInline, formatUsageTooltip } from './ChatContextPanel'
+import { FileViewer } from './FileViewer'
+import { ImageLightbox } from './ImageLightbox'
+import { DEFAULT_VIEWER_WIDTH_PCT, useFileViewer } from './fileViewerStore'
+import { isRenderableImageAttachment } from './attachments'
 import { clampContextWidth, DEFAULT_CONTEXT_WIDTH, readContextWidth, saveContextWidth } from './contextWidth'
 import { clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH, readSidebarWidth, saveSidebarWidth } from './sidebarWidth'
 import { AssistantMessageActions, UserMessageActions } from './MessageActions'
@@ -654,29 +658,45 @@ function Connected() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [quotasOpen, setQuotasOpen] = useState(false)
   const [contextOpen, setContextOpen] = useState(false)
-  useTelegramBack(!!panel || drawerOpen || quotasOpen || contextOpen || view === 'billing', () => {
+  const viewerFile = useFileViewer(s => s.file)
+  const lightboxFile = useFileViewer(s => s.lightboxFile)
+  const viewerWidthPct = useFileViewer(s => s.widthPct)
+  const viewerExpanded = useFileViewer(s => s.expanded)
+  const openFile = useFileViewer(s => s.openFile)
+  const closeFile = useFileViewer(s => s.closeFile)
+  const closeLightbox = useFileViewer(s => s.closeLightbox)
+  const setViewerWidthPct = useFileViewer(s => s.setWidthPct)
+  const toggleViewerExpanded = useFileViewer(s => s.toggleExpanded)
+  useEffect(() => {
+    closeFile()
+    closeLightbox()
+  }, [activeId, closeFile, closeLightbox])
+  useTelegramBack(!!panel || drawerOpen || quotasOpen || !!lightboxFile || !!viewerFile || contextOpen || view === 'billing', () => {
     if (panel) setPanel(null)
     else if (drawer.current?.open) drawer.current.close()
     else if (quotaMenu.current?.open) quotaMenu.current.open = false
+    else if (lightboxFile) closeLightbox()
+    else if (viewerFile) closeFile()
     else if (contextOpen) setContextOpen(false)
     else if (view === 'billing') setView('chat')
   })
   useEffect(() => {
-    if (!contextOpen) return
+    if (!contextOpen || viewerFile || lightboxFile) return
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setContextOpen(false)
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [contextOpen])
+  }, [contextOpen, viewerFile, lightboxFile])
   const [collapsed, setCollapsed] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(() => readSidebarWidth())
   const [resizingSidebar, setResizingSidebar] = useState(false)
   const [contextWidth, setContextWidth] = useState(() => readContextWidth())
   const [resizingContext, setResizingContext] = useState(false)
+  const [resizingViewer, setResizingViewer] = useState(false)
 
   useEffect(() => {
-    if (!resizingSidebar && !resizingContext) return
+    if (!resizingSidebar && !resizingContext && !resizingViewer) return
     const prevCursor = document.body.style.cursor
     const prevSelect = document.body.style.userSelect
     document.body.style.cursor = 'col-resize'
@@ -685,7 +705,7 @@ function Connected() {
       document.body.style.cursor = prevCursor
       document.body.style.userSelect = prevSelect
     }
-  }, [resizingSidebar, resizingContext])
+  }, [resizingSidebar, resizingContext, resizingViewer])
 
   const startSidebarResize = (e: React.PointerEvent<HTMLDivElement>) => {
     if (collapsed) return
@@ -729,6 +749,23 @@ function Connected() {
     window.addEventListener('pointerup', onUp)
   }
 
+  const startViewerResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!viewerFile) return
+    e.preventDefault()
+    setResizingViewer(true)
+    const onMove = (ev: PointerEvent) => {
+      const vw = Math.max(window.innerWidth, 1)
+      setViewerWidthPct(((vw - ev.clientX) / vw) * 100)
+    }
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      setResizingViewer(false)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }
+
   useEffect(() => {
     if (remote) return
     const unsubscribe = transport.subscribeAccount(useAccountStore.getState().receive)
@@ -750,7 +787,7 @@ function Connected() {
   }
 
   return <div
-    className={'workspace ' + (collapsed ? 'collapsed' : '') + (resizingSidebar || resizingContext ? ' is-resizing' : '')}
+    className={'workspace ' + (collapsed ? 'collapsed' : '') + (resizingSidebar || resizingContext || resizingViewer ? ' is-resizing' : '')}
     style={{ '--sidebar-width': `${sidebarWidth}px` } as React.CSSProperties}
   >
     <aside className="desktop-side"><Sidebar openBilling={() => setView('billing')} openSettings={() => setPanel('devices')} openShare={openShareDialog} close={() => setView('chat')}/></aside>
@@ -816,7 +853,12 @@ function Connected() {
           </div>
         </div>
       </header>
-      {connectionError && <p className="notice connection-error" role="alert">{connectionError}</p>}
+      {connectionError && (
+        <p className="notice connection-error" role="alert">
+          <span>{connectionError}</span>
+          <button type="button" className="text-action" onClick={reconnectServer}>Повторить</button>
+        </p>
+      )}
       {!remote && incoming && <Incoming key={incoming.requestId} request={incoming}/>}
       {view === 'billing' ? <Billing back={() => setView('chat')}/> : chat ? <Conversation
         key={chat.id}
@@ -827,50 +869,88 @@ function Connected() {
       {panel && panel !== 'admin' && <WorkspaceDialog kind={panel} w={w} chatId={panel === 'share' ? (shareChatId ?? activeId) : activeId} close={() => { setPanel(null); setShareChatId(null) }}/>}
     </main>
     {view === 'chat' && chat && (
-      <>
-        <div
-          className={`context-backdrop${contextOpen ? ' is-open' : ''}`}
-          onClick={() => setContextOpen(false)}
-          aria-hidden="true"
-        />
-        {contextOpen && (
+      viewerFile ? (
+        <>
           <div
-            className="context-resizer"
+            className="context-resizer fv-resizer"
             role="separator"
             aria-orientation="vertical"
-            aria-label="Изменить ширину контекстной панели"
-            aria-valuemin={240}
-            aria-valuemax={460}
-            aria-valuenow={contextWidth}
-            onPointerDown={startContextResize}
-            onDoubleClick={() => { setContextWidth(DEFAULT_CONTEXT_WIDTH); saveContextWidth(DEFAULT_CONTEXT_WIDTH) }}
+            aria-label="Изменить ширину просмотрщика файла"
+            aria-valuemin={25}
+            aria-valuemax={65}
+            aria-valuenow={Math.round(viewerExpanded ? 65 : viewerWidthPct)}
+            onPointerDown={startViewerResize}
+            onDoubleClick={() => setViewerWidthPct(DEFAULT_VIEWER_WIDTH_PCT)}
           />
-        )}
-        <aside
-          className={`chat-context-side${contextOpen ? ' is-open' : ''}${resizingContext ? ' is-resizing' : ''}`}
-          aria-label="Контекстная панель чата"
-          aria-hidden={!contextOpen}
-          style={{ '--context-width': `${contextWidth}px` } as React.CSSProperties}
-        >
-          <ChatContextPanel
-            turns={chat.turns}
-            defaultProviderId={chat.provider ?? defaultServerProvider ?? remote?.provider ?? 'stub'}
-            providerLabel={(() => {
-              const p = chat.provider ?? defaultServerProvider ?? remote?.provider ?? 'stub'
-              return p === 'stub' ? 'StubProvider' : (providerLabels[p] ?? p)
-            })()}
-            modelLabel={(() => {
-              const p = chat.provider ?? defaultServerProvider ?? remote?.provider ?? 'stub'
-              return resolveModelDisplay(p, chat.model, useChats.getState().serverModelsByProvider).modelLabel
-            })()}
-            serverModelsByProvider={useChats.getState().serverModelsByProvider}
-            remote={remote}
-            canAttach={!!remote && editableChat && !chat.indexedCodex}
-            onAttachClick={() => document.querySelector<HTMLInputElement>('.composer input[type="file"]')?.click()}
-            onClose={() => setContextOpen(false)}
+          <aside
+            className={`file-viewer-side is-open${resizingViewer ? ' is-resizing' : ''}`}
+            aria-label={`Просмотр файла ${viewerFile.name}`}
+            style={{ '--viewer-width': `${viewerExpanded ? 65 : viewerWidthPct}vw` } as React.CSSProperties}
+          >
+            <FileViewer
+              file={viewerFile}
+              remote={remote}
+              expanded={viewerExpanded}
+              onToggleExpand={toggleViewerExpanded}
+              onClose={closeFile}
+            />
+          </aside>
+        </>
+      ) : (
+        <>
+          <div
+            className={`context-backdrop${contextOpen ? ' is-open' : ''}`}
+            onClick={() => setContextOpen(false)}
+            aria-hidden="true"
           />
-        </aside>
-      </>
+          {contextOpen && (
+            <div
+              className="context-resizer"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Изменить ширину контекстной панели"
+              aria-valuemin={240}
+              aria-valuemax={460}
+              aria-valuenow={contextWidth}
+              onPointerDown={startContextResize}
+              onDoubleClick={() => { setContextWidth(DEFAULT_CONTEXT_WIDTH); saveContextWidth(DEFAULT_CONTEXT_WIDTH) }}
+            />
+          )}
+          <aside
+            className={`chat-context-side${contextOpen ? ' is-open' : ''}${resizingContext ? ' is-resizing' : ''}`}
+            aria-label="Контекстная панель чата"
+            aria-hidden={!contextOpen}
+            style={{ '--context-width': `${contextWidth}px` } as React.CSSProperties}
+          >
+            <ChatContextPanel
+              turns={chat.turns}
+              defaultProviderId={chat.provider ?? defaultServerProvider ?? remote?.provider ?? 'stub'}
+              providerLabel={(() => {
+                const p = chat.provider ?? defaultServerProvider ?? remote?.provider ?? 'stub'
+                return p === 'stub' ? 'StubProvider' : (providerLabels[p] ?? p)
+              })()}
+              modelLabel={(() => {
+                const p = chat.provider ?? defaultServerProvider ?? remote?.provider ?? 'stub'
+                return resolveModelDisplay(p, chat.model, useChats.getState().serverModelsByProvider).modelLabel
+              })()}
+              serverModelsByProvider={useChats.getState().serverModelsByProvider}
+              remote={remote}
+              canAttach={!!remote && editableChat && !chat.indexedCodex}
+              onAttachClick={() => document.querySelector<HTMLInputElement>('.composer input[type="file"]')?.click()}
+              onClose={() => setContextOpen(false)}
+            />
+          </aside>
+        </>
+      )
+    )}
+    {view === 'chat' && chat && lightboxFile && (
+      <ImageLightbox
+        file={lightboxFile}
+        images={collectChatAttachments(chat.turns).filter(att => isRenderableImageAttachment(att) && !!att.url)}
+        remote={remote}
+        onSelect={openFile}
+        onClose={closeLightbox}
+      />
     )}
   </div>
 }
