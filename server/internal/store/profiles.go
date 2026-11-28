@@ -37,6 +37,9 @@ func readUserProfile(db rowQuerier, ctx context.Context, query string, args ...a
 	var uiRaw string
 	err := db.QueryRowContext(ctx, query, args...).Scan(&p.DisplayName, &p.AvatarData, &p.ProfileMD, &p.MemoryMD, &p.MemoryEnabled, &p.MemoryUpdatedAt, &uiRaw)
 	if err == nil {
+		if strings.TrimSpace(p.MemoryMD) == "[]" {
+			p.MemoryMD = ""
+		}
 		trimmed := strings.TrimSpace(uiRaw)
 		if trimmed == "" || !json.Valid([]byte(trimmed)) {
 			p.UISettings = json.RawMessage("{}")

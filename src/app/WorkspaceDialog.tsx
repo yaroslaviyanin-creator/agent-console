@@ -484,13 +484,14 @@ function ProfileSection({ w, remote }: { w: Workspace; remote: RemoteTransport |
               rows={4}
               maxLength={4000}
               disabled={saving}
-              value={profile.memoryMd}
+              value={profile.memoryMd.trim() === '[]' ? '' : profile.memoryMd}
+              placeholder="Пока нет сохранённых фактов"
               aria-label="Что ассистент помнит о вас"
               onChange={e => edit('memoryMd', e.target.value)}
             />
             <div className="memory-actions">
               {saved && saved.memoryUpdatedAt > 0 && <small>Обновлено {deviceActivityFormat.format(saved.memoryUpdatedAt)}</small>}
-              <button type="button" className="text-action" disabled={saving || !profile.memoryMd} onClick={() => edit('memoryMd', '')}>
+              <button type="button" className="text-action" disabled={saving || !profile.memoryMd || profile.memoryMd.trim() === '[]'} onClick={() => edit('memoryMd', '')}>
                 Очистить память
               </button>
             </div>
