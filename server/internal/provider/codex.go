@@ -209,8 +209,18 @@ func cliEnvironment() []string {
 	return env
 }
 
+type codexUsage struct {
+	InputTokens         int64 `json:"input_tokens"`
+	CachedInputTokens   int64 `json:"cached_input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	ReasoningTokens     int64 `json:"reasoning_tokens"`
+	OutputTokensDetails *struct {
+		ReasoningTokens int64 `json:"reasoning_tokens"`
+	} `json:"output_tokens_details"`
+}
+
 type codexLine struct {
-	Usage     *Usage `json:"usage"`
+	Usage     *codexUsage `json:"usage"`
 	Type      string `json:"type"`
 	ThreadID  string `json:"thread_id"`
 	SessionID string `json:"session_id"`
@@ -269,7 +279,16 @@ func parseJSONL(input io.Reader, emit func(Event) bool) (Event, error) {
 		case "turn.completed":
 			completed = true
 			if line.Usage != nil {
-				usage = line.Usage
+				reasoningTokens := line.Usage.ReasoningTokens
+				if line.Usage.OutputTokensDetails != nil && line.Usage.OutputTokensDetails.ReasoningTokens > reasoningTokens {
+					reasoningTokens = line.Usage.OutputTokensDetails.ReasoningTokens
+				}
+				usage = &Usage{
+					InputTokens:       line.Usage.InputTokens,
+					CachedInputTokens: line.Usage.CachedInputTokens,
+					OutputTokens:      line.Usage.OutputTokens,
+					ReasoningTokens:   reasoningTokens,
+				}
 			}
 		case "turn.failed", "error":
 			return Event{Type: Error, Err: errors.New("Codex reported a failed turn")}, nil

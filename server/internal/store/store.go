@@ -69,6 +69,8 @@ type MessageUsage struct {
 	InputTokens       int64 `json:"inputTokens"`
 	CachedInputTokens int64 `json:"cachedInputTokens"`
 	OutputTokens      int64 `json:"outputTokens"`
+	ReasoningTokens   int64 `json:"reasoningTokens"`
+	TotalTokens       int64 `json:"totalTokens"`
 }
 
 type Message struct {
@@ -176,7 +178,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version == 18 {
+	if version == 19 {
 		return nil
 	}
 	// SQLite requires disabling foreign keys outside the transaction on this connection.
@@ -193,7 +195,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	switch version {
 	case 0:
-		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=18;"); err != nil {
+		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=19;"); err != nil {
 			return err
 		}
 	case 1:
@@ -490,7 +492,21 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=18;`); err != nil {
 			return err
 		}
+		fallthrough
 	case 18:
+		var reasonExists bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_events') WHERE name='reasoning_tokens')").Scan(&reasonExists); err != nil {
+			return err
+		}
+		if !reasonExists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE usage_events ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0;`); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=19;`); err != nil {
+			return err
+		}
+	case 19:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}
@@ -761,7 +777,7 @@ func (s *Store) ForkChat(ctx context.Context, userID, sourceChatID string) (Chat
 func (s *Store) messages(ctx context.Context, userID, chatID string, includeShared bool) ([]Message, error) {
 	// A LEFT JOIN distinguishes an accessible empty chat from an inaccessible chat.
 	rows, err := s.db.QueryContext(ctx, `SELECT CASE WHEN m.role='assistant' THEN COALESCE(m.run_id,m.id) ELSE m.id END, m.role,m.content,m.thinking,m.created_at,m.run_id,m.duration_ms,
-		u.provider,u.model,u.input_tokens,u.cached_input_tokens,u.output_tokens
+		u.provider,u.model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.reasoning_tokens
 		FROM chats c LEFT JOIN chat_messages m ON m.chat_id=c.id
 		LEFT JOIN usage_events u ON u.chat_id=m.chat_id AND u.run_id=m.run_id AND m.role='assistant'
 		WHERE c.id=?1 AND (c.user_id=?2 OR (?3 AND EXISTS(
@@ -776,9 +792,9 @@ func (s *Store) messages(ctx context.Context, userID, chatID string, includeShar
 	for rows.Next() {
 		found = true
 		var id, role, content, thinking, runID, uProvider, uModel sql.NullString
-		var createdAt, uIn, uCached, uOut sql.NullInt64
+		var createdAt, uIn, uCached, uOut, uReason sql.NullInt64
 		var durationMs *int64
-		if err := rows.Scan(&id, &role, &content, &thinking, &createdAt, &runID, &durationMs, &uProvider, &uModel, &uIn, &uCached, &uOut); err != nil {
+		if err := rows.Scan(&id, &role, &content, &thinking, &createdAt, &runID, &durationMs, &uProvider, &uModel, &uIn, &uCached, &uOut, &uReason); err != nil {
 			return nil, err
 		}
 		if id.Valid {
@@ -787,11 +803,13 @@ func (s *Store) messages(ctx context.Context, userID, chatID string, includeShar
 				Content: content.String, Thinking: thinking.String, CreatedAt: createdAt.Int64, DurationMs: durationMs,
 				Provider: uProvider.String, Model: uModel.String,
 			}
-			if uIn.Valid || uCached.Valid || uOut.Valid {
+			if uIn.Valid || uCached.Valid || uOut.Valid || uReason.Valid {
 				msg.Usage = &MessageUsage{
 					InputTokens:       uIn.Int64,
 					CachedInputTokens: uCached.Int64,
 					OutputTokens:      uOut.Int64,
+					ReasoningTokens:   uReason.Int64,
+					TotalTokens:       uIn.Int64 + uOut.Int64,
 				}
 			}
 			messages = append(messages, msg)

@@ -97,6 +97,7 @@ func TestParseAgyJSONL_Success(t *testing.T) {
 		InputTokens:       1200,
 		CachedInputTokens: 500,
 		OutputTokens:      35,
+		ReasoningTokens:   10,
 	}
 	if *terminal.Usage != expectedUsage {
 		t.Fatalf("usage mismatch:\nexpected: %+v\ngot:      %+v", expectedUsage, *terminal.Usage)

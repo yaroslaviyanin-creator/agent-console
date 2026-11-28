@@ -70,7 +70,7 @@ func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 		t.Fatalf("auth after reopening DB failed: %v", err)
 	}
 	var version int
-	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 18 {
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 19 {
 		t.Fatalf("schema version %d: %v", version, err)
 	}
 	if currentDevice.LastSeenAt != device.LastSeenAt {
@@ -846,8 +846,8 @@ func TestStoreMigrateV16ToV17Attachments(t *testing.T) {
 	defer reopened.Close()
 
 	var version int
-	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 18 {
-		t.Fatalf("expected user_version=18, got %d (err=%v)", version, err)
+	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 19 {
+		t.Fatalf("expected user_version=19, got %d (err=%v)", version, err)
 	}
 	owner, err := reopened.CreateUserWithRole(ctx, "u1", []byte("h"), "user")
 	if err != nil {
@@ -863,5 +863,110 @@ func TestStoreMigrateV16ToV17Attachments(t *testing.T) {
 	})
 	if err != nil || att.Warning != "warn" {
 		t.Fatalf("CreateAttachment after v17 migration failed: %+v err=%v", att, err)
+	}
+}
+
+func TestPerMessageUsageAndLegacyCompatibility(t *testing.T) {
+	ctx := t.Context()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	u, err := db.CreateUserWithRole(ctx, "alice", []byte("hash"), "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev, _, err := db.IssueDevice(ctx, u.ID, "mac")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat, err := db.CreateChat(ctx, u.ID, "Multi usage", "codex", "GPT-6.2-Sol")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Turn 1: Codex GPT-6.2-Sol with reasoning tokens
+	if _, _, err := db.BeginRunForDeviceWithAttachments(ctx, u.ID, dev.ID, chat.ID, "r1", "p1", "codex", "GPT-6.2-Sol", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishRunWithProvider(ctx, u.ID, chat.ID, "r1", "codex", "GPT-6.2-Sol", "a1", "", "s1", 1200, &provider.Usage{
+		InputTokens: 1000, CachedInputTokens: 200, OutputTokens: 150, ReasoningTokens: 50,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Turn 2: Switch to Claude without reasoning tokens
+	if _, _, err := db.BeginRunForDeviceWithAttachments(ctx, u.ID, dev.ID, chat.ID, "r2", "p2", "claude", "claude-sonnet", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishRunWithProvider(ctx, u.ID, chat.ID, "r2", "claude", "claude-sonnet", "a2", "", "s2", 800, &provider.Usage{
+		InputTokens: 500, CachedInputTokens: 100, OutputTokens: 80,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Legacy assistant message without usage_events row
+	if _, err := db.db.ExecContext(ctx, `INSERT INTO chat_messages (id,chat_id,role,content,thinking,created_at,run_id) VALUES ('legacy-a',?,'assistant','old','',9999999999999,'legacy-run')`, chat.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := db.Messages(ctx, u.ID, chat.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 5 {
+		t.Fatalf("expected 5 messages, got %d", len(msgs))
+	}
+	m1, m2, mLegacy := msgs[1], msgs[3], msgs[4]
+	if m1.Provider != "codex" || m1.Model != "GPT-6.2-Sol" || m1.Usage == nil || m1.Usage.ReasoningTokens != 50 || m1.Usage.TotalTokens != 1150 {
+		t.Fatalf("unexpected m1: %+v", m1)
+	}
+	if m2.Provider != "claude" || m2.Model != "claude-sonnet" || m2.Usage == nil || m2.Usage.ReasoningTokens != 0 || m2.Usage.TotalTokens != 580 {
+		t.Fatalf("unexpected m2: %+v", m2)
+	}
+	if mLegacy.Usage != nil {
+		t.Fatalf("expected legacy message without usage_events to have nil Usage, got %+v", mLegacy.Usage)
+	}
+}
+
+func TestMigrateV18ToV19AddsReasoningTokensAndReadsLegacyMessages(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "v18.db")
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash BLOB NOT NULL, role TEXT NOT NULL DEFAULT 'user', is_active INTEGER NOT NULL DEFAULT 1, plan_tier TEXT NOT NULL DEFAULT 'none', bypass_5h_limit INTEGER NOT NULL DEFAULT 0, subscription_until INTEGER NOT NULL DEFAULT 0, display_name TEXT NOT NULL DEFAULT '', avatar_data TEXT NOT NULL DEFAULT '', profile_md TEXT NOT NULL DEFAULT '', memory_md TEXT NOT NULL DEFAULT '', memory_enabled INTEGER NOT NULL DEFAULT 1, memory_updated_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+		CREATE TABLE devices (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, last_seen_at INTEGER NOT NULL, created_at INTEGER NOT NULL);
+		CREATE TABLE chats (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'codex', session_provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL, provider_session_id TEXT, pinned INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+		CREATE TABLE chat_messages (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, run_id TEXT, duration_ms INTEGER, run_user_id TEXT, memory_private INTEGER NOT NULL DEFAULT 1);
+		CREATE TABLE chat_shares (chat_id TEXT NOT NULL, user_id TEXT NOT NULL, access TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (chat_id, user_id));
+		CREATE TABLE usage_events (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, chat_id TEXT NOT NULL, run_id TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cost_cents INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, UNIQUE (chat_id, run_id));
+		CREATE TABLE chat_attachments (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, message_id TEXT, user_id TEXT NOT NULL, original_name TEXT NOT NULL, mime_type TEXT NOT NULL, kind TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, storage_key TEXT NOT NULL UNIQUE, extracted_text TEXT, warning TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
+		INSERT INTO users (id,username,password_hash,role,created_at) VALUES ('u1','demo',X'00','admin',1);
+		INSERT INTO chats (id,user_id,title,provider,model,created_at,updated_at) VALUES ('c1','u1','Old Chat','codex','gpt-5',1,1);
+		INSERT INTO chat_messages (id,chat_id,role,content,created_at,run_id) VALUES ('m1','c1','user','hi',1,'r1'),('m2','c1','assistant','hello',2,'r1');
+		INSERT INTO usage_events (id,user_id,chat_id,run_id,provider,model,input_tokens,cached_input_tokens,output_tokens,cost_cents,created_at) VALUES ('ue1','u1','c1','r1','codex','gpt-5',100,20,30,1,2);
+		PRAGMA user_version=18;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.Close()
+
+	db, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open v18 db failed: %v", err)
+	}
+	defer db.Close()
+
+	msgs, err := db.Messages(ctx, "u1", "c1")
+	if err != nil {
+		t.Fatalf("Messages after v18->v19 migration failed: %v", err)
+	}
+	if len(msgs) != 2 || msgs[1].Usage == nil || msgs[1].Usage.InputTokens != 100 || msgs[1].Usage.ReasoningTokens != 0 {
+		t.Fatalf("unexpected migrated messages: %+v", msgs)
 	}
 }

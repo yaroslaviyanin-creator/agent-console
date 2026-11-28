@@ -13,7 +13,7 @@ import type { Chat, Turn } from './chatStore'
 import type { Provider, ServerProvider, ServerProviderInfo } from '../protocol/types'
 import { CHAT_ATTACHMENT_ACCEPT, MAX_CHAT_ATTACHMENTS } from './attachments'
 import { DraftAttachmentsBar, TurnAttachments } from './AttachmentViews'
-import { ChatContextPanel, collectChatAttachments, extractChatLinks } from './ChatContextPanel'
+import { ChatContextPanel, collectChatAttachments, extractChatLinks, formatUsageInline, formatUsageTooltip } from './ChatContextPanel'
 import { clampContextWidth, DEFAULT_CONTEXT_WIDTH, readContextWidth, saveContextWidth } from './contextWidth'
 import { clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH, readSidebarWidth, saveSidebarWidth } from './sidebarWidth'
 import { AssistantMessageActions, UserMessageActions } from './MessageActions'
@@ -151,7 +151,14 @@ function Transcript({
       {turn.progress ? <details className="response-progress">
         <summary>{progressLabel(turn.durationMs)}<ChevronRight size={14}/></summary>
         <div className="response-progress-body"><RichText text={turn.progress}/></div>
-      </details> : turn.durationMs != null && <span className="response-duration">{progressLabel(turn.durationMs)}</span>}
+      </details> : (turn.durationMs != null || turn.usage) && (
+        <span className="response-duration" title={turn.usage ? formatUsageTooltip(turn.usage) : undefined}>
+          {[turn.durationMs != null ? progressLabel(turn.durationMs) : '', turn.usage ? formatUsageInline(turn.usage) : ''].filter(Boolean).join(' · ')}
+        </span>
+      )}
+      {turn.progress && turn.usage && (
+        <span className="response-duration" title={formatUsageTooltip(turn.usage)}>{formatUsageInline(turn.usage)}</span>
+      )}
       {turn.parts.map((p, i) => p.kind === 'tool' ? <ToolCard key={p.callId} chatId={chatId} turn={turn} entry={p}/> : p.kind === 'thinking'
       ? <details className="thinking" key={i}><summary><Brain size={14}/><span>Рассуждения</span><ChevronRight size={13}/></summary><p>{p.text}</p></details>
       : <RichText text={p.text} key={i}/>)}

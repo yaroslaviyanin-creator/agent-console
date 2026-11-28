@@ -258,6 +258,7 @@ func mapWireEvent(wireEvent runnerwire.Event) (event Event, terminal bool, ok bo
 			InputTokens:       wireEvent.Usage.InputTokens,
 			CachedInputTokens: wireEvent.Usage.CachedInputTokens,
 			OutputTokens:      wireEvent.Usage.OutputTokens,
+			ReasoningTokens:   wireEvent.Usage.ReasoningTokens,
 		}
 		usage = &u
 	}

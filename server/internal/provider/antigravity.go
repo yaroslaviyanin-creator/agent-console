@@ -218,11 +218,16 @@ type agyEvent struct {
 }
 
 type agyUsage struct {
-	InputTokens     int64 `json:"input_tokens"`
-	OutputTokens    int64 `json:"output_tokens"`
-	ThinkingTokens  int64 `json:"thinking_tokens"`
-	CacheReadTokens int64 `json:"cache_read_tokens"`
-	TotalTokens     int64 `json:"total_tokens"`
+	InputTokens         int64 `json:"input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	ThinkingTokens      int64 `json:"thinking_tokens"`
+	ReasoningTokens     int64 `json:"reasoning_tokens"`
+	ThoughtsTokenCount  int64 `json:"thoughtsTokenCount"`
+	CacheReadTokens     int64 `json:"cache_read_tokens"`
+	TotalTokens         int64 `json:"total_tokens"`
+	OutputTokensDetails *struct {
+		ReasoningTokens int64 `json:"reasoning_tokens"`
+	} `json:"output_tokens_details"`
 }
 
 func parseAgyJSONL(input io.Reader, emit func(Event) bool) (Event, error) {
@@ -290,10 +295,15 @@ func parseAgyJSONL(input io.Reader, emit func(Event) bool) (Event, error) {
 				if res.Status == "SUCCESS" {
 					completed = true
 					if res.Usage != nil {
+						reasoningTokens := max(res.Usage.ThinkingTokens, res.Usage.ReasoningTokens, res.Usage.ThoughtsTokenCount)
+						if res.Usage.OutputTokensDetails != nil && res.Usage.OutputTokensDetails.ReasoningTokens > reasoningTokens {
+							reasoningTokens = res.Usage.OutputTokensDetails.ReasoningTokens
+						}
 						usage = &Usage{
 							InputTokens:       res.Usage.InputTokens,
 							CachedInputTokens: res.Usage.CacheReadTokens,
 							OutputTokens:      res.Usage.OutputTokens,
+							ReasoningTokens:   reasoningTokens,
 						}
 					}
 					if !hasText && res.Response != "" {

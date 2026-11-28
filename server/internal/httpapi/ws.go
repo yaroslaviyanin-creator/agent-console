@@ -650,6 +650,8 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 						InputTokens:       event.Usage.InputTokens,
 						CachedInputTokens: event.Usage.CachedInputTokens,
 						OutputTokens:      event.Usage.OutputTokens,
+						ReasoningTokens:   event.Usage.ReasoningTokens,
+						TotalTokens:       event.Usage.InputTokens + event.Usage.OutputTokens,
 					}
 				}
 			case provider.Error:

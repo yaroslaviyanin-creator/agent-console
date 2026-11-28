@@ -45,6 +45,7 @@ type Usage struct {
 	InputTokens       int64 `json:"input_tokens"`
 	CachedInputTokens int64 `json:"cached_input_tokens"`
 	OutputTokens      int64 `json:"output_tokens"`
+	ReasoningTokens   int64 `json:"reasoning_tokens,omitempty"`
 }
 
 type Event struct {

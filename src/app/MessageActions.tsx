@@ -297,15 +297,29 @@ export function AssistantMessageActions({
               <div className="msg-info-row"><span>Длительность</span><strong>{(turn.durationMs / 1000).toFixed(1)} с</strong></div>
             )}
             {turn.usage && (
-              <div className="msg-info-row">
-                <span>Токены</span>
-                <strong>
-                  {turn.usage.inputTokens} in
-                  {turn.usage.cachedInputTokens > 0 ? ` (${turn.usage.cachedInputTokens} cache)` : ''}
-                  {' / '}
-                  {turn.usage.outputTokens} out
-                </strong>
-              </div>
+              <>
+                <div className="msg-info-row">
+                  <span>Вход</span>
+                  <strong>
+                    {turn.usage.inputTokens.toLocaleString('ru-RU')}
+                    {turn.usage.cachedInputTokens > 0 ? ` (кэш: ${turn.usage.cachedInputTokens.toLocaleString('ru-RU')})` : ''}
+                  </strong>
+                </div>
+                <div className="msg-info-row">
+                  <span>Выход</span>
+                  <strong>{turn.usage.outputTokens.toLocaleString('ru-RU')}</strong>
+                </div>
+                {(turn.usage.reasoningTokens ?? 0) > 0 && (
+                  <div className="msg-info-row">
+                    <span>Обдумывание</span>
+                    <strong>{(turn.usage.reasoningTokens ?? 0).toLocaleString('ru-RU')}</strong>
+                  </div>
+                )}
+                <div className="msg-info-row">
+                  <span>Итого</span>
+                  <strong>{(turn.usage.totalTokens ?? (turn.usage.inputTokens + turn.usage.outputTokens)).toLocaleString('ru-RU')}</strong>
+                </div>
+              </>
             )}
           </div>
         )}

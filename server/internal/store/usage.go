@@ -43,6 +43,7 @@ func priceUsage(usage *provider.Usage, model, prompt, text, thinking string) (pr
 			InputTokens:       max(0, usage.InputTokens),
 			CachedInputTokens: max(0, usage.CachedInputTokens),
 			OutputTokens:      max(0, usage.OutputTokens),
+			ReasoningTokens:   max(0, usage.ReasoningTokens),
 		}
 	}
 	if counts == (provider.Usage{}) {

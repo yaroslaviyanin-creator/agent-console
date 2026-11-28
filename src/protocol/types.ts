@@ -196,6 +196,8 @@ export interface MessageUsage {
   inputTokens: number
   cachedInputTokens: number
   outputTokens: number
+  reasoningTokens?: number
+  totalTokens?: number
 }
 export interface AdminChat extends ServerChat { messagesCount: number }
 export interface IndexedCodexChat extends ServerChat { archived: boolean }

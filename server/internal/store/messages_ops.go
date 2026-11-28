@@ -162,6 +162,7 @@ func (s *Store) ForkChatUpTo(ctx context.Context, userID, sourceChatID, upToMess
 	rows.Close()
 
 	idMap := make(map[string]string, len(msgs))
+	copiedRuns := make(map[string]bool)
 	for _, m := range msgs {
 		newMsgID := randomHex(16)
 		idMap[m.oldID] = newMsgID
@@ -169,6 +170,16 @@ func (s *Store) ForkChatUpTo(ctx context.Context, userID, sourceChatID, upToMess
 			VALUES (?,?,?,?,?,?,?,?,'')`,
 			newMsgID, c.ID, m.role, m.content, m.thinking, m.createdAt, m.runID, m.durationMs); err != nil {
 			return Chat{}, err
+		}
+		if m.role == "assistant" && m.runID.Valid && m.runID.String != "" && !copiedRuns[m.runID.String] {
+			copiedRuns[m.runID.String] = true
+			if _, err := tx.ExecContext(ctx, `INSERT INTO usage_events
+				(id,user_id,chat_id,run_id,provider,model,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,cost_cents,created_at)
+				SELECT ?,?, ?,run_id,provider,model,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,0,created_at
+				FROM usage_events WHERE chat_id=? AND run_id=?`,
+				randomHex(16), userID, c.ID, sourceChatID, m.runID.String); err != nil {
+				return Chat{}, err
+			}
 		}
 	}
 

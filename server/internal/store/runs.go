@@ -271,9 +271,9 @@ func (s *Store) FinishRunWithProvider(ctx context.Context, userID, chatID, messa
 	counts, cents := priceUsage(usage, model, prompt, text, thinking)
 	now := time.Now().UnixMilli()
 	if _, err := tx.ExecContext(ctx, `INSERT INTO usage_events
-		(id,user_id,chat_id,run_id,provider,model,input_tokens,cached_input_tokens,output_tokens,cost_cents,created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?)`, randomHex(16), userID, chatID, messageID, backend, model,
-		counts.InputTokens, counts.CachedInputTokens, counts.OutputTokens, cents, now); err != nil {
+		(id,user_id,chat_id,run_id,provider,model,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,cost_cents,created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, randomHex(16), userID, chatID, messageID, backend, model,
+		counts.InputTokens, counts.CachedInputTokens, counts.OutputTokens, counts.ReasoningTokens, cents, now); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages (id,chat_id,role,content,thinking,created_at,run_id,duration_ms,memory_private)

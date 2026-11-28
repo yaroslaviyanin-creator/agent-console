@@ -1,12 +1,51 @@
 import { useEffect, useState } from 'react'
 import { Download, ExternalLink, FileArchive, FileCode, FileText, Image as ImageIcon, Link2, Paperclip, Plus, Sparkles, X } from 'lucide-react'
-import type { MessageAttachment } from '../protocol/types'
+import type { MessageAttachment, MessageUsage } from '../protocol/types'
 import type { RemoteTransport } from '../transport/RemoteTransport'
 import type { Turn } from './chatStore'
 import { formatAttachmentSize, isRenderableImageAttachment } from './attachments'
 
 const URL_RE = /https?:\/\/[^\s<>"'`]+/g
 const TRAILING_PUNCT_RE = /[.,;:!?)\]>]+$/
+
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  antigravity: 'Antigravity',
+  codex: 'Codex',
+  claude: 'Claude',
+  paid_api: 'Paid API',
+  stub: 'StubProvider',
+}
+
+export function formatCompactTokens(value: number): string {
+  const n = Math.max(0, Math.round(value))
+  if (n < 1000) return String(n)
+  if (n < 100_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}K`
+  if (n < 1_000_000) return `${Math.round(n / 1000)}K`
+  return `${(n / 1_000_000).toFixed(2).replace(/\.?0+$/, '')}M`
+}
+
+export function formatUsageTooltip(usage: MessageUsage): string {
+  const lines: string[] = []
+  const cachePart = usage.cachedInputTokens > 0
+    ? ` (кэш: ${usage.cachedInputTokens.toLocaleString('ru-RU')})`
+    : ''
+  lines.push(`Вход: ${usage.inputTokens.toLocaleString('ru-RU')}${cachePart}`)
+  lines.push(`Выход: ${usage.outputTokens.toLocaleString('ru-RU')}`)
+  if ((usage.reasoningTokens ?? 0) > 0) {
+    lines.push(`Обдумывание: ${(usage.reasoningTokens ?? 0).toLocaleString('ru-RU')}`)
+  }
+  const total = usage.totalTokens ?? (usage.inputTokens + usage.outputTokens)
+  lines.push(`Итого: ${total.toLocaleString('ru-RU')}`)
+  return lines.join(' · ')
+}
+
+export function formatUsageInline(usage: MessageUsage): string {
+  const base = `↑ ${formatCompactTokens(usage.inputTokens)} · ↓ ${formatCompactTokens(usage.outputTokens)} ток.`
+  if ((usage.reasoningTokens ?? 0) > 0) {
+    return `${base} · мысли ${formatCompactTokens(usage.reasoningTokens ?? 0)}`
+  }
+  return base
+}
 
 export function collectChatAttachments(turns: Turn[]): MessageAttachment[] {
   const out: MessageAttachment[] = []
@@ -50,12 +89,39 @@ export function extractChatLinks(turns: Turn[]): string[] {
   return out
 }
 
+export interface ModelUsageSummary {
+  modelId: string
+  modelLabel: string
+  count: number
+  inputTokens: number
+  cachedInputTokens: number
+  outputTokens: number
+  reasoningTokens: number
+}
+
+export interface ProviderUsageSummary {
+  providerId: string
+  providerLabel: string
+  count: number
+  inputTokens: number
+  cachedInputTokens: number
+  outputTokens: number
+  reasoningTokens: number
+  models: ModelUsageSummary[]
+}
+
 export interface ChatContextSummary {
   providerLabel: string
   modelLabel: string
   turnsCount: number
   messagesCount: number
+  hasDetailedUsage: boolean
+  inputTokens: number
+  cachedInputTokens: number
+  outputTokens: number
+  reasoningTokens: number
   totalTokens?: number
+  byProvider: ProviderUsageSummary[]
 }
 
 export function summarizeChatContext(
@@ -64,23 +130,117 @@ export function summarizeChatContext(
   modelLabel: string,
 ): ChatContextSummary {
   let messagesCount = 0
+  let inputTokens = 0
+  let cachedInputTokens = 0
+  let outputTokens = 0
+  let reasoningTokens = 0
   let totalTokens = 0
   let hasUsage = false
+  let hasDetailedUsage = false
+
+  const providerMap = new Map<string, {
+    providerId: string
+    providerLabel: string
+    count: number
+    inputTokens: number
+    cachedInputTokens: number
+    outputTokens: number
+    reasoningTokens: number
+    models: Map<string, ModelUsageSummary>
+  }>()
+
   for (const turn of turns) {
     if (turn.prompt || (turn.attachments?.length ?? 0) > 0) messagesCount += 1
-    if (turn.parts.length > 0 || turn.state === 'completed' || turn.state === 'stopped') messagesCount += 1
-    const maybeUsage = (turn as Turn & { usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number } }).usage
-    if (maybeUsage) {
+    const hasAssistant = turn.parts.length > 0 || turn.state === 'completed' || turn.state === 'stopped'
+    if (hasAssistant) messagesCount += 1
+
+    const u = turn.usage
+    if (u) {
       hasUsage = true
-      totalTokens += maybeUsage.totalTokens ?? ((maybeUsage.inputTokens ?? 0) + (maybeUsage.outputTokens ?? 0))
+      const inTok = u.inputTokens ?? 0
+      const cachedTok = u.cachedInputTokens ?? 0
+      const outTok = u.outputTokens ?? 0
+      const reasonTok = u.reasoningTokens ?? 0
+      if (inTok > 0 || outTok > 0 || cachedTok > 0 || reasonTok > 0) {
+        hasDetailedUsage = true
+      }
+      inputTokens += inTok
+      cachedInputTokens += cachedTok
+      outputTokens += outTok
+      reasoningTokens += reasonTok
+      totalTokens += u.totalTokens ?? (inTok + outTok)
+    }
+
+    if (hasAssistant) {
+      const pid = turn.provider ?? 'unknown'
+      const pLabel = turn.provider ? (PROVIDER_DISPLAY_NAMES[turn.provider] ?? turn.provider) : providerLabel
+      const mid = (turn.modelId && turn.modelId !== 'default' ? turn.modelId : turn.model) || modelLabel
+      const mLabel = (turn.model && turn.model !== 'default' ? turn.model : mid) || modelLabel
+
+      let pEntry = providerMap.get(pid)
+      if (!pEntry) {
+        pEntry = {
+          providerId: pid,
+          providerLabel: pLabel,
+          count: 0,
+          inputTokens: 0,
+          cachedInputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          models: new Map(),
+        }
+        providerMap.set(pid, pEntry)
+      }
+      pEntry.count += 1
+      pEntry.inputTokens += u?.inputTokens ?? 0
+      pEntry.cachedInputTokens += u?.cachedInputTokens ?? 0
+      pEntry.outputTokens += u?.outputTokens ?? 0
+      pEntry.reasoningTokens += u?.reasoningTokens ?? 0
+
+      let mEntry = pEntry.models.get(mid)
+      if (!mEntry) {
+        mEntry = {
+          modelId: mid,
+          modelLabel: mLabel,
+          count: 0,
+          inputTokens: 0,
+          cachedInputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+        }
+        pEntry.models.set(mid, mEntry)
+      }
+      mEntry.count += 1
+      mEntry.inputTokens += u?.inputTokens ?? 0
+      mEntry.cachedInputTokens += u?.cachedInputTokens ?? 0
+      mEntry.outputTokens += u?.outputTokens ?? 0
+      mEntry.reasoningTokens += u?.reasoningTokens ?? 0
     }
   }
+
+  const byProvider: ProviderUsageSummary[] = Array.from(providerMap.values()).map(p => ({
+    providerId: p.providerId,
+    providerLabel: p.providerLabel,
+    count: p.count,
+    inputTokens: p.inputTokens,
+    cachedInputTokens: p.cachedInputTokens,
+    outputTokens: p.outputTokens,
+    reasoningTokens: p.reasoningTokens,
+    models: Array.from(p.models.values()),
+  }))
+
   return {
     providerLabel,
     modelLabel,
     turnsCount: turns.length,
     messagesCount,
+    hasDetailedUsage,
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningTokens,
     ...(hasUsage ? { totalTokens } : {}),
+    byProvider,
   }
 }
 
@@ -166,6 +326,7 @@ export function ChatContextPanel({
   const attachments = collectChatAttachments(turns)
   const links = extractChatLinks(turns)
   const summary = summarizeChatContext(turns, providerLabel, modelLabel)
+  const showBreakdown = summary.byProvider.length >= 2 || (summary.byProvider[0]?.models.length ?? 0) >= 2
 
   return (
     <div className="context-panel-inner">
@@ -238,10 +399,68 @@ export function ChatContextPanel({
           <div><dt>Провайдер</dt><dd>{summary.providerLabel}</dd></div>
           <div><dt>Модель</dt><dd>{summary.modelLabel}</dd></div>
           <div><dt>Сообщений</dt><dd>{summary.messagesCount}</dd></div>
-          {summary.totalTokens != null && (
-            <div><dt>Токены</dt><dd>{summary.totalTokens.toLocaleString('ru-RU')}</dd></div>
-          )}
+          {summary.hasDetailedUsage ? (
+            <>
+              <div>
+                <dt>Вход</dt>
+                <dd title={summary.cachedInputTokens > 0
+                  ? `Вход: ${summary.inputTokens.toLocaleString('ru-RU')} (включая кэш: ${summary.cachedInputTokens.toLocaleString('ru-RU')})`
+                  : `Вход: ${summary.inputTokens.toLocaleString('ru-RU')}`}
+                >
+                  ↑ {formatCompactTokens(summary.inputTokens)}
+                  {summary.cachedInputTokens > 0 && (
+                    <small className="context-token-sub"> кэш {formatCompactTokens(summary.cachedInputTokens)}</small>
+                  )}
+                </dd>
+              </div>
+              <div>
+                <dt>Выход</dt>
+                <dd title={`Выход: ${summary.outputTokens.toLocaleString('ru-RU')}`}>
+                  ↓ {formatCompactTokens(summary.outputTokens)}
+                </dd>
+              </div>
+              {summary.reasoningTokens > 0 && (
+                <div>
+                  <dt>Обдумывание</dt>
+                  <dd title={`Обдумывание: ${summary.reasoningTokens.toLocaleString('ru-RU')}`}>
+                    {formatCompactTokens(summary.reasoningTokens)}
+                  </dd>
+                </div>
+              )}
+            </>
+          ) : summary.totalTokens != null ? (
+            <div><dt>Итого</dt><dd>{summary.totalTokens.toLocaleString('ru-RU')}</dd></div>
+          ) : null}
         </dl>
+
+        {showBreakdown && (
+          <div className="context-usage-breakdown">
+            <h4>По провайдерам и моделям</h4>
+            <ul className="context-provider-list">
+              {summary.byProvider.map(p => (
+                <li key={p.providerId} className="context-provider-item">
+                  <div className="context-provider-head">
+                    <strong>{p.providerLabel}</strong>
+                    <span className="context-provider-stats">
+                      {p.count} отв. · ↑ {formatCompactTokens(p.inputTokens)} / ↓ {formatCompactTokens(p.outputTokens)}
+                    </span>
+                  </div>
+                  <ul className="context-model-list">
+                    {p.models.map(m => (
+                      <li key={m.modelId} className="context-model-item">
+                        <span className="context-model-name" title={m.modelLabel}>{m.modelLabel}</span>
+                        <span className="context-model-stats">
+                          {m.count} · ↑ {formatCompactTokens(m.inputTokens)} / ↓ {formatCompactTokens(m.outputTokens)}
+                          {m.reasoningTokens > 0 ? ` · мысли ${formatCompactTokens(m.reasoningTokens)}` : ''}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </section>
     </div>
   )

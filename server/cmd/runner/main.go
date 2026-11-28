@@ -564,6 +564,7 @@ func (s *runnerServer) handleStream(w http.ResponseWriter, r *http.Request) {
 						InputTokens:       ev.Usage.InputTokens,
 						CachedInputTokens: ev.Usage.CachedInputTokens,
 						OutputTokens:      ev.Usage.OutputTokens,
+						ReasoningTokens:   ev.Usage.ReasoningTokens,
 					}
 				}
 				if _, err := writeNDJSONEvent(w, rc, runnerwire.Event{
