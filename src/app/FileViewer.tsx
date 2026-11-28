@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle, Check, ChevronDown, ChevronLeft, ChevronUp, Copy, Download,
-  FileArchive, FileCode, FileText, Image as ImageIcon, Maximize2, Minimize2,
+  FileArchive, FileCode, FileSpreadsheet, FileText, Image as ImageIcon, Maximize2, Minimize2,
   Paperclip, RotateCw, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import hljs from 'highlight.js/lib/core'
@@ -21,6 +21,7 @@ import plaintext from 'highlight.js/lib/languages/plaintext'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import mammoth from 'mammoth'
+import readXlsxFile from 'read-excel-file/browser'
 import type { MessageAttachment } from '../protocol/types'
 import type { RemoteTransport } from '../transport/RemoteTransport'
 import { formatAttachmentSize } from './attachments'
@@ -43,6 +44,7 @@ function fileIcon(att: Pick<MessageAttachment, 'kind' | 'name'>) {
   const ext = getFileExtension(att.name)
   if (att.kind === 'archive' || ext === '.zip') return FileArchive
   if (att.kind === 'image' && ext !== '.svg') return ImageIcon
+  if (ext === '.xlsx' || ext === '.csv' || ext === '.tsv') return FileSpreadsheet
   if (att.kind === 'pdf' || att.kind === 'document' || ext === '.pdf' || ext === '.docx') return FileText
   if (att.kind === 'text' || ext) return FileCode
   return Paperclip
@@ -374,6 +376,8 @@ export function FileViewer({
   const [textContent, setTextContent] = useState('')
   const [bufferContent, setBufferContent] = useState<ArrayBuffer | null>(null)
   const [docxHtml, setDocxHtml] = useState('')
+  const [xlsxSheets, setXlsxSheets] = useState<Array<{ name: string; rows: string[][] }>>([])
+  const [activeSheetIdx, setActiveSheetIdx] = useState(0)
   const [imageUrl, setImageUrl] = useState('')
   const [viewTab, setViewTab] = useState<'preview' | 'source'>('preview')
   const [copied, setCopied] = useState(false)
@@ -405,6 +409,8 @@ export function FileViewer({
     setTextContent('')
     setBufferContent(null)
     setDocxHtml('')
+    setXlsxSheets([])
+    setActiveSheetIdx(0)
     setImageUrl('')
 
     if (mode === 'binary') {
@@ -443,6 +449,20 @@ export function FileViewer({
         const buf = await blob.arrayBuffer()
         const result = await mammoth.convertToHtml({ arrayBuffer: buf })
         if (!controller.signal.aborted) setDocxHtml(sanitizeDocxHtml(result.value))
+      } else if (mode === 'xlsx') {
+        const sheets = await readXlsxFile(blob)
+        const formatted = sheets.map((s, idx) => ({
+          name: s.sheet || `Лист ${idx + 1}`,
+          rows: s.data.map(row => row.map(cell => {
+            if (cell == null) return ''
+            if (cell instanceof Date) return cell.toLocaleDateString('ru-RU')
+            return String(cell)
+          })),
+        }))
+        if (!controller.signal.aborted) {
+          setXlsxSheets(formatted)
+          setActiveSheetIdx(0)
+        }
       } else {
         const txt = await blob.text()
         if (!controller.signal.aborted) setTextContent(txt)
@@ -608,6 +628,54 @@ export function FileViewer({
           <PdfCanvasViewer buffer={bufferContent} />
         ) : mode === 'docx' ? (
           <DocxSheetViewer html={docxHtml} />
+        ) : mode === 'xlsx' ? (
+          <div className="fv-doc-shell">
+            {xlsxSheets.length > 1 && (
+              <div className="fv-xlsx-sheets" role="tablist" aria-label="Листы таблицы">
+                {xlsxSheets.map((s, idx) => (
+                  <button
+                    key={`${s.name}-${idx}`}
+                    type="button"
+                    role="tab"
+                    aria-selected={idx === activeSheetIdx}
+                    className={`fv-xlsx-sheet-tab${idx === activeSheetIdx ? ' is-active' : ''}`}
+                    onClick={() => setActiveSheetIdx(idx)}
+                  >
+                    {s.name}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="fv-table-scroll">
+              {(() => {
+                const rows = xlsxSheets[activeSheetIdx]?.rows ?? []
+                if (rows.length === 0) {
+                  return <div className="fv-state-card"><p>Лист пуст</p></div>
+                }
+                const maxCols = Math.max(...rows.map(r => r.length), 0)
+                return (
+                  <table className="fv-table">
+                    <thead>
+                      <tr>
+                        {Array.from({ length: maxCols }, (_, cIdx) => (
+                          <th key={cIdx}>{rows[0]?.[cIdx] ?? ''}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rows.slice(1).map((row, rIdx) => (
+                        <tr key={rIdx}>
+                          {Array.from({ length: maxCols }, (_, cIdx) => (
+                            <td key={cIdx}>{row[cIdx] ?? ''}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )
+              })()}
+            </div>
+          </div>
         ) : mode === 'image' && imageUrl ? (
           <ImageStageViewer src={imageUrl} name={file.name} />
         ) : mode === 'markdown' ? (

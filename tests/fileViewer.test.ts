@@ -13,7 +13,7 @@ test('getFileViewerMode maps extensions/MIME and forces .html/.htm/.svg/.xml str
   assert.equal(getFileViewerMode({ name: 'photo.jpg', kind: 'image', mimeType: 'image/jpeg' }), 'image')
   assert.equal(getFileViewerMode({ name: 'screen.png', kind: 'image', mimeType: 'image/png' }), 'image')
   assert.equal(getFileViewerMode({ name: 'archive.zip', kind: 'archive' }), 'binary')
-  assert.equal(getFileViewerMode({ name: 'sheet.xlsx', kind: 'document' }), 'binary')
+  assert.equal(getFileViewerMode({ name: 'sheet.xlsx', kind: 'document' }), 'xlsx')
 
   // Security invariant: HTML/SVG/XML must NEVER resolve to image or HTML rendering.
   assert.equal(getFileViewerMode({ name: 'payload.html', kind: 'text', mimeType: 'text/html' }), 'code')

@@ -20,6 +20,7 @@ import (
 	"agent-console/server/internal/identity"
 	"agent-console/server/internal/provider"
 	"agent-console/server/internal/store"
+	"agent-console/server/internal/webfetch"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -34,6 +35,7 @@ type API struct {
 	index           indexedHistory
 	logins          *rateLimiter
 	uploads         *rateLimiter
+	webfetcher      *webfetch.Fetcher
 }
 
 type session struct {
@@ -98,8 +100,9 @@ func newRegistryHandler(ctx context.Context, db *store.Store, cfg config.Config,
 	}
 	api := &API{db: db, config: cfg, logger: logger, defaultProvider: cfg.DefaultProvider, memoryProvider: memoryID,
 		live:    newLiveRunsWithProviders(ctx, cfg.DefaultProvider, registry, max(1, cfg.MaxConcurrentStreams)),
-		logins:  newRateLimiter(),
-		uploads: newRateLimiter()}
+		logins:     newRateLimiter(),
+		uploads:    newRateLimiter(),
+		webfetcher: webfetch.NewFetcher()}
 	api.live.db = db
 	api.live.logger = logger
 	if db != nil {
@@ -145,6 +148,11 @@ func newRegistryHandler(ctx context.Context, db *store.Store, cfg config.Config,
 	mux.HandleFunc("POST /api/chats", api.withAuth(api.createChat))
 	mux.HandleFunc("PATCH /api/chats/{id}", api.withAuth(api.patchChat))
 	mux.HandleFunc("DELETE /api/chats/{id}", api.withAuth(api.deleteChat))
+	mux.HandleFunc("GET /api/folders", api.withAuth(api.listFolders))
+	mux.HandleFunc("POST /api/folders", api.withAuth(api.createFolder))
+	mux.HandleFunc("PATCH /api/folders/{id}", api.withAuth(api.patchFolder))
+	mux.HandleFunc("DELETE /api/folders/{id}", api.withAuth(api.deleteFolder))
+	mux.HandleFunc("GET /api/search", api.withAuth(api.searchMessages))
 	mux.HandleFunc("POST /api/chats/{id}/attachments", api.withAuth(api.uploadAttachments))
 	mux.HandleFunc("GET /api/attachments/{id}", api.withAuth(api.getAttachment))
 	mux.HandleFunc("DELETE /api/attachments/{id}", api.withAuth(api.deleteAttachment))
@@ -566,14 +574,16 @@ func (a *API) forkChat(w http.ResponseWriter, r *http.Request, s session) {
 
 func (a *API) patchChat(w http.ResponseWriter, r *http.Request, s session) {
 	var req struct {
-		Title  *string `json:"title"`
-		Pinned *bool   `json:"pinned"`
+		Title    *string          `json:"title"`
+		Pinned   *bool            `json:"pinned"`
+		FolderID *json.RawMessage `json:"folderId"`
+		Archived *bool            `json:"archived"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
-	if req.Title == nil && req.Pinned == nil {
-		fail(w, http.StatusBadRequest, "invalid_chat", "Provide title or pinned.")
+	if req.Title == nil && req.Pinned == nil && req.FolderID == nil && req.Archived == nil {
+		fail(w, http.StatusBadRequest, "invalid_chat", "Provide title, pinned, folderId, or archived.")
 		return
 	}
 	if req.Title != nil {
@@ -584,7 +594,30 @@ func (a *API) patchChat(w http.ResponseWriter, r *http.Request, s session) {
 		}
 		req.Title = &trimmed
 	}
-	chat, err := a.db.UpdateChat(r.Context(), s.User.ID, r.PathValue("id"), req.Title, req.Pinned)
+	var (
+		folderSet bool
+		folderVal *string
+	)
+	if req.FolderID != nil {
+		folderSet = true
+		raw := strings.TrimSpace(string(*req.FolderID))
+		if raw != "" && raw != "null" {
+			var parsed string
+			if err := json.Unmarshal(*req.FolderID, &parsed); err != nil {
+				fail(w, http.StatusBadRequest, "invalid_chat", "Invalid folderId.")
+				return
+			}
+			parsed = strings.TrimSpace(parsed)
+			if parsed != "" {
+				if !correlationID.MatchString(parsed) {
+					fail(w, http.StatusBadRequest, "invalid_chat", "Invalid folderId.")
+					return
+				}
+				folderVal = &parsed
+			}
+		}
+	}
+	chat, err := a.db.UpdateChatWithOptions(r.Context(), s.User.ID, r.PathValue("id"), req.Title, req.Pinned, folderSet, folderVal, req.Archived)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		fail(w, http.StatusNotFound, "chat_not_found", "Chat not found.")

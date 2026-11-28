@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"agent-console/server/internal/artifacts"
 	"agent-console/server/internal/store"
 	"agent-console/server/internal/uploads"
 )
@@ -83,7 +84,7 @@ func (a *API) userInstructions(ctx context.Context, userID string, shared bool) 
 		}
 	}
 	if shared {
-		return "Текущий собеседник: " + name, nil
+		return "Текущий собеседник: " + name + "\n\n" + artifacts.ArtifactSystemPrompt, nil
 	}
 
 	var instructions strings.Builder
@@ -95,5 +96,6 @@ func (a *API) userInstructions(ctx context.Context, userID string, shared bool) 
 	if profile.MemoryEnabled && profile.MemoryMD != "" {
 		instructions.WriteString("\n\n## Память из прошлых чатов\n" + profile.MemoryMD)
 	}
+	instructions.WriteString("\n\n" + artifacts.ArtifactSystemPrompt)
 	return instructions.String(), nil
 }

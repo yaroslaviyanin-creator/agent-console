@@ -27,6 +27,15 @@ CREATE TABLE IF NOT EXISTS devices (
     expires_at INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS chat_folders (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    color TEXT NOT NULL DEFAULT '#6366f1',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS chats (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -36,6 +45,8 @@ CREATE TABLE IF NOT EXISTS chats (
     model TEXT NOT NULL,
     provider_session_id TEXT,
     pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    folder_id TEXT NULL,
+    archived_at INTEGER NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -50,7 +61,8 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     run_id TEXT,
     duration_ms INTEGER,
     run_user_id TEXT,
-    memory_private INTEGER NOT NULL DEFAULT 1 CHECK (memory_private IN (0, 1))
+    memory_private INTEGER NOT NULL DEFAULT 1 CHECK (memory_private IN (0, 1)),
+    web_sources_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS chat_shares (
@@ -90,10 +102,12 @@ CREATE TABLE IF NOT EXISTS chat_attachments (
     storage_key TEXT NOT NULL UNIQUE,
     extracted_text TEXT,
     warning TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'assistant')),
     created_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS devices_by_user ON devices (user_id);
+CREATE INDEX IF NOT EXISTS chat_folders_by_user ON chat_folders (user_id, sort_order, created_at);
 CREATE INDEX IF NOT EXISTS chats_by_user ON chats (user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS messages_by_chat ON chat_messages (chat_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS chat_message_runs ON chat_messages (chat_id, role, run_id);

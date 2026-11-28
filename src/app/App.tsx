@@ -5,14 +5,14 @@ import { Incoming, LimitActions, Quotas, ServerQuotas } from './Quotas'
 import { AuthScene } from './AuthScene'
 import { WorkspaceDialog } from './WorkspaceDialog'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Hourglass, Laptop, Menu, PanelLeft, PanelRight, Paperclip, Receipt, Square, Terminal } from 'lucide-react'
+import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Globe, Hourglass, Laptop, Menu, PanelLeft, PanelRight, Paperclip, Receipt, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
-import { clearChatAttachmentError, demoPrompt, availableDevices, editAndResendPrompt, models, providerLabels, checkAccountStatus, logout, newChat, reconnectServer, removeChatAttachment, resolveAvailableProviders, resolveModelDisplay, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, stopChat, switchChatProvider, updateChat, uploadChatFiles, useChats } from './chatStore'
+import { clearChatAttachmentError, clearSearchJump, demoPrompt, availableDevices, downloadChatMarkdown, editAndResendPrompt, models, providerLabels, checkAccountStatus, logout, newChat, reconnectServer, removeChatAttachment, resolveAvailableProviders, resolveModelDisplay, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, stopChat, switchChatProvider, updateChat, uploadChatFiles, useChats } from './chatStore'
 import type { Chat, Turn } from './chatStore'
 import type { Provider, ServerProvider } from '../protocol/types'
 import { CHAT_ATTACHMENT_ACCEPT, MAX_CHAT_ATTACHMENTS } from './attachments'
-import { DraftAttachmentsBar, TurnAttachments } from './AttachmentViews'
+import { AssistantArtifacts, DraftAttachmentsBar, TurnAttachments } from './AttachmentViews'
 import { ChatContextPanel, collectChatAttachments, extractChatLinks, formatUsageInline, formatUsageTooltip } from './ChatContextPanel'
 import { FileViewer } from './FileViewer'
 import { ImageLightbox } from './ImageLightbox'
@@ -26,6 +26,7 @@ import { EnvironmentPopover, ModelPopover } from './ComposerPopovers'
 import type { ProviderOption } from './ProviderSelect'
 import { defaultReasoningForProvider, groupServerModels } from './modelCatalog'
 import { Sidebar } from './Sidebar'
+import { SearchPalette } from './SearchPalette'
 import { ToolCard } from './ToolCard'
 import { RichText } from './Markdown'
 import { AdminDialog } from './AdminDialog'
@@ -42,6 +43,39 @@ const mcpExamples = [
 ] as const
 
 const clock = new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit' })
+const streamingConsoleFileDoneRe = /<console_file\s+name\s*=\s*(?:"([^"]*)"|'([^']*)')\s*>[\s\S]*?<\/console_file\s*>/gi
+const streamingConsoleFileOpenRe = /<console_file\s+name\s*=\s*(?:"([^"]*)"|'([^']*)')\s*>[\s\S]*$/i
+
+function formatStreamingDisplayText(text: string, running: boolean): string {
+  if (!running || !text.toLowerCase().includes('<console_file')) return text
+  const replaced = text.replace(streamingConsoleFileDoneRe, (_, d1, d2) => {
+    const name = (d1 || d2 || 'файл').trim()
+    return `\n\n> *Файл \`${name}\` подготовлен…*\n\n`
+  })
+  return replaced.replace(streamingConsoleFileOpenRe, (_, d1, d2) => {
+    const name = (d1 || d2 || 'файл').trim()
+    return `\n\n> *Генерация файла \`${name}\`…*`
+  })
+}
+
+function webSourceLabel(url: string, title?: string): string {
+  if (title && title.trim()) return title.trim()
+  try {
+    return new URL(url).hostname
+  } catch {
+    return url
+  }
+}
+
+function webSourceStatusMeta(status: 'ok' | 'blocked' | 'js_required' | 'error'): { label: string; cls: string } {
+  switch (status) {
+    case 'ok': return { label: 'OK', cls: 'is-ok' }
+    case 'blocked': return { label: 'Закрыто', cls: 'is-blocked' }
+    case 'js_required': return { label: 'Нужен JS', cls: 'is-warn' }
+    default: return { label: 'Ошибка', cls: 'is-err' }
+  }
+}
+
 function progressLabel(durationMs?: number) {
   if (durationMs == null) return 'Ход работы'
   if (durationMs < 1000) return 'Выполнено меньше чем за секунду'
@@ -62,6 +96,7 @@ function Transcript({
   retry,
   demo,
   isLast,
+  highlighted,
 }: {
   turn: Turn
   chatId: string
@@ -71,6 +106,7 @@ function Transcript({
   retry: (modelId: string) => void
   demo: boolean
   isLast: boolean
+  highlighted?: boolean
 }) {
   const w = useChats(s => s.workspace)!
   const remote = useChats(s => s.remote)
@@ -90,7 +126,7 @@ function Transcript({
     void editAndResendPrompt(chatId, turn.id, trimmed)
   }
 
-  return <article className="turn">
+  return <article className={'turn' + (highlighted ? ' is-search-highlight' : '')} data-turn-id={turn.id} data-user-msg-id={turn.userMessageId ?? ''}>
     {(hasPrompt || !!turn.attachments?.length) && (
       <div className={'user-turn-block' + (isSelf ? ' is-self' : '')}>
         <div className="person user-person">
@@ -101,6 +137,27 @@ function Transcript({
         {!!turn.attachments?.length && (
           <div className="user-turn-attachments">
             <TurnAttachments attachments={turn.attachments} remote={remote} />
+          </div>
+        )}
+        {!!turn.webSources?.length && (
+          <div className="web-source-chips" aria-label="Загруженные веб-страницы">
+            {turn.webSources.map((ws, idx) => {
+              const meta = webSourceStatusMeta(ws.status)
+              return (
+                <a
+                  key={`${ws.url}-${idx}`}
+                  href={ws.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className={`web-source-chip ${meta.cls}`}
+                  title={ws.detail ? `${ws.url} (${ws.detail})` : ws.url}
+                >
+                  <Globe size={12} aria-hidden="true" />
+                  <span className="web-source-title">{webSourceLabel(ws.url, ws.title)}</span>
+                  <span className={`web-source-status ${meta.cls}`}>{meta.label}</span>
+                </a>
+              )
+            })}
           </div>
         )}
         {editingPrompt ? (
@@ -163,7 +220,10 @@ function Transcript({
       )}
       {turn.parts.map((p, i) => p.kind === 'tool' ? <ToolCard key={p.callId} chatId={chatId} turn={turn} entry={p}/> : p.kind === 'thinking'
       ? <details className="thinking" key={i}><summary><Brain size={14}/><span>Рассуждения</span><ChevronRight size={13}/></summary><p>{p.text}</p></details>
-      : <RichText text={p.text} key={i}/>)}
+      : <RichText text={formatStreamingDisplayText(p.text, turn.state === 'running')} key={i}/>)}
+      {!!turn.assistantAttachments?.length && (
+        <AssistantArtifacts attachments={turn.assistantAttachments} remote={remote} />
+      )}
       {turn.parts.length === 0 && turn.state === 'running' && <span role="status" className="waiting"><i aria-hidden="true"/>Агент подключается…</span>}
       {(turn.notice || turn.state === 'stopped') && <p role="status" className="notice">{turn.notice ?? 'Ответ остановлен.'}</p>}
       <AssistantMessageActions
@@ -219,6 +279,8 @@ function Conversation({
   const dragDepthRef = useRef(0)
   const [draggingFiles, setDraggingFiles] = useState(false)
   const [openMenu, setOpenMenu] = useState<'model' | 'env' | null>(null)
+  const [highlightedTurnId, setHighlightedTurnId] = useState<string | null>(null)
+  const pendingSearchJump = useChats(s => s.pendingSearchJump)
   const running = chat.turns.at(-1)?.state === 'running'
   const editable = chat.access === 'owner' || chat.access === 'write'
   const locked = running || !editable
@@ -230,8 +292,35 @@ function Conversation({
   const pending = running && last?.parts.some(p => p.kind === 'tool' && p.permission && !p.result && !p.decision)
   useLayoutEffect(() => {
     const box = scroll.current
-    if (box && follow.current) box.scrollTop = box.scrollHeight
-  }, [chat.turns])
+    if (box && follow.current && (!pendingSearchJump || pendingSearchJump.chatId !== chat.id)) {
+      box.scrollTop = box.scrollHeight
+    }
+  }, [chat.turns, pendingSearchJump, chat.id])
+
+  useEffect(() => {
+    if (!pendingSearchJump || pendingSearchJump.chatId !== chat.id) return
+    if (remote && !chat.historyLoaded) return
+    const targetTurn = chat.turns.find(t =>
+      t.id === pendingSearchJump.messageId || t.userMessageId === pendingSearchJump.messageId,
+    )
+    if (!targetTurn) {
+      clearSearchJump()
+      return
+    }
+    follow.current = false
+    setHighlightedTurnId(targetTurn.id)
+    const raf = window.requestAnimationFrame(() => {
+      const container = scroll.current
+      const el = container?.querySelector<HTMLElement>(`[data-turn-id="${CSS.escape(targetTurn.id)}"]`)
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    })
+    clearSearchJump()
+    const timer = window.setTimeout(() => setHighlightedTurnId(curr => (curr === targetTurn.id ? null : curr)), 2000)
+    return () => {
+      window.cancelAnimationFrame(raf)
+      window.clearTimeout(timer)
+    }
+  }, [pendingSearchJump, chat.id, chat.historyLoaded, chat.turns, remote])
   useLayoutEffect(() => {
     const el = input.current
     if (!el) return
@@ -406,6 +495,7 @@ function Conversation({
           busy={running}
           demo={!remote}
           isLast={idx === chat.turns.length - 1}
+          highlighted={highlightedTurnId === turn.id}
           retry={modelId => {
             follow.current = true
             void retryAnswer(chat.id, turn.id, modelId)
@@ -658,6 +748,7 @@ function Connected() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [quotasOpen, setQuotasOpen] = useState(false)
   const [contextOpen, setContextOpen] = useState(false)
+  const [searchOpen, setSearchOpen] = useState(false)
   const viewerFile = useFileViewer(s => s.file)
   const lightboxFile = useFileViewer(s => s.lightboxFile)
   const viewerWidthPct = useFileViewer(s => s.widthPct)
@@ -671,8 +762,9 @@ function Connected() {
     closeFile()
     closeLightbox()
   }, [activeId, closeFile, closeLightbox])
-  useTelegramBack(!!panel || drawerOpen || quotasOpen || !!lightboxFile || !!viewerFile || contextOpen || view === 'billing', () => {
-    if (panel) setPanel(null)
+  useTelegramBack(searchOpen || !!panel || drawerOpen || quotasOpen || !!lightboxFile || !!viewerFile || contextOpen || view === 'billing', () => {
+    if (searchOpen) setSearchOpen(false)
+    else if (panel) setPanel(null)
     else if (drawer.current?.open) drawer.current.close()
     else if (quotaMenu.current?.open) quotaMenu.current.open = false
     else if (lightboxFile) closeLightbox()
@@ -680,6 +772,16 @@ function Connected() {
     else if (contextOpen) setContextOpen(false)
     else if (view === 'billing') setView('chat')
   })
+  useEffect(() => {
+    const onGlobalKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        setSearchOpen(v => !v)
+      }
+    }
+    window.addEventListener('keydown', onGlobalKeyDown)
+    return () => window.removeEventListener('keydown', onGlobalKeyDown)
+  }, [])
   useEffect(() => {
     if (!contextOpen || viewerFile || lightboxFile) return
     const onKeyDown = (e: KeyboardEvent) => {
@@ -790,7 +892,7 @@ function Connected() {
     className={'workspace ' + (collapsed ? 'collapsed' : '') + (resizingSidebar || resizingContext || resizingViewer ? ' is-resizing' : '')}
     style={{ '--sidebar-width': `${sidebarWidth}px` } as React.CSSProperties}
   >
-    <aside className="desktop-side"><Sidebar openBilling={() => setView('billing')} openSettings={() => setPanel('devices')} openShare={openShareDialog} close={() => setView('chat')}/></aside>
+    <aside className="desktop-side"><Sidebar openBilling={() => setView('billing')} openSettings={() => setPanel('devices')} openShare={openShareDialog} openSearch={() => setSearchOpen(true)} close={() => setView('chat')}/></aside>
     {!collapsed && (
       <div
         className="sidebar-resizer"
@@ -804,7 +906,7 @@ function Connected() {
         onDoubleClick={() => { setSidebarWidth(DEFAULT_SIDEBAR_WIDTH); saveSidebarWidth(DEFAULT_SIDEBAR_WIDTH) }}
       />
     )}
-    <dialog ref={drawer} onClose={() => setDrawerOpen(false)} className="drawer" aria-label="Список чатов" onClick={e => { if (e.target === drawer.current) drawer.current.close() }}><Sidebar openBilling={() => { drawer.current?.close(); setView('billing') }} openSettings={() => { drawer.current?.close(); setPanel('devices') }} openAdmin={isAdmin ? () => { drawer.current?.close(); setPanel('admin') } : undefined} openShare={id => { drawer.current?.close(); openShareDialog(id) }} close={() => { drawer.current?.close(); setView('chat') }}/></dialog>
+    <dialog ref={drawer} onClose={() => setDrawerOpen(false)} className="drawer" aria-label="Список чатов" onClick={e => { if (e.target === drawer.current) drawer.current.close() }}><Sidebar openBilling={() => { drawer.current?.close(); setView('billing') }} openSettings={() => { drawer.current?.close(); setPanel('devices') }} openAdmin={isAdmin ? () => { drawer.current?.close(); setPanel('admin') } : undefined} openShare={id => { drawer.current?.close(); openShareDialog(id) }} openSearch={() => { drawer.current?.close(); setSearchOpen(true) }} close={() => { drawer.current?.close(); setView('chat') }}/></dialog>
     <main className="main">
       <header className="chat-heading unified-header" data-tauri-drag-region>
         <div className="heading-inner">
@@ -937,6 +1039,7 @@ function Connected() {
               remote={remote}
               canAttach={!!remote && editableChat && !chat.indexedCodex}
               onAttachClick={() => document.querySelector<HTMLInputElement>('.composer input[type="file"]')?.click()}
+              onExportMarkdown={() => downloadChatMarkdown(chat)}
               onClose={() => setContextOpen(false)}
             />
           </aside>
@@ -952,5 +1055,13 @@ function Connected() {
         onClose={closeLightbox}
       />
     )}
+    <SearchPalette
+      open={searchOpen}
+      onClose={() => setSearchOpen(false)}
+      onAfterSelect={() => {
+        setView('chat')
+        drawer.current?.close()
+      }}
+    />
   </div>
 }

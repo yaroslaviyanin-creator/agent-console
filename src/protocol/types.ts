@@ -29,14 +29,22 @@ export type ToolCall =
 
 export type PermissionDecision = 'allow' | 'allow_folder' | 'deny'
 
+export interface WebSource {
+  url: string
+  title?: string
+  status: 'ok' | 'blocked' | 'js_required' | 'error'
+  detail?: string
+}
+
 type RunPayload =
   | { type: 'started'; prompt: string; attachments?: MessageAttachment[]; model: string; createdAt: number }
+  | { type: 'web_sources'; webSources: WebSource[] }
   | { type: 'thinking_delta' | 'text_delta'; delta: string }
   | { type: 'tool_use'; callId: string; tool: ToolCall }
   | { type: 'permission_request'; requestId: string; callId: string; folder: string; deviceId: string; tool: ToolCall }
   | { type: 'tool_result'; callId: string; status: 'ok' | 'denied' | 'error'; output: string }
   | { type: 'refusal_detected'; reason: string }
-  | { type: 'done'; reason: 'completed' | 'refused' | 'denied'; durationMs?: number; provider?: ServerProvider; model?: string; usage?: MessageUsage }
+  | { type: 'done'; reason: 'completed' | 'refused' | 'denied'; durationMs?: number; provider?: ServerProvider; model?: string; usage?: MessageUsage; attachments?: MessageAttachment[]; cleanText?: string }
   | { type: 'error'; code: string; message: string; retryable: boolean }
 
 export type RunEvent = RunPayload & { chatId: string; messageId: string; seq: number }
@@ -98,6 +106,24 @@ export interface ChatAccess {
   grants: Grant[] // Only owners receive the recipient list.
   trustedDeviceId?: string
   pinned?: boolean
+  folderId?: string | null
+  archivedAt?: number | null
+}
+export interface ChatFolder {
+  id: string
+  userId?: string
+  name: string
+  color: string
+  sortOrder: number
+  createdAt: number
+}
+export interface SearchResult {
+  chatId: string
+  messageId: string
+  chatTitle: string
+  role: 'user' | 'assistant' | 'title'
+  snippet: string
+  createdAt: number
 }
 export interface Workspace {
   user: Member
@@ -186,6 +212,8 @@ export interface ServerChat {
   access?: ChatAccess['access']
   grants?: Grant[]
   pinned?: boolean
+  folderId?: string | null
+  archivedAt?: number | null
   id: string
   title: string
   provider: ServerProvider
@@ -209,11 +237,13 @@ export interface MessageAttachment {
   mimeType?: string
   sizeBytes?: number
   warning?: string
+  source?: 'user' | 'assistant'
   url?: string
   path?: string
 }
 export interface ServerMessage {
   attachments?: MessageAttachment[]
+  webSources?: WebSource[]
   progress?: string
   durationMs?: number
   provider?: ServerProvider

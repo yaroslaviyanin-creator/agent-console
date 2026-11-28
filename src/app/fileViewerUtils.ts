@@ -4,7 +4,7 @@ import { isRenderableImageAttachment } from './attachments'
 
 export const MAX_FILE_VIEWER_BYTES = 25 * 1024 * 1024
 
-export type FileViewerMode = 'pdf' | 'docx' | 'markdown' | 'table' | 'image' | 'code' | 'binary'
+export type FileViewerMode = 'pdf' | 'docx' | 'xlsx' | 'markdown' | 'table' | 'image' | 'code' | 'binary'
 
 const MARKDOWN_EXTENSIONS = new Set(['.md', '.markdown'])
 const TABLE_EXTENSIONS = new Set(['.csv', '.tsv'])
@@ -40,6 +40,9 @@ export function getFileViewerMode(att: Pick<MessageAttachment, 'kind' | 'name' |
   }
   if (ext === '.docx' || mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
     return 'docx'
+  }
+  if (ext === '.xlsx' || mime === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') {
+    return 'xlsx'
   }
   if (MARKDOWN_EXTENSIONS.has(ext) || mime === 'text/markdown') {
     return 'markdown'

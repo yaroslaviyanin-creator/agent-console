@@ -3,10 +3,13 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"os"
 	"time"
 
 	"agent-console/server/internal/provider"
+	"agent-console/server/internal/uploads"
 )
 
 var (
@@ -245,22 +248,28 @@ func (s *Store) FinishRun(ctx context.Context, userID, chatID, messageID, text, 
 
 // FinishRunWithProvider publishes a durable reply and updates the chat's active provider, model, and session binding.
 func (s *Store) FinishRunWithProvider(ctx context.Context, userID, chatID, messageID, targetProvider, targetModel, text, thinking, sessionID string, durationMs int64, usage *provider.Usage) error {
+	_, err := s.FinishRunWithProviderAndArtifacts(ctx, userID, chatID, messageID, targetProvider, targetModel, text, thinking, sessionID, durationMs, usage, nil)
+	return err
+}
+
+// FinishRunWithProviderAndArtifacts publishes a durable reply, persists assistant-generated artifacts, and updates the chat binding atomically.
+func (s *Store) FinishRunWithProviderAndArtifacts(ctx context.Context, userID, chatID, messageID, targetProvider, targetModel, text, thinking, sessionID string, durationMs int64, usage *provider.Usage, artifacts []uploads.ValidatedAttachment) ([]MessageAttachment, error) {
 	if targetProvider != "" && !isRunnableProvider(targetProvider) {
-		return ErrProviderUnavailable
+		return nil, ErrProviderUnavailable
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
 
-	var prompt, backend, model string
+	var ownerID, prompt, backend, model string
 	var memoryPrivate bool
-	err = tx.QueryRowContext(ctx, `SELECT m.content,c.provider,c.model,m.memory_private FROM chat_messages m JOIN chats c ON c.id=m.chat_id
+	err = tx.QueryRowContext(ctx, `SELECT c.user_id,m.content,c.provider,c.model,m.memory_private FROM chat_messages m JOIN chats c ON c.id=m.chat_id
 		WHERE m.chat_id=? AND m.run_id=? AND m.role='user' AND m.run_user_id=?`,
-		chatID, messageID, userID).Scan(&prompt, &backend, &model, &memoryPrivate)
+		chatID, messageID, userID).Scan(&ownerID, &prompt, &backend, &model, &memoryPrivate)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if targetProvider != "" {
 		backend = targetProvider
@@ -274,17 +283,54 @@ func (s *Store) FinishRunWithProvider(ctx context.Context, userID, chatID, messa
 		(id,user_id,chat_id,run_id,provider,model,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,cost_cents,created_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, randomHex(16), userID, chatID, messageID, backend, model,
 		counts.InputTokens, counts.CachedInputTokens, counts.OutputTokens, counts.ReasoningTokens, cents, now); err != nil {
-		return err
+		return nil, err
 	}
+	assistantMsgID := randomHex(16)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages (id,chat_id,role,content,thinking,created_at,run_id,duration_ms,memory_private)
-		VALUES (?,?,'assistant',?,?,?,?,?,?)`, randomHex(16), chatID, text, thinking, now, messageID, durationMs, memoryPrivate); err != nil {
-		return err
+		VALUES (?,?,'assistant',?,?,?,?,?,?)`, assistantMsgID, chatID, text, thinking, now, messageID, durationMs, memoryPrivate); err != nil {
+		return nil, err
 	}
+
+	var saved []MessageAttachment
+	var writtenPaths []string
+	rollbackFiles := func() {
+		for _, p := range writtenPaths {
+			_ = os.Remove(p)
+		}
+	}
+	for _, art := range artifacts {
+		att, diskPath, err := s.createAssistantAttachmentTx(ctx, tx, chatID, ownerID, assistantMsgID, art, now)
+		if err != nil {
+			rollbackFiles()
+			return nil, err
+		}
+		writtenPaths = append(writtenPaths, diskPath)
+		saved = append(saved, att)
+	}
+
 	if _, err := tx.ExecContext(ctx, `UPDATE chats SET provider=?,model=?,session_provider=?,provider_session_id=NULLIF(?,''),updated_at=MAX(updated_at,?) WHERE id=?`,
 		backend, model, backend, sessionID, now, chatID); err != nil {
+		rollbackFiles()
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		rollbackFiles()
+		return nil, err
+	}
+	return saved, nil
+}
+
+// SaveRunWebSources persists SSRF-fetched URL metadata onto the user message row for this run.
+func (s *Store) SaveRunWebSources(ctx context.Context, chatID, runID string, sources []WebSource) error {
+	if len(sources) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(sources)
+	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	_, err = s.db.ExecContext(ctx, `UPDATE chat_messages SET web_sources_json=? WHERE chat_id=? AND run_id=? AND role='user'`, string(encoded), chatID, runID)
+	return err
 }
 
 // ChatPriorMessages loads ordered conversation messages in a chat before the specified run ID.

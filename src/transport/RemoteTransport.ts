@@ -1,5 +1,5 @@
 import type {
-  AccountingAdapter, AdminChat, AdminUser, ChatAccess, ServerAdminAdapter, IndexedCodexChat, LoginRequest, MessageAttachment, RunEvent, RunRequest, ServerChat, ServerCreateChatRequest, ServerError, ServerHealth,
+  AccountingAdapter, AdminChat, AdminUser, ChatAccess, ChatFolder, ServerAdminAdapter, IndexedCodexChat, LoginRequest, MessageAttachment, RunEvent, RunRequest, SearchResult, ServerChat, ServerCreateChatRequest, ServerError, ServerHealth,
   ServerDevice, ServerDirectoryUser, ServerLoginResponse, ServerMessage, ServerModel, ServerProvider, ServerProviderInfo, ServerProvidersResponse, ServerQuota, ServerSession, TransportAdapter, UserProfile, UserProfilePatch, Workspace, WorkspaceAdapter,
 } from '../protocol/types'
 
@@ -48,6 +48,8 @@ const chatAccess = (chat: ServerChat, userId: string): ChatAccess => ({
   access: chat.access ?? 'owner',
   grants: chat.access === 'owner' ? chat.grants ?? [] : [],
   ...(chat.pinned !== undefined ? { pinned: Boolean(chat.pinned) } : {}),
+  ...(chat.folderId !== undefined ? { folderId: chat.folderId } : {}),
+  ...(chat.archivedAt !== undefined ? { archivedAt: chat.archivedAt } : {}),
 })
 
 function readEvent(data: unknown): RunEvent | { type: 'workspace_changed' } | undefined {
@@ -61,6 +63,8 @@ function readEvent(data: unknown): RunEvent | { type: 'workspace_changed' } | un
       return typeof e.prompt === 'string' && typeof e.model === 'string' && Number.isSafeInteger(e.createdAt)
         ? { ...e, ...(Array.isArray(e.attachments) ? { attachments: e.attachments } : {}) }
         : undefined
+    case 'web_sources':
+      return Array.isArray(e.webSources) ? e : undefined
     case 'text_delta':
     case 'thinking_delta':
       return typeof e.delta === 'string' ? e : undefined
@@ -483,12 +487,38 @@ export class RemoteTransport implements TransportAdapter {
     })
   }
 
-  patchChat(chatId: string, patch: { title?: string; pinned?: boolean }) {
+  patchChat(chatId: string, patch: { title?: string; pinned?: boolean; folderId?: string | null; archived?: boolean }) {
     return this.updateWorkspace(async () => {
       const updated = await this.request<ServerChat>('/api/chats/' + encodeURIComponent(chatId), patch, undefined, 'PATCH')
       await this.loadChatsAndUsers()
       return { chat: updated, workspace: this.snapshot() }
     })
+  }
+
+  folders(signal?: AbortSignal) {
+    return this.request<ChatFolder[]>('/api/folders', undefined, signal)
+  }
+
+  createFolder(name: string, color?: string) {
+    return this.request<ChatFolder>('/api/folders', { name, ...(color ? { color } : {}) }, undefined, 'POST')
+  }
+
+  updateFolder(id: string, patch: { name?: string; color?: string; sortOrder?: number }) {
+    return this.request<ChatFolder>('/api/folders/' + encodeURIComponent(id), patch, undefined, 'PATCH')
+  }
+
+  deleteFolder(id: string) {
+    return this.request<void>('/api/folders/' + encodeURIComponent(id), undefined, undefined, 'DELETE')
+  }
+
+  search(query: string, limit = 30, signal?: AbortSignal) {
+    const q = query.trim()
+    if (!q) return Promise.resolve([] as SearchResult[])
+    return this.request<SearchResult[]>(
+      `/api/search?q=${encodeURIComponent(q)}&limit=${Math.min(30, Math.max(1, limit))}`,
+      undefined,
+      signal,
+    )
   }
 
   deleteChat(chatId: string) {

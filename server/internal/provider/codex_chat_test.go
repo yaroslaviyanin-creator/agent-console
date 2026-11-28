@@ -14,7 +14,7 @@ func TestCodexChatConfigNoTools(t *testing.T) {
 	for _, want := range []string{
 		`approval_policy = "never"`,
 		`default_permissions = "chat"`,
-		`web_search = "disabled"`,
+		`web_search = "live"`,
 		`project_doc_max_bytes = 0`,
 		`mcp_servers = {}`,
 		`":root" = "deny"`,

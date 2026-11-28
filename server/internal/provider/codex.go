@@ -162,7 +162,7 @@ func codexArgs(req Request) ([]string, error) {
 }
 
 func codexArgsWithImages(req Request, imagePaths []string) ([]string, error) {
-	args := []string{"exec", "--strict-config", "--ignore-rules", "--skip-git-repo-check", "--json"}
+	args := []string{"--search", "exec", "--strict-config", "--ignore-rules", "--skip-git-repo-check", "--json"}
 	if req.SystemInstructions != "" {
 		instructions, err := json.Marshal(req.SystemInstructions)
 		if err != nil {

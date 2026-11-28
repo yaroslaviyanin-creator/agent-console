@@ -69,7 +69,7 @@ func TestCodexArgs(t *testing.T) {
 	if slices.Contains(args, "--dangerously-bypass-approvals-and-sandbox") {
 		t.Fatalf("prompt leaked into args: %q", args)
 	}
-	expected := []string{"exec", "--strict-config", "--ignore-rules", "--skip-git-repo-check", "--json", "-"}
+	expected := []string{"--search", "exec", "--strict-config", "--ignore-rules", "--skip-git-repo-check", "--json", "-"}
 	if !slices.Equal(args, expected) {
 		t.Fatalf("args mismatch:\nexpected: %q\ngot:      %q", expected, args)
 	}

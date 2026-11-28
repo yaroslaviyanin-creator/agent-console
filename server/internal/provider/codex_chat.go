@@ -14,7 +14,7 @@ import (
 
 const codexChatConfig = `approval_policy = "never"
 default_permissions = "chat"
-web_search = "disabled"
+web_search = "live"
 cli_auth_credentials_store = "file"
 project_doc_max_bytes = 0
 mcp_servers = {}
@@ -51,7 +51,7 @@ workspace_dependencies = false
 `
 
 const codexChatInstructions = `You are the conversational assistant in Agent Console. Answer the user's questions in their language.
-This chat has no access to local files, shell, subagents, external apps, connectors, or web search. If a request needs that access, explain the limitation directly and answer from any information the user provided.
+This chat has no access to local files, shell, subagents, external apps, or connectors. Cloud web search is available when up-to-date information is needed; if a request needs local files or shell access, explain the limitation directly.
 `
 
 const chatSessionPrefix = "chat-v1:"

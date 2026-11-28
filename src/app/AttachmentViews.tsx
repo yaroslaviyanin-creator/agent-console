@@ -1,15 +1,23 @@
 import { useEffect, useState } from 'react'
-import { AlertTriangle, Download, FileArchive, FileCode, FileText, Image as ImageIcon, LoaderCircle, Paperclip, X } from 'lucide-react'
+import { AlertTriangle, Download, FileArchive, FileCode, FileSpreadsheet, FileText, Image as ImageIcon, LoaderCircle, Paperclip, X } from 'lucide-react'
 import type { MessageAttachment } from '../protocol/types'
 import type { RemoteTransport } from '../transport/RemoteTransport'
 import { type DraftAttachment, formatAttachmentSize, isRenderableImageAttachment } from './attachments'
 import { useFileViewer } from './fileViewerStore'
 
 function attachmentFileIcon(att: Pick<MessageAttachment, 'kind' | 'name'>) {
-  if (att.kind === 'archive' || att.name.toLowerCase().endsWith('.zip')) return FileArchive
-  if (att.kind === 'pdf' || att.kind === 'document' || att.name.toLowerCase().endsWith('.pdf')) return FileText
+  const lower = att.name.trim().toLowerCase()
+  if (att.kind === 'archive' || lower.endsWith('.zip')) return FileArchive
+  if (lower.endsWith('.xlsx') || lower.endsWith('.csv') || lower.endsWith('.tsv')) return FileSpreadsheet
+  if (att.kind === 'pdf' || att.kind === 'document' || lower.endsWith('.pdf')) return FileText
   if (att.kind === 'text') return FileCode
   return Paperclip
+}
+
+function attachmentExtensionBadge(name: string): string {
+  const dot = name.lastIndexOf('.')
+  if (dot < 0 || dot === name.length - 1) return 'FILE'
+  return name.slice(dot + 1).toUpperCase().slice(0, 6)
 }
 
 function AuthenticatedImage({
@@ -143,6 +151,81 @@ export function TurnAttachments({
         </ul>
       )}
     </>
+  )
+}
+
+export function AssistantArtifacts({
+  attachments,
+  remote,
+}: {
+  attachments: MessageAttachment[]
+  remote: RemoteTransport | null
+}) {
+  const openFile = useFileViewer(s => s.openFile)
+  const activeFile = useFileViewer(s => s.file)
+
+  if (attachments.length === 0) return null
+
+  return (
+    <div className="assistant-artifacts" aria-label="Созданные файлы">
+      {attachments.map((att, index) => {
+        const Icon = isRenderableImageAttachment(att) ? ImageIcon : attachmentFileIcon(att)
+        const ext = attachmentExtensionBadge(att.name)
+        const sizeLabel = formatAttachmentSize(att.sizeBytes)
+        const isSelected = !!activeFile && (activeFile.id ? activeFile.id === att.id : activeFile.name === att.name && activeFile.url === att.url)
+        return (
+          <div
+            key={att.id ?? `${att.name}-${index}`}
+            className={`artifact-card${isSelected ? ' is-selected' : ''}`}
+            role="button"
+            tabIndex={0}
+            title={att.warning ? `${att.name}: ${att.warning}` : `Открыть ${att.name}`}
+            onClick={() => openFile(att)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                openFile(att)
+              }
+            }}
+          >
+            <span className="artifact-card-icon" aria-hidden="true">
+              <Icon size={17} />
+            </span>
+            <div className="artifact-card-body">
+              <div className="artifact-card-title-row">
+                <strong className="artifact-card-name">{att.name}</strong>
+                {att.warning && (
+                  <span className="att-warning-badge" title={att.warning} aria-label={att.warning}>
+                    <AlertTriangle size={12} aria-hidden="true" />
+                  </span>
+                )}
+              </div>
+              <div className="artifact-card-meta">
+                <span className="artifact-ext-badge">{ext}</span>
+                {sizeLabel && <span className="artifact-size">{sizeLabel}</span>}
+              </div>
+            </div>
+            <div className="artifact-card-actions">
+              <span className="artifact-open-label">Открыть</span>
+              {att.url && remote && (
+                <button
+                  type="button"
+                  className="artifact-download-btn"
+                  aria-label={`Скачать ${att.name}`}
+                  title={`Скачать ${att.name}`}
+                  onClick={e => {
+                    e.stopPropagation()
+                    void remote.downloadAttachment(att)
+                  }}
+                >
+                  <Download size={14} aria-hidden="true" />
+                </button>
+              )}
+            </div>
+          </div>
+        )
+      })}
+    </div>
   )
 }
 

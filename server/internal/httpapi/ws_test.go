@@ -289,7 +289,7 @@ func TestWebSocketChatLifecycle(t *testing.T) {
 		t.Helper()
 		write(sender, chat.ID, id, "chat")
 		request := nextRequest()
-		if request.SystemInstructions != "Текущий собеседник: "+speaker {
+		if !strings.HasPrefix(request.SystemInstructions, "Текущий собеседник: "+speaker) {
 			t.Fatalf("shared context: %q", request.SystemInstructions)
 		}
 		if id == "shared-read" && request.SessionID != "" {

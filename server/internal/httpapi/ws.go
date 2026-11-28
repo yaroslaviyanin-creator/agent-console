@@ -16,9 +16,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"agent-console/server/internal/artifacts"
 	"agent-console/server/internal/provider"
 	"agent-console/server/internal/store"
 	"agent-console/server/internal/uploads"
+	"agent-console/server/internal/webfetch"
 	"github.com/gorilla/websocket"
 )
 
@@ -48,10 +50,12 @@ type runEvent struct {
 	Type        string                    `json:"type"`
 	Prompt      string                    `json:"prompt,omitempty"`
 	Attachments []store.MessageAttachment `json:"attachments,omitempty"`
+	WebSources  []store.WebSource         `json:"webSources,omitempty"`
 	Provider    string                    `json:"provider,omitempty"`
 	Model       string                    `json:"model,omitempty"`
 	CreatedAt   int64                     `json:"createdAt,omitempty"`
 	Delta       string                    `json:"delta,omitempty"`
+	CleanText   *string                   `json:"cleanText,omitempty"`
 	Reason      string                    `json:"reason,omitempty"`
 	DurationMs  *int64                    `json:"durationMs,omitempty"`
 	Usage       *store.MessageUsage       `json:"usage,omitempty"`
@@ -588,7 +592,34 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 	}
 
 	resumeSessionID := ""
-	prompt := buildPromptWithAttachmentsBudget(req.Prompt, attached, a.config.EffectiveMaxAttachmentContextBytes())
+	effectivePrompt := req.Prompt
+	if urls := webfetch.ExtractURLs(req.Prompt, webfetch.MaxURLsPerMessage); len(urls) > 0 && a.webfetcher != nil {
+		pages := a.webfetcher.FetchAll(runCtx, urls)
+		if len(pages) > 0 {
+			webSources := make([]store.WebSource, 0, len(pages))
+			for _, p := range pages {
+				webSources = append(webSources, store.WebSource{
+					URL:    p.URL,
+					Title:  p.Title,
+					Status: string(p.Status),
+					Detail: p.Detail,
+				})
+			}
+			if err := a.db.SaveRunWebSources(runCtx, req.ChatID, req.MessageID, webSources); err != nil {
+				a.logger.Warn("save web sources failed", "chatId", req.ChatID, "error", err)
+			}
+			seq++
+			a.live.publish(runEvent{
+				ChatID:     req.ChatID,
+				MessageID:  req.MessageID,
+				Seq:        seq,
+				Type:       "web_sources",
+				WebSources: webSources,
+			})
+			effectivePrompt = webfetch.BuildPromptContext(req.Prompt, pages)
+		}
+	}
+	prompt := buildPromptWithAttachmentsBudget(effectivePrompt, attached, a.config.EffectiveMaxAttachmentContextBytes())
 	if sessionID != "" && targetProvider == sessionProvider {
 		resumeSessionID = sessionID
 	} else {
@@ -643,13 +674,34 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 				wire.Delta = event.Delta
 			case provider.Done:
 				durationMs := time.Since(started).Milliseconds()
-				if err := a.finishStream(runCtx, userID, targetProvider, req, text.String(), thinking.String(), event, durationMs, shared); err != nil {
+				parsed := artifacts.ParseConsoleFiles(text.String())
+				var built []uploads.ValidatedAttachment
+				if len(parsed.Files) > 0 {
+					policy := uploads.DefaultChatAttachmentPolicyWithLimits(a.config.EffectiveMaxAttachmentBytes(), a.config.EffectiveMaxAttachmentContextBytes())
+					for _, pf := range parsed.Files {
+						att, err := artifacts.BuildValidatedAttachment(runCtx, policy, pf)
+						if err != nil {
+							a.logger.Warn("build generated artifact failed", "chatId", req.ChatID, "name", pf.Name, "error", err)
+							continue
+						}
+						built = append(built, att)
+					}
+				}
+				savedAtts, err := a.finishStreamWithArtifacts(runCtx, userID, targetProvider, req, parsed.CleanText, thinking.String(), event, durationMs, shared, built)
+				if err != nil {
 					return failure("storage_error", "Could not save the response.", err)
 				}
 				wire.Reason = "completed"
 				wire.DurationMs = &durationMs
 				wire.Provider = targetProvider
 				wire.Model = req.Model.ID
+				if len(savedAtts) > 0 {
+					wire.Attachments = savedAtts
+				}
+				if len(parsed.Files) > 0 {
+					cleanCopy := parsed.CleanText
+					wire.CleanText = &cleanCopy
+				}
 				if event.Usage != nil {
 					wire.Usage = &store.MessageUsage{
 						InputTokens:       event.Usage.InputTokens,
@@ -674,18 +726,23 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 }
 
 func (a *API) finishStream(ctx context.Context, userID, targetProvider string, req runRequest, text, thinking string, event provider.Event, durationMs int64, shared bool) error {
+	_, err := a.finishStreamWithArtifacts(ctx, userID, targetProvider, req, text, thinking, event, durationMs, shared, nil)
+	return err
+}
+
+func (a *API) finishStreamWithArtifacts(ctx context.Context, userID, targetProvider string, req runRequest, text, thinking string, event provider.Event, durationMs int64, shared bool, built []uploads.ValidatedAttachment) ([]store.MessageAttachment, error) {
 	// Access revocation can make a running shared chat private. Do not
 	// restore a session that the sharing transition already invalidated.
 	a.live.mu.Lock()
 	defer a.live.mu.Unlock()
 	currentlyShared, err := a.db.IsChatShared(ctx, req.ChatID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if shared != currentlyShared {
 		event.SessionID = ""
 	}
-	return a.db.FinishRunWithProvider(ctx, userID, req.ChatID, req.MessageID, targetProvider, req.Model.ID, text, thinking, event.SessionID, durationMs, event.Usage)
+	return a.db.FinishRunWithProviderAndArtifacts(ctx, userID, req.ChatID, req.MessageID, targetProvider, req.Model.ID, text, thinking, event.SessionID, durationMs, event.Usage, built)
 }
 
 const handoffTranscriptBudget = 24 << 10

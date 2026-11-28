@@ -37,6 +37,7 @@ type Attachment struct {
 	StorageKey    string `json:"-"`
 	ExtractedText string `json:"-"`
 	Warning       string `json:"warning,omitempty"`
+	Source        string `json:"source,omitempty"`
 	CreatedAt     int64  `json:"createdAt"`
 	URL           string `json:"url"`
 }
@@ -48,10 +49,15 @@ type MessageAttachment struct {
 	MimeType  string `json:"mimeType,omitempty"`
 	SizeBytes int64  `json:"sizeBytes,omitempty"`
 	Warning   string `json:"warning,omitempty"`
+	Source    string `json:"source,omitempty"`
 	URL       string `json:"url,omitempty"`
 }
 
 func (a Attachment) AsMessageAttachment() MessageAttachment {
+	src := ""
+	if a.Source == "assistant" {
+		src = "assistant"
+	}
 	return MessageAttachment{
 		ID:        a.ID,
 		Kind:      a.Kind,
@@ -59,6 +65,7 @@ func (a Attachment) AsMessageAttachment() MessageAttachment {
 		MimeType:  a.MIMEType,
 		SizeBytes: a.SizeBytes,
 		Warning:   a.Warning,
+		Source:    src,
 		URL:       a.URL,
 	}
 }
@@ -70,10 +77,10 @@ func (s *Store) attachmentPath(storageKey string) (string, error) {
 	return filepath.Join(s.uploadsDir, storageKey), nil
 }
 
-// CountChatAttachments returns the total number of attachments (attached and pending) in a chat.
+// CountChatAttachments returns the total number of user-uploaded attachments (attached and pending) in a chat.
 func (s *Store) CountChatAttachments(ctx context.Context, chatID string) (int, error) {
 	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chat_attachments WHERE chat_id=?`, chatID).Scan(&count)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chat_attachments WHERE chat_id=? AND source='user'`, chatID).Scan(&count)
 	return count, err
 }
 
@@ -341,9 +348,55 @@ func (s *Store) CleanupOrphanAttachments(ctx context.Context, maxAge time.Durati
 	return removed, nil
 }
 
+func (s *Store) createAssistantAttachmentTx(ctx context.Context, tx *sql.Tx, chatID, ownerID, assistantMsgID string, v uploads.ValidatedAttachment, now int64) (MessageAttachment, string, error) {
+	id := randomHex(16)
+	storageKey := randomHex(16)
+	diskPath, err := s.attachmentPath(storageKey)
+	if err != nil {
+		return MessageAttachment{}, "", err
+	}
+	if err := os.MkdirAll(s.uploadsDir, 0700); err != nil {
+		return MessageAttachment{}, "", err
+	}
+	if err := os.WriteFile(diskPath, v.Data, 0600); err != nil {
+		return MessageAttachment{}, "", err
+	}
+	sizeBytes := int64(len(v.Data))
+	sum := sha256.Sum256(v.Data)
+	shaHex := hex.EncodeToString(sum[:])
+
+	var extracted any
+	if v.ExtractedText != "" {
+		extracted = v.ExtractedText
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO chat_attachments
+		(id,chat_id,message_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,warning,source,created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'assistant',?)`,
+		id, chatID, assistantMsgID, ownerID, v.Filename, v.MIMEType, string(v.Kind), sizeBytes, shaHex, storageKey, extracted, v.Warning, now)
+	if err != nil {
+		_ = os.Remove(diskPath)
+		return MessageAttachment{}, "", err
+	}
+	return MessageAttachment{
+		ID:        id,
+		Kind:      string(v.Kind),
+		Name:      v.Filename,
+		MimeType:  v.MIMEType,
+		SizeBytes: sizeBytes,
+		Warning:   v.Warning,
+		Source:    "assistant",
+		URL:       "/api/attachments/" + id,
+	}, diskPath, nil
+}
+
 func (s *Store) messageAttachmentsForChat(ctx context.Context, chatID string) (map[string][]MessageAttachment, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, message_id, kind, original_name, mime_type, size_bytes, warning
-		FROM chat_attachments WHERE chat_id=? AND message_id IS NOT NULL ORDER BY created_at, rowid`, chatID)
+	rows, err := s.db.QueryContext(ctx, `SELECT a.id,
+		CASE WHEN m.role='assistant' THEN COALESCE(NULLIF(m.run_id,''), m.id) ELSE m.id END,
+		a.kind, a.original_name, a.mime_type, a.size_bytes, a.warning, a.source
+		FROM chat_attachments a
+		JOIN chat_messages m ON m.id=a.message_id
+		WHERE a.chat_id=? AND a.message_id IS NOT NULL
+		ORDER BY a.created_at, a.rowid`, chatID)
 	if err != nil {
 		return nil, err
 	}
@@ -351,10 +404,13 @@ func (s *Store) messageAttachmentsForChat(ctx context.Context, chatID string) (m
 
 	result := make(map[string][]MessageAttachment)
 	for rows.Next() {
-		var msgID string
+		var msgID, source string
 		var att MessageAttachment
-		if err := rows.Scan(&att.ID, &msgID, &att.Kind, &att.Name, &att.MimeType, &att.SizeBytes, &att.Warning); err != nil {
+		if err := rows.Scan(&att.ID, &msgID, &att.Kind, &att.Name, &att.MimeType, &att.SizeBytes, &att.Warning, &source); err != nil {
 			return nil, err
+		}
+		if source == "assistant" {
+			att.Source = "assistant"
 		}
 		att.URL = "/api/attachments/" + att.ID
 		result[msgID] = append(result[msgID], att)
@@ -362,10 +418,10 @@ func (s *Store) messageAttachmentsForChat(ctx context.Context, chatID string) (m
 	return result, rows.Err()
 }
 
-// PriorAttachmentsForChat returns attachments keyed by user message ID for provider handoff context.
+// PriorAttachmentsForChat returns user-uploaded attachments keyed by user message ID for provider handoff context.
 func (s *Store) PriorAttachmentsForChat(ctx context.Context, chatID string) (map[string][]Attachment, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, chat_id, message_id, user_id, original_name, mime_type, kind, size_bytes, sha256, storage_key, COALESCE(extracted_text,''), warning, created_at
-		FROM chat_attachments WHERE chat_id=? AND message_id IS NOT NULL ORDER BY created_at, rowid`, chatID)
+		FROM chat_attachments WHERE chat_id=? AND message_id IS NOT NULL AND source='user' ORDER BY created_at, rowid`, chatID)
 	if err != nil {
 		return nil, err
 	}

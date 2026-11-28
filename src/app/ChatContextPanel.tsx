@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Download, ExternalLink, FileArchive, FileCode, FileText, Image as ImageIcon, Link2, Paperclip, Plus, Sparkles, X } from 'lucide-react'
-import type { MessageAttachment, MessageUsage, ServerModel, ServerProvider } from '../protocol/types'
+import type { MessageAttachment, MessageUsage, ServerModel, ServerProvider, WebSource } from '../protocol/types'
 import type { RemoteTransport } from '../transport/RemoteTransport'
 import { resolveModelDisplay, type Turn } from './chatStore'
 import { formatAttachmentSize, isRenderableImageAttachment } from './attachments'
@@ -51,13 +51,17 @@ export function formatUsageInline(usage: MessageUsage): string {
 export function collectChatAttachments(turns: Turn[]): MessageAttachment[] {
   const out: MessageAttachment[] = []
   const seen = new Set<string>()
-  for (const turn of turns) {
-    for (const att of turn.attachments ?? []) {
-      const key = att.id ? `id:${att.id}` : `name:${att.name}:${att.sizeBytes ?? 0}`
+  const pushAll = (items?: MessageAttachment[]) => {
+    for (const att of items ?? []) {
+      const key = att.id ? `id:${att.id}` : `name:${att.name}:${att.sizeBytes ?? 0}:${att.source ?? 'user'}`
       if (seen.has(key)) continue
       seen.add(key)
       out.push(att)
     }
+  }
+  for (const turn of turns) {
+    pushAll(turn.attachments)
+    pushAll(turn.assistantAttachments)
   }
   return out
 }
@@ -88,6 +92,33 @@ export function extractChatLinks(turns: Turn[]): string[] {
     }
   }
   return out
+}
+
+export interface ChatWebLink {
+  url: string
+  title?: string
+  status?: WebSource['status']
+  detail?: string
+}
+
+export function collectChatWebLinks(turns: Turn[]): ChatWebLink[] {
+  const byUrl = new Map<string, ChatWebLink>()
+  for (const turn of turns) {
+    for (const ws of turn.webSources ?? []) {
+      byUrl.set(ws.url, {
+        url: ws.url,
+        ...(ws.title ? { title: ws.title } : {}),
+        status: ws.status,
+        ...(ws.detail ? { detail: ws.detail } : {}),
+      })
+    }
+  }
+  for (const url of extractChatLinks(turns)) {
+    if (!byUrl.has(url)) {
+      byUrl.set(url, { url })
+    }
+  }
+  return Array.from(byUrl.values())
 }
 
 export interface ModelUsageSummary {
@@ -309,7 +340,15 @@ function PanelAttachmentThumb({
       )}
       <div className="context-file-meta">
         <strong>{att.name}</strong>
-        {att.sizeBytes != null && <small>{formatAttachmentSize(att.sizeBytes)}</small>}
+        <div className="context-file-sub">
+          {att.sizeBytes != null && <small>{formatAttachmentSize(att.sizeBytes)}</small>}
+          {att.source === 'assistant' && (
+            <span className="context-ai-badge" title="Создано моделью">
+              <Sparkles size={10} aria-hidden="true" />
+              ИИ
+            </span>
+          )}
+        </div>
       </div>
       {att.url && remote && (
         <button
@@ -354,6 +393,7 @@ export function ChatContextPanel({
   remote,
   canAttach,
   onAttachClick,
+  onExportMarkdown,
   onClose,
 }: {
   turns: Turn[]
@@ -364,10 +404,11 @@ export function ChatContextPanel({
   remote: RemoteTransport | null
   canAttach: boolean
   onAttachClick: () => void
+  onExportMarkdown?: (() => void) | undefined
   onClose: () => void
 }) {
   const attachments = collectChatAttachments(turns)
-  const links = extractChatLinks(turns)
+  const links = collectChatWebLinks(turns)
   const summary = summarizeChatContext(turns, providerLabel, modelLabel, serverModelsByProvider, defaultProviderId)
   const showBreakdown = summary.byProvider.length >= 2 || (summary.byProvider[0]?.models.length ?? 0) >= 2
 
@@ -420,15 +461,34 @@ export function ChatContextPanel({
         </div>
         {links.length > 0 && (
           <ul className="context-link-list">
-            {links.map(url => (
-              <li key={url}>
-                <a href={url} target="_blank" rel="noopener noreferrer" title={url}>
-                  <Link2 size={12} aria-hidden="true" />
-                  <span>{url}</span>
-                  <ExternalLink size={11} aria-hidden="true" />
-                </a>
-              </li>
-            ))}
+            {links.map(item => {
+              const statusLabel = item.status === 'ok'
+                ? 'OK'
+                : item.status === 'blocked'
+                  ? 'Закрыто'
+                  : item.status === 'js_required'
+                    ? 'Нужен JS'
+                    : item.status === 'error'
+                      ? 'Ошибка'
+                      : undefined
+              return (
+                <li key={item.url}>
+                  <a href={item.url} target="_blank" rel="noopener noreferrer" title={item.detail ? `${item.url} (${item.detail})` : item.url}>
+                    <Link2 size={12} aria-hidden="true" />
+                    <span className="context-link-text">
+                      <strong>{item.title || item.url}</strong>
+                      {item.title && <small>{item.url}</small>}
+                    </span>
+                    {statusLabel && (
+                      <span className={`web-source-status is-${item.status === 'ok' ? 'ok' : item.status === 'blocked' ? 'blocked' : item.status === 'js_required' ? 'warn' : 'err'}`}>
+                        {statusLabel}
+                      </span>
+                    )}
+                    <ExternalLink size={11} aria-hidden="true" />
+                  </a>
+                </li>
+              )
+            })}
           </ul>
         )}
       </section>
@@ -436,7 +496,20 @@ export function ChatContextPanel({
       <section className="context-section">
         <div className="context-section-head">
           <h3>Сводка по чату</h3>
-          <Sparkles size={13} aria-hidden="true" />
+          <div className="context-section-meta">
+            {onExportMarkdown && (
+              <button
+                type="button"
+                className="context-export-btn"
+                title="Экспорт чата в Markdown (.md)"
+                onClick={onExportMarkdown}
+              >
+                <Download size={12} aria-hidden="true" />
+                <span>.md</span>
+              </button>
+            )}
+            <Sparkles size={13} aria-hidden="true" />
+          </div>
         </div>
         <dl className="context-summary">
           <div><dt>Провайдер</dt><dd>{summary.providerLabel}</dd></div>

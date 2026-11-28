@@ -1,6 +1,6 @@
 import { historyUntil, previousTurn } from './runHistory'
 import { create } from 'zustand'
-import type { LoginRequest, MessageAttachment, MessageUsage, Workspace, PermissionDecision, Provider, RunEvent, RunRequest, ServerMessage, ServerModel, ServerProvider, ServerProviderInfo, ShareAccess, Target, ToolCall } from '../protocol/types'
+import type { ChatFolder, LoginRequest, MessageAttachment, MessageUsage, Workspace, PermissionDecision, Provider, RunEvent, RunRequest, SearchResult, ServerMessage, ServerModel, ServerProvider, ServerProviderInfo, ShareAccess, Target, ToolCall, WebSource } from '../protocol/types'
 import { MockWorkspace } from '../transport/MockWorkspace'
 import { type DraftAttachment, inferDraftKind, isSafeRasterPreviewFile, MAX_ATTACHMENT_MB, MAX_CHAT_ATTACHMENTS, MAX_CHAT_TOTAL_ATTACHMENTS, MAX_IMAGE_MB } from './attachments'
 import { useAccountStore, blockReason } from './accountStore'
@@ -42,6 +42,8 @@ export interface ToolEntry {
 export type Part = { kind: 'thinking' | 'text'; text: string } | ToolEntry
 export interface Turn {
   attachments?: MessageAttachment[]
+  assistantAttachments?: MessageAttachment[]
+  webSources?: WebSource[]
   progress?: string
   durationMs?: number
   id: string
@@ -66,6 +68,8 @@ export interface Chat {
   id: string
   title: string
   pinned?: boolean
+  folderId?: string | null
+  archivedAt?: number | null
   access: ShareAccess | 'owner'
   provider?: ServerProvider
   serverProvider?: ServerProvider
@@ -119,12 +123,16 @@ export const useChats = create<{
   modelsErrorByProvider: Partial<Record<ServerProvider, string>>
   lastModelByProvider: Partial<Record<ServerProvider, { model: string; reasoning?: string | undefined }>>
   codexIndex: 'hidden' | 'loading' | 'ready' | 'error'
+  folders: ChatFolder[]
+  pendingSearchJump: { chatId: string; messageId: string; nonce: number } | null
 }>(() => ({
   activeId: '', chats: [], workspace: null, mode: savedConnection.mode, address: savedConnection.address,
   remote: null, restoring: false, connected: false, connectionError: '',
   serverProviders: [], defaultServerProvider: null, providersLoaded: false,
   serverModelsByProvider: {}, modelsLoadingByProvider: {}, modelsErrorByProvider: {}, lastModelByProvider: {},
   codexIndex: 'hidden',
+  folders: [],
+  pendingSearchJump: null,
 }))
 
 // The mock server and transcripts live for this app launch. Drafts belong to the signed-in user.
@@ -290,6 +298,8 @@ function clearSession() {
       serverProviders: [], defaultServerProvider: null, providersLoaded: false,
       serverModelsByProvider: {}, modelsLoadingByProvider: {}, modelsErrorByProvider: {}, lastModelByProvider: {},
       codexIndex: 'hidden',
+      folders: [],
+      pendingSearchJump: null,
     })
   } else {
     loadWorkspace(null)
@@ -399,9 +409,20 @@ function ensureChatModels(remote: RemoteTransport, chatId: string) {
 function startRemote(remote: RemoteTransport) {
   void remote.connect()
   void refreshServerProviders(remote)
+  void refreshFolders(remote)
   if (remote.provider !== 'stub') {
     void refreshServerModels(remote.provider, false, remote)
   }
+}
+
+export async function refreshFolders(targetRemote = useChats.getState().remote) {
+  if (!targetRemote || useChats.getState().workspace?.user.role === 'pending') return
+  try {
+    const folders = await targetRemote.folders()
+    if (useChats.getState().remote === targetRemote) {
+      useChats.setState({ folders })
+    }
+  } catch { /* ignore transient folder refresh errors */ }
 }
 
 export async function refreshServerProviders(targetRemote = useChats.getState().remote) {
@@ -548,29 +569,35 @@ function applyRemoteWorkspace(remote: RemoteTransport, workspace: Workspace, pre
   const existing = new Map(state.chats.map(item => [item.id, item]))
   const accessById = new Map(workspace.chats.map(c => [c.id, c.access]))
   const pinnedById = new Map(workspace.chats.map(c => [c.id, Boolean(c.pinned)]))
+  const folderById = new Map(workspace.chats.map(c => [c.id, c.folderId ?? null]))
+  const archivedById = new Map(workspace.chats.map(c => [c.id, c.archivedAt ?? null]))
   const rawChats = remote.chats.map(item => {
     const previous = existing.get(item.id)
     const serverProvider = item.provider ?? remote.provider
     const serverModel = serverProvider === 'stub' || item.model === 'codex' || item.model === 'antigravity' ? 'default' : item.model
-    if ('archived' in item && typeof item.archived === 'boolean') {
+    if ('archived' in item && typeof item.archived === 'boolean' && item.id.startsWith('codex-')) {
       return { ...(previous ?? chat(item.id, item.title, 'read')), title: item.title, pinned: false, provider: serverProvider, serverProvider, model: serverModel, indexedCodex: true, archived: item.archived }
     }
     const access = accessById.get(item.id) ?? 'read'
     const pinned = item.pinned ?? pinnedById.get(item.id) ?? false
+    const folderId = item.folderId !== undefined ? (item.folderId ?? null) : (folderById.get(item.id) ?? null)
+    const archivedAt = item.archivedAt !== undefined ? (item.archivedAt ?? null) : (archivedById.get(item.id) ?? null)
     if (!previous) {
-      return { ...chat(item.id, item.title, access), pinned, provider: serverProvider, serverProvider, model: serverModel }
+      return { ...chat(item.id, item.title, access), pinned, folderId, archivedAt, provider: serverProvider, serverProvider, model: serverModel }
     }
     const prevServerProvider = previous.serverProvider ?? serverProvider
     const hasLocalProviderOverride = previous.provider != null && previous.provider !== prevServerProvider
     const serverChanged = serverProvider !== prevServerProvider
     if (hasLocalProviderOverride && !serverChanged) {
-      return { ...previous, title: item.title, pinned, access, serverProvider }
+      return { ...previous, title: item.title, pinned, folderId, archivedAt, access, serverProvider }
     }
     const externalProviderChange = serverChanged && previous.provider !== serverProvider
     return {
       ...previous,
       title: item.title,
       pinned,
+      folderId,
+      archivedAt,
       access,
       provider: serverProvider,
       serverProvider,
@@ -626,7 +653,7 @@ async function refreshQuota(remote: RemoteTransport) {
 
 async function refreshRemote(remote: RemoteTransport, changedId?: string) {
   try {
-    const workspace = await remote.refreshChats()
+    const [workspace] = await Promise.all([remote.refreshChats(), refreshFolders(remote)])
     if (useChats.getState().remote !== remote) return
     applyRemoteWorkspace(remote, workspace)
     const { activeId, connectionError } = useChats.getState()
@@ -676,10 +703,11 @@ function restoreTurns(messages: ServerMessage[], local: Turn[], label: string): 
       const id = message.runId ?? message.id
       const pending = localByID.get(id)
       previousPrompt = pending
-        ? { ...pending, userMessageId: message.id, prompt: message.content }
+        ? { ...pending, userMessageId: message.id, prompt: message.content, ...(message.webSources?.length ? { webSources: message.webSources } : {}) }
         : {
           id, userMessageId: message.id, prompt: message.content, model: label, time: message.createdAt, parts: [], seq: 0,
           ...(message.attachments?.length ? { attachments: message.attachments } : {}),
+          ...(message.webSources?.length ? { webSources: message.webSources } : {}),
           state: 'stopped', notice: 'В истории пока есть только запрос.',
         }
       turns.set(id, previousPrompt)
@@ -703,6 +731,8 @@ function restoreTurns(messages: ServerMessage[], local: Turn[], label: string): 
         parts,
         seq: 0,
         ...(prompt?.attachments?.length ? { attachments: prompt.attachments } : {}),
+        ...(prompt?.webSources?.length ? { webSources: prompt.webSources } : {}),
+        ...(message.attachments?.length ? { assistantAttachments: message.attachments } : {}),
         ...(message.progress ? { progress: message.progress } : {}),
         ...(message.durationMs != null ? { durationMs: message.durationMs } : {}),
         state: 'completed',
@@ -763,6 +793,9 @@ export function applyEvent(turn: Turn, event: RunEvent): Turn {
   if (event.messageId !== turn.id || event.seq <= turn.seq || turn.state !== 'running') return turn
   const next = { ...turn, seq: event.seq }
   switch (event.type) {
+    case 'web_sources':
+      next.webSources = event.webSources
+      break
     case 'text_delta':
     case 'thinking_delta': {
       const kind = event.type === 'text_delta' ? 'text' : 'thinking'
@@ -791,6 +824,11 @@ export function applyEvent(turn: Turn, event: RunEvent): Turn {
       if (resolved.modelId) next.modelId = resolved.modelId
       next.model = resolved.modelLabel
       if (event.usage) next.usage = event.usage
+      if (event.attachments?.length) next.assistantAttachments = event.attachments
+      if (event.cleanText !== undefined) {
+        const preserved = next.parts.filter(p => p.kind !== 'text')
+        next.parts = event.cleanText ? [...preserved, { kind: 'text', text: event.cleanText }] : preserved
+      }
       break
     }
   }
@@ -1062,17 +1100,57 @@ export function clearChatAttachmentError(chatId: string) {
   updateChat(chatId, c => ({ ...c, attachmentError: undefined }))
 }
 
+function yamlQuote(value: string): string {
+  return JSON.stringify(value)
+}
+
 export function exportChatMarkdown(c: Chat): string {
-  const lines: string[] = [`# ${c.title || 'Чат'}`, '']
+  const earliest = c.turns.reduce((minT, t) => (t.time && t.time < minT ? t.time : minT), Number.POSITIVE_INFINITY)
+  const createdISO = new Date(Number.isFinite(earliest) ? earliest : Date.now()).toISOString()
+  const exportedISO = new Date().toISOString()
+  const providers = Array.from(new Set([
+    ...(c.provider ? [c.provider] : []),
+    ...c.turns.flatMap(t => (t.provider ? [t.provider] : [])),
+  ]))
+  const modelsUsed = Array.from(new Set([
+    ...(c.model && c.model !== 'default' ? [c.model] : []),
+    ...c.turns.flatMap(t => (t.model ? [t.model] : [])),
+  ]))
+  const msgCount = c.turns.reduce((acc, t) => {
+    const hasUser = Boolean(t.prompt || (t.attachments?.length ?? 0) > 0)
+    const hasAssistant = t.parts.length > 0 || (t.assistantAttachments?.length ?? 0) > 0 || t.state === 'completed' || t.state === 'stopped'
+    return acc + (hasUser ? 1 : 0) + (hasAssistant ? 1 : 0)
+  }, 0)
+
+  const lines: string[] = [
+    '---',
+    `title: ${yamlQuote(c.title || 'Чат')}`,
+    `created: ${createdISO}`,
+    `exported: ${exportedISO}`,
+    `providers: [${providers.map(yamlQuote).join(', ')}]`,
+    `models: [${modelsUsed.map(yamlQuote).join(', ')}]`,
+    `messages: ${msgCount}`,
+    '---',
+    '',
+    `# ${c.title || 'Чат'}`,
+    '',
+  ]
+
   for (const turn of c.turns) {
     const timeStr = new Date(turn.time).toLocaleString('ru-RU')
-    if (turn.prompt) {
-      lines.push(`## Пользователь (${timeStr})`, '', turn.prompt, '')
+    if (turn.prompt || (turn.attachments?.length ?? 0) > 0) {
+      lines.push(`## Пользователь (${timeStr})`, '')
+      if (turn.prompt) {
+        lines.push(turn.prompt, '')
+      }
+      if (turn.attachments?.length) {
+        lines.push('**Прикреплённые файлы:**', ...turn.attachments.map(a => `- \`${a.name}\``), '')
+      }
     }
     const textParts = turn.parts.flatMap(p => (p.kind === 'text' ? [p.text] : [])).join('\n\n').trim()
     const thinkingParts = turn.parts.flatMap(p => (p.kind === 'thinking' ? [p.text] : [])).join('\n\n').trim()
     const meta = [turn.model, turn.provider].filter(Boolean).join(' · ')
-    lines.push(`## Ассистент${meta ? ` — ${meta}` : ''}`, '')
+    lines.push(`## Ассистент${meta ? ` — ${meta}` : ''} (${timeStr})`, '')
     if (thinkingParts) {
       lines.push('<details>', '<summary>Размышления</summary>', '', thinkingParts, '', '</details>', '')
     }
@@ -1080,6 +1158,9 @@ export function exportChatMarkdown(c: Chat): string {
       lines.push(textParts, '')
     } else if (turn.notice) {
       lines.push(`_${turn.notice}_`, '')
+    }
+    if (turn.assistantAttachments?.length) {
+      lines.push('**Созданные файлы:**', ...turn.assistantAttachments.map(a => `- \`${a.name}\``), '')
     }
     lines.push('---', '')
   }
@@ -1149,6 +1230,144 @@ export async function togglePinChat(chatId: string) {
   useChats.setState(s => ({
     chats: sortChatsPinnedFirst(s.chats.map(c => c.id === chatId ? { ...c, pinned: nextPinned } : c)),
   }))
+}
+
+export async function createChatFolder(name: string, color = '#6366f1') {
+  const trimmed = name.trim()
+  if (!trimmed || trimmed.length > 60) return
+  const { remote } = useChats.getState()
+  if (remote) {
+    const folder = await remote.createFolder(trimmed, color)
+    if (useChats.getState().remote === remote) {
+      useChats.setState(s => ({ folders: [...s.folders, folder] }))
+    }
+    return folder
+  }
+  const folder: ChatFolder = {
+    id: crypto.randomUUID(),
+    name: trimmed,
+    color,
+    sortOrder: useChats.getState().folders.length,
+    createdAt: Date.now(),
+  }
+  useChats.setState(s => ({ folders: [...s.folders, folder] }))
+  return folder
+}
+
+export async function updateChatFolder(id: string, patch: { name?: string; color?: string }) {
+  const { remote } = useChats.getState()
+  if (remote) {
+    const updated = await remote.updateFolder(id, patch)
+    if (useChats.getState().remote === remote) {
+      useChats.setState(s => ({ folders: s.folders.map(f => f.id === id ? updated : f) }))
+    }
+    return
+  }
+  useChats.setState(s => ({
+    folders: s.folders.map(f => f.id === id ? { ...f, ...patch } : f),
+  }))
+}
+
+export async function deleteChatFolder(id: string) {
+  const { remote } = useChats.getState()
+  if (remote) {
+    await remote.deleteFolder(id)
+    if (useChats.getState().remote === remote) {
+      useChats.setState(s => ({
+        folders: s.folders.filter(f => f.id !== id),
+        chats: s.chats.map(c => c.folderId === id ? { ...c, folderId: null } : c),
+      }))
+    }
+    return
+  }
+  useChats.setState(s => ({
+    folders: s.folders.filter(f => f.id !== id),
+    chats: s.chats.map(c => c.folderId === id ? { ...c, folderId: null } : c),
+  }))
+}
+
+export async function moveChatToFolder(chatId: string, folderId: string | null) {
+  const { remote, chats } = useChats.getState()
+  const target = chats.find(c => c.id === chatId)
+  if (!target || target.access !== 'owner' || target.indexedCodex) return
+  if (remote) {
+    try {
+      const { workspace } = await remote.patchChat(chatId, { folderId })
+      if (useChats.getState().remote === remote) applyRemoteWorkspace(remote, workspace)
+    } catch (error) {
+      if (useChats.getState().remote === remote) {
+        useChats.setState({ connectionError: error instanceof Error ? error.message : 'Не удалось переместить чат в папку.' })
+      }
+    }
+    return
+  }
+  updateChat(chatId, c => ({ ...c, folderId }))
+  const saved = transcripts.get(chatId)
+  if (saved) transcripts.set(chatId, { ...saved, folderId })
+}
+
+export async function toggleArchiveChat(chatId: string) {
+  const { remote, chats } = useChats.getState()
+  const target = chats.find(c => c.id === chatId)
+  if (!target || target.access !== 'owner' || target.indexedCodex) return
+  const nextArchived = !target.archivedAt
+  if (remote) {
+    try {
+      const { workspace } = await remote.patchChat(chatId, { archived: nextArchived })
+      if (useChats.getState().remote === remote) applyRemoteWorkspace(remote, workspace)
+    } catch (error) {
+      if (useChats.getState().remote === remote) {
+        useChats.setState({ connectionError: error instanceof Error ? error.message : 'Не удалось изменить статус архива.' })
+      }
+    }
+    return
+  }
+  const archivedAt = nextArchived ? Date.now() : null
+  updateChat(chatId, c => ({ ...c, archivedAt }))
+  const saved = transcripts.get(chatId)
+  if (saved) transcripts.set(chatId, { ...saved, archivedAt })
+}
+
+export async function searchChatsAndMessages(query: string, signal?: AbortSignal): Promise<SearchResult[]> {
+  const trimmed = query.trim()
+  if (!trimmed) return []
+  const { remote, chats } = useChats.getState()
+  if (remote) {
+    return remote.search(trimmed, 30, signal)
+  }
+  const lowerQ = trimmed.toLowerCase()
+  const out: SearchResult[] = []
+  for (const c of chats) {
+    for (let i = c.turns.length - 1; i >= 0; i--) {
+      const t = c.turns[i]!
+      const text = t.parts.flatMap(p => (p.kind === 'text' ? [p.text] : [])).join('\n')
+      if (text.toLowerCase().includes(lowerQ)) {
+        out.push({ chatId: c.id, messageId: t.id, chatTitle: c.title, role: 'assistant', snippet: text.slice(0, 140), createdAt: t.time })
+      }
+      if (t.prompt.toLowerCase().includes(lowerQ)) {
+        out.push({ chatId: c.id, messageId: t.id, chatTitle: c.title, role: 'user', snippet: t.prompt.slice(0, 140), createdAt: t.time })
+      }
+      if (out.length >= 30) return out.slice(0, 30)
+    }
+    if (c.title.toLowerCase().includes(lowerQ) && !out.some(r => r.chatId === c.id)) {
+      out.push({ chatId: c.id, messageId: '', chatTitle: c.title, role: 'title', snippet: c.title, createdAt: Date.now() })
+    }
+    if (out.length >= 30) return out.slice(0, 30)
+  }
+  return out
+}
+
+export function jumpToSearchResult(hit: SearchResult) {
+  selectChat(hit.chatId)
+  useChats.setState({
+    pendingSearchJump: hit.messageId
+      ? { chatId: hit.chatId, messageId: hit.messageId, nonce: Date.now() }
+      : null,
+  })
+}
+
+export function clearSearchJump() {
+  useChats.setState({ pendingSearchJump: null })
 }
 
 export async function forkChatAt(chatId: string, upToTurnId?: string) {

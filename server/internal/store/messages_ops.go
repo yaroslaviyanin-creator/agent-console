@@ -48,6 +48,11 @@ func (s *Store) checkWriteOrForbidden(ctx context.Context, tx *sql.Tx, userID, c
 
 // UpdateChat updates title and/or pinned state for a chat owned by userID.
 func (s *Store) UpdateChat(ctx context.Context, userID, chatID string, title *string, pinned *bool) (Chat, error) {
+	return s.UpdateChatWithOptions(ctx, userID, chatID, title, pinned, false, nil, nil)
+}
+
+// UpdateChatWithOptions updates title, pinned, folderId, and/or archived state for a chat owned by userID.
+func (s *Store) UpdateChatWithOptions(ctx context.Context, userID, chatID string, title *string, pinned *bool, folderSet bool, folderID *string, archived *bool) (Chat, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Chat{}, err
@@ -59,18 +64,66 @@ func (s *Store) UpdateChat(ctx context.Context, userID, chatID string, title *st
 	}
 
 	var c Chat
-	if err := tx.QueryRowContext(ctx, `SELECT id,title,provider,model,pinned,created_at,updated_at,user_id FROM chats WHERE id=?`, chatID).
-		Scan(&c.ID, &c.Title, &c.Provider, &c.Model, &c.Pinned, &c.CreatedAt, &c.UpdatedAt, &c.OwnerID); err != nil {
+	var curFolder sql.NullString
+	var curArchived sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT id,title,provider,model,pinned,folder_id,archived_at,created_at,updated_at,user_id FROM chats WHERE id=?`, chatID).
+		Scan(&c.ID, &c.Title, &c.Provider, &c.Model, &c.Pinned, &curFolder, &curArchived, &c.CreatedAt, &c.UpdatedAt, &c.OwnerID); err != nil {
 		return Chat{}, err
 	}
 	c.Access = "owner"
+	if curFolder.Valid && curFolder.String != "" {
+		v := curFolder.String
+		c.FolderID = &v
+	}
+	if curArchived.Valid {
+		v := curArchived.Int64
+		c.ArchivedAt = &v
+	}
+
 	if title != nil {
 		c.Title = *title
 	}
 	if pinned != nil {
 		c.Pinned = *pinned
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE chats SET title=?, pinned=? WHERE id=? AND user_id=?`, c.Title, c.Pinned, chatID, userID); err != nil {
+	if folderSet {
+		if folderID == nil || *folderID == "" {
+			c.FolderID = nil
+		} else {
+			var ownedFolder string
+			err := tx.QueryRowContext(ctx, `SELECT id FROM chat_folders WHERE id=? AND user_id=?`, *folderID, userID).Scan(&ownedFolder)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return Chat{}, ErrForbidden
+				}
+				return Chat{}, err
+			}
+			v := ownedFolder
+			c.FolderID = &v
+		}
+	}
+	if archived != nil {
+		if *archived {
+			if c.ArchivedAt == nil {
+				now := time.Now().UnixMilli()
+				c.ArchivedAt = &now
+			}
+		} else {
+			c.ArchivedAt = nil
+		}
+	}
+
+	var dbFolder any
+	if c.FolderID != nil {
+		dbFolder = *c.FolderID
+	}
+	var dbArchived any
+	if c.ArchivedAt != nil {
+		dbArchived = *c.ArchivedAt
+	}
+
+	if _, err := tx.ExecContext(ctx, `UPDATE chats SET title=?, pinned=?, folder_id=?, archived_at=? WHERE id=? AND user_id=?`,
+		c.Title, c.Pinned, dbFolder, dbArchived, chatID, userID); err != nil {
 		return Chat{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -127,20 +180,20 @@ func (s *Store) ForkChatUpTo(ctx context.Context, userID, sourceChatID, upToMess
 	}
 
 	type srcMsg struct {
-		oldID, role, content, thinking string
-		createdAt                      int64
-		runID                          sql.NullString
-		durationMs                     sql.NullInt64
+		oldID, role, content, thinking, webSources string
+		createdAt                                  int64
+		runID                                      sql.NullString
+		durationMs                                 sql.NullInt64
 	}
 	var (
 		rows *sql.Rows
 	)
 	if hasCutoff {
-		rows, err = tx.QueryContext(ctx, `SELECT id,role,content,thinking,created_at,run_id,duration_ms
+		rows, err = tx.QueryContext(ctx, `SELECT id,role,content,thinking,created_at,run_id,duration_ms,COALESCE(web_sources_json,'[]')
 			FROM chat_messages WHERE chat_id=?1 AND (created_at < ?2 OR (created_at = ?2 AND rowid <= ?3))
 			ORDER BY created_at,rowid`, sourceChatID, cutoffCreatedAt, cutoffRowID)
 	} else {
-		rows, err = tx.QueryContext(ctx, `SELECT id,role,content,thinking,created_at,run_id,duration_ms
+		rows, err = tx.QueryContext(ctx, `SELECT id,role,content,thinking,created_at,run_id,duration_ms,COALESCE(web_sources_json,'[]')
 			FROM chat_messages WHERE chat_id=?1 ORDER BY created_at,rowid`, sourceChatID)
 	}
 	if err != nil {
@@ -149,7 +202,7 @@ func (s *Store) ForkChatUpTo(ctx context.Context, userID, sourceChatID, upToMess
 	var msgs []srcMsg
 	for rows.Next() {
 		var m srcMsg
-		if err := rows.Scan(&m.oldID, &m.role, &m.content, &m.thinking, &m.createdAt, &m.runID, &m.durationMs); err != nil {
+		if err := rows.Scan(&m.oldID, &m.role, &m.content, &m.thinking, &m.createdAt, &m.runID, &m.durationMs, &m.webSources); err != nil {
 			rows.Close()
 			return Chat{}, err
 		}
@@ -166,9 +219,9 @@ func (s *Store) ForkChatUpTo(ctx context.Context, userID, sourceChatID, upToMess
 	for _, m := range msgs {
 		newMsgID := randomHex(16)
 		idMap[m.oldID] = newMsgID
-		if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages (id,chat_id,role,content,thinking,created_at,run_id,duration_ms,run_user_id)
-			VALUES (?,?,?,?,?,?,?,?,'')`,
-			newMsgID, c.ID, m.role, m.content, m.thinking, m.createdAt, m.runID, m.durationMs); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages (id,chat_id,role,content,thinking,created_at,run_id,duration_ms,run_user_id,web_sources_json)
+			VALUES (?,?,?,?,?,?,?,?,'',?)`,
+			newMsgID, c.ID, m.role, m.content, m.thinking, m.createdAt, m.runID, m.durationMs, m.webSources); err != nil {
 			return Chat{}, err
 		}
 		if m.role == "assistant" && m.runID.Valid && m.runID.String != "" && !copiedRuns[m.runID.String] {
@@ -184,12 +237,12 @@ func (s *Store) ForkChatUpTo(ctx context.Context, userID, sourceChatID, upToMess
 	}
 
 	type srcAtt struct {
-		oldMsgID, name, mimeType, kind, sha256, storageKey, warning string
-		sizeBytes                                                   int64
-		extractedText                                               sql.NullString
-		createdAt                                                   int64
+		oldMsgID, name, mimeType, kind, sha256, storageKey, warning, source string
+		sizeBytes                                                           int64
+		extractedText                                                       sql.NullString
+		createdAt                                                           int64
 	}
-	attRows, err := tx.QueryContext(ctx, `SELECT message_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,warning,created_at
+	attRows, err := tx.QueryContext(ctx, `SELECT message_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,warning,source,created_at
 		FROM chat_attachments WHERE chat_id=? AND message_id IS NOT NULL ORDER BY created_at,rowid`, sourceChatID)
 	if err != nil {
 		return Chat{}, err
@@ -197,7 +250,7 @@ func (s *Store) ForkChatUpTo(ctx context.Context, userID, sourceChatID, upToMess
 	var atts []srcAtt
 	for attRows.Next() {
 		var a srcAtt
-		if err := attRows.Scan(&a.oldMsgID, &a.name, &a.mimeType, &a.kind, &a.sizeBytes, &a.sha256, &a.storageKey, &a.extractedText, &a.warning, &a.createdAt); err != nil {
+		if err := attRows.Scan(&a.oldMsgID, &a.name, &a.mimeType, &a.kind, &a.sizeBytes, &a.sha256, &a.storageKey, &a.extractedText, &a.warning, &a.source, &a.createdAt); err != nil {
 			attRows.Close()
 			return Chat{}, err
 		}
@@ -243,9 +296,9 @@ func (s *Store) ForkChatUpTo(ctx context.Context, userID, sourceChatID, upToMess
 			copiedPaths = append(copiedPaths, dstPath)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO chat_attachments
-			(id,chat_id,message_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,warning,created_at)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			newAttID, c.ID, idMap[a.oldMsgID], userID, a.name, a.mimeType, a.kind, a.sizeBytes, a.sha256, newKey, a.extractedText, a.warning, a.createdAt); err != nil {
+			(id,chat_id,message_id,user_id,original_name,mime_type,kind,size_bytes,sha256,storage_key,extracted_text,warning,source,created_at)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			newAttID, c.ID, idMap[a.oldMsgID], userID, a.name, a.mimeType, a.kind, a.sizeBytes, a.sha256, newKey, a.extractedText, a.warning, a.source, a.createdAt); err != nil {
 			rollbackFiles()
 			return Chat{}, err
 		}
@@ -309,8 +362,8 @@ func (s *Store) DeleteMessage(ctx context.Context, userID, chatID, messageID str
 	}
 
 	var keysToDelete []string
-	if role == "user" {
-		attRows, err := tx.QueryContext(ctx, `SELECT storage_key FROM chat_attachments WHERE chat_id=? AND message_id=?`, chatID, msgID)
+	collectForQuery := func(query string, args ...any) error {
+		attRows, err := tx.QueryContext(ctx, query, args...)
 		if err != nil {
 			return err
 		}
@@ -327,17 +380,31 @@ func (s *Store) DeleteMessage(ctx context.Context, userID, chatID, messageID str
 			return err
 		}
 		attRows.Close()
+		return nil
+	}
 
+	if role == "user" {
 		if runID.Valid && runID.String != "" {
+			if err := collectForQuery(`SELECT a.storage_key FROM chat_attachments a
+				JOIN chat_messages m ON m.id=a.message_id
+				WHERE a.chat_id=? AND (m.id=? OR m.run_id=?)`, chatID, msgID, runID.String); err != nil {
+				return err
+			}
 			if _, err := tx.ExecContext(ctx, `DELETE FROM chat_messages WHERE chat_id=? AND (id=? OR run_id=?)`, chatID, msgID, runID.String); err != nil {
 				return err
 			}
 		} else {
+			if err := collectForQuery(`SELECT storage_key FROM chat_attachments WHERE chat_id=? AND message_id=?`, chatID, msgID); err != nil {
+				return err
+			}
 			if _, err := tx.ExecContext(ctx, `DELETE FROM chat_messages WHERE chat_id=? AND id=?`, chatID, msgID); err != nil {
 				return err
 			}
 		}
 	} else {
+		if err := collectForQuery(`SELECT storage_key FROM chat_attachments WHERE chat_id=? AND message_id=?`, chatID, msgID); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM chat_messages WHERE chat_id=? AND id=?`, chatID, msgID); err != nil {
 			return err
 		}

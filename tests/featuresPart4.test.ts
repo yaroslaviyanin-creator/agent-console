@@ -250,7 +250,8 @@ test('Markdown export, plain text stripping, and context menu position clamping 
     }],
   }
   const md = exportChatMarkdown(c)
-  assert.match(md, /^# Архитектура/)
+  assert.match(md, /^---\ntitle: "Архитектура"\ncreated: .+\nexported: .+\nproviders: \["codex"\]\nmodels: \["codex", "Codex"\]\nmessages: 2\n---/)
+  assert.match(md, /\n# Архитектура\n/)
   assert.match(md, /## Пользователь/)
   assert.match(md, /## Ассистент — Codex · codex/)
   assert.match(md, /<summary>Размышления<\/summary>/)
@@ -261,4 +262,71 @@ test('Markdown export, plain text stripping, and context menu position clamping 
   const clamped = clampMenuPosition(1200, 900, 210, 240, 1280, 920)
   assert.equal(clamped.left, 1062)
   assert.equal(clamped.top, 672)
+})
+
+test('Stage 3: Sidebar folders, archive, SearchPalette Cmd+K, and Obsidian export with attachments', async () => {
+  const { createChatFolder, deleteChatFolder, moveChatToFolder, toggleArchiveChat, searchChatsAndMessages, useChats } = await import('../src/app/chatStore')
+  const { SearchPalette } = await import('../src/app/SearchPalette')
+
+  const sidebarSource = readFileSync(new URL('../src/app/Sidebar.tsx', import.meta.url), 'utf8')
+  assert.match(sidebarSource, /Переместить в папку/)
+  assert.match(sidebarSource, /Архивировать/)
+  assert.match(sidebarSource, /Архив \(/)
+
+  const appSource = readFileSync(new URL('../src/app/App.tsx', import.meta.url), 'utf8')
+  assert.match(appSource, /e\.key\.toLowerCase\(\) === 'k'/)
+  assert.match(appSource, /<SearchPalette/)
+
+  // Verify SearchPalette renders empty prompt state cleanly on SSR
+  const searchHtml = renderToStaticMarkup(createElement(SearchPalette, { open: true, onClose: () => {} }))
+  assert.match(searchHtml, /Поиск по чатам и сообщениям/)
+
+  // Verify in-memory folders, archive, and search in chatStore
+  useChats.setState({
+    remote: null,
+    folders: [],
+    chats: [
+      {
+        id: 'c-org',
+        title: 'Организация дел',
+        access: 'owner',
+        model: 'sonnet',
+        target: { mode: 'chat' },
+        draft: '',
+        turns: [{
+          id: 't-org-1',
+          prompt: 'Напиши заметку про кварц',
+          time: 1_700_000_000_000,
+          model: 'Claude Sonnet',
+          seq: 1,
+          state: 'completed',
+          attachments: [{ id: 'u1', kind: 'text', name: 'notes.txt' }],
+          assistantAttachments: [{ id: 'a1', kind: 'pdf', name: 'summary.pdf', source: 'assistant' }],
+          parts: [{ kind: 'text', text: 'Готово: **формула** $E=mc^2$.' }],
+        }],
+      },
+    ],
+  })
+
+  const folder = await createChatFolder('Заметки', '#10b981')
+  assert.ok(folder?.id)
+  await moveChatToFolder('c-org', folder!.id)
+  assert.equal(useChats.getState().chats[0]?.folderId, folder!.id)
+
+  await toggleArchiveChat('c-org')
+  assert.ok(useChats.getState().chats[0]?.archivedAt != null)
+
+  await deleteChatFolder(folder!.id)
+  assert.equal(useChats.getState().folders.length, 0)
+  assert.equal(useChats.getState().chats[0]?.folderId, null)
+
+  const hits = await searchChatsAndMessages('кварц')
+  assert.equal(hits.length, 1)
+  assert.equal(hits[0]?.chatId, 'c-org')
+  assert.equal(hits[0]?.messageId, 't-org-1')
+
+  const exported = exportChatMarkdown(useChats.getState().chats[0]!)
+  assert.match(exported, /\*\*Прикреплённые файлы:\*\*\n- `notes\.txt`/)
+  assert.match(exported, /\*\*Созданные файлы:\*\*\n- `summary\.pdf`/)
+  assert.match(exported, /\$E=mc\^2\$/)
 })

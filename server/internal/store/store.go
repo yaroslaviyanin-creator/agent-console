@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -75,6 +76,8 @@ type Chat struct {
 	SessionProvider string      `json:"-"`
 	Model           string      `json:"model"`
 	Pinned          bool        `json:"pinned,omitempty"`
+	FolderID        *string     `json:"folderId,omitempty"`
+	ArchivedAt      *int64      `json:"archivedAt,omitempty"`
 	CreatedAt       int64       `json:"createdAt"`
 	UpdatedAt       int64       `json:"updatedAt"`
 }
@@ -87,8 +90,16 @@ type MessageUsage struct {
 	TotalTokens       int64 `json:"totalTokens"`
 }
 
+type WebSource struct {
+	URL    string `json:"url"`
+	Title  string `json:"title,omitempty"`
+	Status string `json:"status"`
+	Detail string `json:"detail,omitempty"`
+}
+
 type Message struct {
 	Attachments []MessageAttachment `json:"attachments,omitempty"`
+	WebSources  []WebSource         `json:"webSources,omitempty"`
 	Progress    string              `json:"progress,omitempty"`
 	DurationMs  *int64              `json:"durationMs,omitempty"`
 	Provider    string              `json:"provider,omitempty"`
@@ -192,7 +203,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version == 20 {
+	if version == 23 {
 		return nil
 	}
 	// SQLite requires disabling foreign keys outside the transaction on this connection.
@@ -209,7 +220,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	switch version {
 	case 0:
-		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=20;"); err != nil {
+		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=23;"); err != nil {
 			return err
 		}
 	case 1:
@@ -534,7 +545,65 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=20;`); err != nil {
 			return err
 		}
+		fallthrough
 	case 20:
+		var sourceExists bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chat_attachments') WHERE name='source')").Scan(&sourceExists); err != nil {
+			return err
+		}
+		if !sourceExists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE chat_attachments ADD COLUMN source TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'assistant'));`); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=21;`); err != nil {
+			return err
+		}
+		fallthrough
+	case 21:
+		var webSourcesExists bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chat_messages') WHERE name='web_sources_json')").Scan(&webSourcesExists); err != nil {
+			return err
+		}
+		if !webSourcesExists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE chat_messages ADD COLUMN web_sources_json TEXT NOT NULL DEFAULT '[]';`); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=22;`); err != nil {
+			return err
+		}
+		fallthrough
+	case 22:
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS chat_folders (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name TEXT NOT NULL,
+			color TEXT NOT NULL DEFAULT '#6366f1',
+			sort_order INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS chat_folders_by_user ON chat_folders (user_id, sort_order, created_at);`); err != nil {
+			return err
+		}
+		for _, col := range []struct{ name, def string }{
+			{"folder_id", "TEXT NULL"},
+			{"archived_at", "INTEGER NULL"},
+		} {
+			var exists bool
+			if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chats') WHERE name=?)", col.name).Scan(&exists); err != nil {
+				return err
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE chats ADD COLUMN "+col.name+" "+col.def); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=23;`); err != nil {
+			return err
+		}
+	case 23:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}
@@ -709,7 +778,10 @@ func insertChat(ctx context.Context, db interface {
 }
 
 func (s *Store) Chats(ctx context.Context, userID string) ([]Chat, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.title,c.provider,c.model,c.pinned,c.created_at,c.updated_at,c.user_id,
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.title,c.provider,c.model,c.pinned,
+		CASE WHEN c.user_id=?1 THEN c.folder_id ELSE NULL END,
+		CASE WHEN c.user_id=?1 THEN c.archived_at ELSE NULL END,
+		c.created_at,c.updated_at,c.user_id,
 		COALESCE(membership.access,'owner'),g.user_id,g.access
 		FROM chats c LEFT JOIN chat_shares membership ON membership.chat_id=c.id AND membership.user_id=?1
 		LEFT JOIN chat_shares g ON g.chat_id=c.id AND c.user_id=?1
@@ -722,9 +794,19 @@ func (s *Store) Chats(ctx context.Context, userID string) ([]Chat, error) {
 	chats := []Chat{}
 	for rows.Next() {
 		var c Chat
+		var folderID sql.NullString
+		var archivedAt sql.NullInt64
 		var recipient, grant sql.NullString
-		if err := rows.Scan(&c.ID, &c.Title, &c.Provider, &c.Model, &c.Pinned, &c.CreatedAt, &c.UpdatedAt, &c.OwnerID, &c.Access, &recipient, &grant); err != nil {
+		if err := rows.Scan(&c.ID, &c.Title, &c.Provider, &c.Model, &c.Pinned, &folderID, &archivedAt, &c.CreatedAt, &c.UpdatedAt, &c.OwnerID, &c.Access, &recipient, &grant); err != nil {
 			return nil, err
+		}
+		if folderID.Valid && folderID.String != "" {
+			v := folderID.String
+			c.FolderID = &v
+		}
+		if archivedAt.Valid {
+			v := archivedAt.Int64
+			c.ArchivedAt = &v
 		}
 		if len(chats) == 0 || chats[len(chats)-1].ID != c.ID {
 			chats = append(chats, c)
@@ -808,7 +890,7 @@ func (s *Store) ForkChat(ctx context.Context, userID, sourceChatID string) (Chat
 
 func (s *Store) messages(ctx context.Context, userID, chatID string, includeShared bool) ([]Message, error) {
 	// A LEFT JOIN distinguishes an accessible empty chat from an inaccessible chat.
-	rows, err := s.db.QueryContext(ctx, `SELECT CASE WHEN m.role='assistant' THEN COALESCE(m.run_id,m.id) ELSE m.id END, m.role,m.content,m.thinking,m.created_at,m.run_id,m.duration_ms,
+	rows, err := s.db.QueryContext(ctx, `SELECT CASE WHEN m.role='assistant' THEN COALESCE(m.run_id,m.id) ELSE m.id END, m.role,m.content,m.thinking,m.created_at,m.run_id,m.duration_ms,COALESCE(m.web_sources_json,'[]'),
 		u.provider,u.model,u.input_tokens,u.cached_input_tokens,u.output_tokens,u.reasoning_tokens
 		FROM chats c LEFT JOIN chat_messages m ON m.chat_id=c.id
 		LEFT JOIN usage_events u ON u.chat_id=m.chat_id AND u.run_id=m.run_id AND m.role='assistant'
@@ -823,10 +905,10 @@ func (s *Store) messages(ctx context.Context, userID, chatID string, includeShar
 	found := false
 	for rows.Next() {
 		found = true
-		var id, role, content, thinking, runID, uProvider, uModel sql.NullString
+		var id, role, content, thinking, runID, webSourcesRaw, uProvider, uModel sql.NullString
 		var createdAt, uIn, uCached, uOut, uReason sql.NullInt64
 		var durationMs *int64
-		if err := rows.Scan(&id, &role, &content, &thinking, &createdAt, &runID, &durationMs, &uProvider, &uModel, &uIn, &uCached, &uOut, &uReason); err != nil {
+		if err := rows.Scan(&id, &role, &content, &thinking, &createdAt, &runID, &durationMs, &webSourcesRaw, &uProvider, &uModel, &uIn, &uCached, &uOut, &uReason); err != nil {
 			return nil, err
 		}
 		if id.Valid {
@@ -834,6 +916,12 @@ func (s *Store) messages(ctx context.Context, userID, chatID string, includeShar
 				ID: id.String, RunID: runID.String, ChatID: chatID, Role: role.String,
 				Content: content.String, Thinking: thinking.String, CreatedAt: createdAt.Int64, DurationMs: durationMs,
 				Provider: uProvider.String, Model: uModel.String,
+			}
+			if raw := strings.TrimSpace(webSourcesRaw.String); raw != "" && raw != "[]" {
+				var sources []WebSource
+				if json.Unmarshal([]byte(raw), &sources) == nil && len(sources) > 0 {
+					msg.WebSources = sources
+				}
 			}
 			if uIn.Valid || uCached.Valid || uOut.Valid || uReason.Valid {
 				msg.Usage = &MessageUsage{
@@ -859,10 +947,8 @@ func (s *Store) messages(ctx context.Context, userID, chatID string, includeShar
 			return nil, err
 		}
 		for i := range messages {
-			if messages[i].Role == "user" {
-				if atts := byMessage[messages[i].ID]; len(atts) > 0 {
-					messages[i].Attachments = atts
-				}
+			if atts := byMessage[messages[i].ID]; len(atts) > 0 {
+				messages[i].Attachments = atts
 			}
 		}
 	}

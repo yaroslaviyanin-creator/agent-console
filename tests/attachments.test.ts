@@ -58,3 +58,61 @@ test('chatStore clears draft attachments on send and supports attachment-only me
   assert.match(source, /attachments:\s*source\s*\?\s*value\.attachments\s*:\s*\[\]/)
   assert.match(source, /attachmentIds\.length\s*\?\s*\{\s*attachmentIds\s*\}\s*:\s*\{\}/)
 })
+
+test('applyEvent done attaches generated assistantAttachments and replaces raw console_file text with cleanText', async () => {
+  const { applyEvent } = await import('../src/app/chatStore')
+  const turn = {
+    id: 'm1',
+    prompt: 'Создай файл',
+    time: 1000,
+    model: 'Codex',
+    parts: [
+      { kind: 'thinking' as const, text: 'Думаю' },
+      { kind: 'text' as const, text: 'Готово:\n<console_file name="report.pdf"># Отчёт</console_file>' },
+    ],
+    seq: 2,
+    state: 'running' as const,
+  }
+  const doneTurn = applyEvent(turn, {
+    type: 'done',
+    chatId: 'c1',
+    messageId: 'm1',
+    seq: 3,
+    reason: 'completed',
+    cleanText: 'Готово:',
+    attachments: [
+      { id: 'a1', kind: 'pdf', name: 'report.pdf', sizeBytes: 2048, source: 'assistant', url: '/api/attachments/a1' },
+    ],
+  })
+  assert.equal(doneTurn.state, 'completed')
+  assert.equal(doneTurn.assistantAttachments?.length, 1)
+  assert.equal(doneTurn.assistantAttachments?.[0]?.name, 'report.pdf')
+  assert.deepEqual(doneTurn.parts, [
+    { kind: 'thinking', text: 'Думаю' },
+    { kind: 'text', text: 'Готово:' },
+  ])
+})
+
+test('applyEvent web_sources and collectChatWebLinks preserve titles and statuses', async () => {
+  const { applyEvent } = await import('../src/app/chatStore')
+  const { collectChatWebLinks } = await import('../src/app/ChatContextPanel')
+  const turn = applyEvent({
+    id: 'm2',
+    prompt: 'Смотри https://example.com',
+    time: 1000,
+    model: 'Codex',
+    parts: [],
+    seq: 1,
+    state: 'running',
+  }, {
+    type: 'web_sources',
+    chatId: 'c1',
+    messageId: 'm2',
+    seq: 2,
+    webSources: [{ url: 'https://example.com', title: 'Example Domain', status: 'ok' }],
+  })
+  assert.equal(turn.webSources?.length, 1)
+  assert.equal(turn.webSources?.[0]?.title, 'Example Domain')
+  const links = collectChatWebLinks([turn])
+  assert.deepEqual(links, [{ url: 'https://example.com', title: 'Example Domain', status: 'ok' }])
+})

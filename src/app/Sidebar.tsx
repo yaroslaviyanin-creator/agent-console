@@ -1,12 +1,16 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
-  CodeXml, Download, Eye, GitFork, MessageSquare, MoreHorizontal, Pencil, Pin, PinOff, Plus, Radio, Receipt, Settings2, Share2, Shield, Trash2, Users, X,
+  Archive, ArchiveRestore, ChevronDown, ChevronRight, CodeXml, Download, Eye, Folder, FolderInput, FolderPlus,
+  GitFork, MessageSquare, MoreHorizontal, Palette, Pencil, Pin, PinOff, Plus, Radio, Receipt, Search,
+  Settings2, Share2, Shield, Trash2, Users, X,
 } from 'lucide-react'
 import {
-  deleteChatItem, downloadChatMarkdown, forkChatAt, newChat, renameChat, selectChat, togglePinChat, useChats,
-  type Chat,
+  createChatFolder, deleteChatFolder, deleteChatItem, downloadChatMarkdown, forkChatAt,
+  moveChatToFolder, newChat, renameChat, selectChat, toggleArchiveChat, togglePinChat,
+  updateChatFolder, useChats, type Chat,
 } from './chatStore'
+import type { ChatFolder } from '../protocol/types'
 import { Quotas, ServerQuotas } from './Quotas'
 import { useAccountStore } from './accountStore'
 import { UserAvatar } from './UserAvatar'
@@ -18,8 +22,39 @@ const planBadges = {
   unlimited: 'UNLIMITED',
 } as const
 
+export const FOLDER_COLORS = ['#6366f1', '#10b981', '#0ea5e9', '#f59e0b', '#f43f5e', '#64748b'] as const
+const COLLAPSED_STORAGE_KEY = 'agent-console:collapsed-sections'
+
+function readCollapsedSections(): Record<string, boolean> {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return {}
+    const raw = window.localStorage.getItem(COLLAPSED_STORAGE_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, boolean> : {}
+  } catch {
+    return {}
+  }
+}
+
+function saveCollapsedSections(next: Record<string, boolean>) {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(COLLAPSED_STORAGE_KEY, JSON.stringify(next))
+    }
+  } catch { /* ignore restricted storage */ }
+}
+
 interface MenuState {
+  kind: 'chat'
   chatId: string
+  x: number
+  y: number
+}
+
+interface FolderMenuState {
+  kind: 'folder'
+  folderId: string
   x: number
   y: number
 }
@@ -38,23 +73,41 @@ export function Sidebar({
   openSettings,
   openAdmin,
   openShare,
+  openSearch,
 }: {
   close: () => void
   openBilling: () => void
   openSettings: () => void
   openAdmin?: (() => void) | undefined
   openShare: (chatId: string) => void
+  openSearch?: (() => void) | undefined
 }) {
-  const { chats, activeId, mode, connected, connectionError, workspace, remote } = useChats()
+  const { chats, folders, activeId, mode, connected, connectionError, workspace, remote } = useChats()
   const mobileQuotaRef = useRef<HTMLDetailsElement>(null)
   const serverQuota = useAccountStore(s => s.serverQuota)
   const online = mode === 'demo' || (connected && !connectionError)
-  const [menu, setMenu] = useState<MenuState | null>(null)
+
+  const [menu, setMenu] = useState<MenuState | FolderMenuState | null>(null)
+  const [folderSubmenuOpen, setFolderSubmenuOpen] = useState(false)
+  const [folderColorSubmenuOpen, setFolderColorSubmenuOpen] = useState(false)
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
+  const [renamingFolderId, setRenamingFolderId] = useState<string | null>(null)
+  const [renameFolderDraft, setRenameFolderDraft] = useState('')
+
+  const [creatingFolder, setCreatingFolder] = useState(false)
+  const [newFolderName, setNewFolderName] = useState('')
+  const [newFolderColor, setNewFolderColor] = useState<string>(FOLDER_COLORS[0])
+  const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>(() => ({
+    archive: true,
+    ...readCollapsedSections(),
+  }))
+
   const menuRef = useRef<HTMLDivElement>(null)
   const renameInputRef = useRef<HTMLInputElement>(null)
+  const renameFolderInputRef = useRef<HTMLInputElement>(null)
+  const newFolderInputRef = useRef<HTMLInputElement>(null)
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const longPressOriginRef = useRef<{ x: number; y: number } | null>(null)
   const suppressNextClickRef = useRef(false)
@@ -67,14 +120,27 @@ export function Sidebar({
     }
   }, [renamingId])
 
+  useEffect(() => {
+    if (renamingFolderId) {
+      renameFolderInputRef.current?.focus()
+      renameFolderInputRef.current?.select()
+    }
+  }, [renamingFolderId])
+
+  useEffect(() => {
+    if (creatingFolder) {
+      newFolderInputRef.current?.focus()
+    }
+  }, [creatingFolder])
+
   useLayoutEffect(() => {
     if (!menu || !menuRef.current) {
       setMenuPos(null)
       return
     }
     const rect = menuRef.current.getBoundingClientRect()
-    setMenuPos(clampMenuPosition(menu.x, menu.y, rect.width || 210, rect.height || 240, window.innerWidth, window.innerHeight))
-  }, [menu, confirmDeleteId])
+    setMenuPos(clampMenuPosition(menu.x, menu.y, rect.width || 220, rect.height || 260, window.innerWidth, window.innerHeight))
+  }, [menu, confirmDeleteId, folderSubmenuOpen, folderColorSubmenuOpen])
 
   useEffect(() => {
     if (!menu) return
@@ -82,12 +148,16 @@ export function Sidebar({
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenu(null)
         setConfirmDeleteId(null)
+        setFolderSubmenuOpen(false)
+        setFolderColorSubmenuOpen(false)
       }
     }
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setMenu(null)
         setConfirmDeleteId(null)
+        setFolderSubmenuOpen(false)
+        setFolderColorSubmenuOpen(false)
       }
     }
     window.addEventListener('pointerdown', onPointerDown)
@@ -97,6 +167,14 @@ export function Sidebar({
       window.removeEventListener('keydown', onKeyDown)
     }
   }, [menu])
+
+  const toggleSection = (key: string) => {
+    setCollapsedSections(prev => {
+      const next = { ...prev, [key]: !prev[key] }
+      saveCollapsedSections(next)
+      return next
+    })
+  }
 
   const clearLongPress = () => {
     if (longPressTimerRef.current) {
@@ -108,13 +186,36 @@ export function Sidebar({
 
   const openMenuAt = (chatId: string, x: number, y: number) => {
     setConfirmDeleteId(null)
-    setMenu({ chatId, x, y })
+    setFolderSubmenuOpen(false)
+    setFolderColorSubmenuOpen(false)
+    setMenu({ kind: 'chat', chatId, x, y })
+  }
+
+  const openFolderMenuAt = (folderId: string, x: number, y: number) => {
+    setConfirmDeleteId(null)
+    setFolderSubmenuOpen(false)
+    setFolderColorSubmenuOpen(false)
+    setMenu({ kind: 'folder', folderId, x, y })
   }
 
   const commitRename = (chatId: string) => {
     const next = renameDraft.trim()
     setRenamingId(null)
     if (next) void renameChat(chatId, next)
+  }
+
+  const commitFolderRename = (folderId: string) => {
+    const next = renameFolderDraft.trim()
+    setRenamingFolderId(null)
+    if (next) void updateChatFolder(folderId, { name: next })
+  }
+
+  const submitCreateFolder = () => {
+    const trimmed = newFolderName.trim()
+    if (!trimmed) return
+    setCreatingFolder(false)
+    setNewFolderName('')
+    void createChatFolder(trimmed, newFolderColor)
   }
 
   function row(c: Chat) {
@@ -152,7 +253,7 @@ export function Sidebar({
     return (
       <div
         key={c.id}
-        className={'chat-row-item' + (c.id === activeId ? ' selected' : '') + (menu?.chatId === c.id ? ' menu-open' : '')}
+        className={'chat-row-item' + (c.id === activeId ? ' selected' : '') + (menu?.kind === 'chat' && menu.chatId === c.id ? ' menu-open' : '')}
         onContextMenu={e => {
           if (!showMenuTrigger) return
           e.preventDefault()
@@ -196,7 +297,7 @@ export function Sidebar({
           <Icon size={15} aria-label={{ read: 'Чтение', fork: 'Разветвление', write: 'Полный доступ', owner: 'Мой чат' }[c.access]} />
           <span className="chat-link-title">{c.title}</span>
           {c.pinned && <Pin size={12} className="chat-pin-badge" aria-label="Закреплён" />}
-          {c.archived && <small className="archive-label">Архив</small>}
+          {(c.archived || c.archivedAt != null) && <small className="archive-label">Архив</small>}
         </button>
         {showMenuTrigger && (
           <button
@@ -204,11 +305,11 @@ export function Sidebar({
             className="chat-more-btn"
             aria-label={`Действия с чатом ${c.title}`}
             aria-haspopup="menu"
-            aria-expanded={menu?.chatId === c.id}
+            aria-expanded={menu?.kind === 'chat' && menu.chatId === c.id}
             onClick={e => {
               e.stopPropagation()
               const rect = e.currentTarget.getBoundingClientRect()
-              if (menu?.chatId === c.id) {
+              if (menu?.kind === 'chat' && menu.chatId === c.id) {
                 setMenu(null)
               } else {
                 openMenuAt(c.id, rect.right, rect.bottom + 4)
@@ -222,8 +323,16 @@ export function Sidebar({
     )
   }
 
-  const menuChat = menu ? chats.find(c => c.id === menu.chatId) : undefined
+  const ownerChats = chats.filter(c => c.access === 'owner')
+  const archivedOwnerChats = ownerChats.filter(c => c.archivedAt != null)
+  const activeOwnerChats = ownerChats.filter(c => c.archivedAt == null)
+  const folderIdSet = new Set(folders.map(f => f.id))
+  const unfiledOwnerChats = activeOwnerChats.filter(c => !c.folderId || !folderIdSet.has(c.folderId))
   const shared = chats.filter(c => c.access !== 'owner' && !c.indexedCodex)
+
+  const menuChat = menu?.kind === 'chat' ? chats.find(c => c.id === menu.chatId) : undefined
+  const menuFolder: ChatFolder | undefined = menu?.kind === 'folder' ? folders.find(f => f.id === menu.folderId) : undefined
+
   const handle = workspace ? '@' + (mode === 'server' ? workspace.user.name : workspace.user.id) : ''
   const profileDisplayName = workspace ? (workspace.user.displayName?.trim() || workspace.user.name) : ''
   const planBadge = mode === 'server'
@@ -234,16 +343,174 @@ export function Sidebar({
         : null
     : { label: 'DEMO', tone: 'demo' }
 
-  const contextMenuNode = menu && menuChat && typeof document !== 'undefined'
+  const contextMenuNode = menu && (menuChat || menuFolder) && typeof document !== 'undefined'
     ? createPortal(
       <div
         ref={menuRef}
         className="chat-context-menu"
         role="menu"
-        aria-label={`Меню чата ${menuChat.title}`}
+        aria-label={menuChat ? `Меню чата ${menuChat.title}` : `Меню папки ${menuFolder?.name}`}
         style={menuPos ? { left: `${menuPos.left}px`, top: `${menuPos.top}px` } : { left: `${menu.x}px`, top: `${menu.y}px` }}
       >
-        {menuChat.access === 'owner' && !menuChat.indexedCodex && (
+        {menuChat && (
+          <>
+            {menuChat.access === 'owner' && !menuChat.indexedCodex && (
+              <>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="chat-menu-item"
+                  onClick={() => {
+                    setMenu(null)
+                    setRenameDraft(menuChat.title)
+                    setRenamingId(menuChat.id)
+                  }}
+                >
+                  <Pencil size={14} />
+                  <span>Переименовать</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="chat-menu-item"
+                  onClick={() => {
+                    setMenu(null)
+                    void togglePinChat(menuChat.id)
+                  }}
+                >
+                  {menuChat.pinned ? <PinOff size={14} /> : <Pin size={14} />}
+                  <span>{menuChat.pinned ? 'Открепить' : 'Закрепить'}</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  aria-expanded={folderSubmenuOpen}
+                  className="chat-menu-item"
+                  onClick={() => setFolderSubmenuOpen(v => !v)}
+                >
+                  <FolderInput size={14} />
+                  <span>Переместить в папку ▸</span>
+                </button>
+                {folderSubmenuOpen && (
+                  <div className="chat-menu-submenu" role="group" aria-label="Выбор папки">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className={`chat-menu-item is-sub${!menuChat.folderId ? ' is-current' : ''}`}
+                      onClick={() => {
+                        setMenu(null)
+                        void moveChatToFolder(menuChat.id, null)
+                      }}
+                    >
+                      <span>Без папки</span>
+                    </button>
+                    {folders.map(f => (
+                      <button
+                        key={f.id}
+                        type="button"
+                        role="menuitem"
+                        className={`chat-menu-item is-sub${menuChat.folderId === f.id ? ' is-current' : ''}`}
+                        onClick={() => {
+                          setMenu(null)
+                          void moveChatToFolder(menuChat.id, f.id)
+                        }}
+                      >
+                        <span className="folder-dot" style={{ backgroundColor: f.color }} />
+                        <span>{f.name}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="chat-menu-item"
+                  onClick={() => {
+                    setMenu(null)
+                    void toggleArchiveChat(menuChat.id)
+                  }}
+                >
+                  {menuChat.archivedAt != null ? <ArchiveRestore size={14} /> : <Archive size={14} />}
+                  <span>{menuChat.archivedAt != null ? 'Вернуть из архива' : 'Архивировать'}</span>
+                </button>
+              </>
+            )}
+            {menuChat.access !== 'read' && !menuChat.indexedCodex && (
+              <button
+                type="button"
+                role="menuitem"
+                className="chat-menu-item"
+                onClick={() => {
+                  setMenu(null)
+                  void forkChatAt(menuChat.id)
+                  close()
+                }}
+              >
+                <GitFork size={14} />
+                <span>Создать ветку чата</span>
+              </button>
+            )}
+            {menuChat.access === 'owner' && !menuChat.indexedCodex && (
+              <button
+                type="button"
+                role="menuitem"
+                className="chat-menu-item"
+                onClick={() => {
+                  setMenu(null)
+                  close()
+                  openShare(menuChat.id)
+                }}
+              >
+                <Share2 size={14} />
+                <span>Поделиться</span>
+              </button>
+            )}
+            <button
+              type="button"
+              role="menuitem"
+              className="chat-menu-item"
+              onClick={() => {
+                setMenu(null)
+                downloadChatMarkdown(menuChat)
+              }}
+            >
+              <Download size={14} />
+              <span>Экспорт в Markdown (.md)</span>
+            </button>
+            {menuChat.access === 'owner' && !menuChat.indexedCodex && (
+              confirmDeleteId === menuChat.id ? (
+                <div className="chat-menu-confirm">
+                  <span>Удалить чат безвозвратно?</span>
+                  <div className="chat-menu-confirm-btns">
+                    <button
+                      type="button"
+                      className="is-danger"
+                      onClick={() => {
+                        setMenu(null)
+                        setConfirmDeleteId(null)
+                        void deleteChatItem(menuChat.id)
+                      }}
+                    >
+                      Удалить
+                    </button>
+                    <button type="button" onClick={() => setConfirmDeleteId(null)}>Отмена</button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="chat-menu-item is-danger"
+                  onClick={() => setConfirmDeleteId(menuChat.id)}
+                >
+                  <Trash2 size={14} />
+                  <span>Удалить</span>
+                </button>
+              )
+            )}
+          </>
+        )}
+        {menuFolder && (
           <>
             <button
               type="button"
@@ -251,8 +518,8 @@ export function Sidebar({
               className="chat-menu-item"
               onClick={() => {
                 setMenu(null)
-                setRenameDraft(menuChat.title)
-                setRenamingId(menuChat.id)
+                setRenameFolderDraft(menuFolder.name)
+                setRenamingFolderId(menuFolder.id)
               }}
             >
               <Pencil size={14} />
@@ -262,88 +529,42 @@ export function Sidebar({
               type="button"
               role="menuitem"
               className="chat-menu-item"
-              onClick={() => {
-                setMenu(null)
-                void togglePinChat(menuChat.id)
-              }}
+              aria-expanded={folderColorSubmenuOpen}
+              onClick={() => setFolderColorSubmenuOpen(v => !v)}
             >
-              {menuChat.pinned ? <PinOff size={14} /> : <Pin size={14} />}
-              <span>{menuChat.pinned ? 'Открепить' : 'Закрепить'}</span>
+              <Palette size={14} />
+              <span>Цвет ▸</span>
             </button>
-          </>
-        )}
-        {menuChat.access !== 'read' && !menuChat.indexedCodex && (
-          <button
-            type="button"
-            role="menuitem"
-            className="chat-menu-item"
-            onClick={() => {
-              setMenu(null)
-              void forkChatAt(menuChat.id)
-              close()
-            }}
-          >
-            <GitFork size={14} />
-            <span>Создать ветку чата</span>
-          </button>
-        )}
-        {menuChat.access === 'owner' && !menuChat.indexedCodex && (
-          <button
-            type="button"
-            role="menuitem"
-            className="chat-menu-item"
-            onClick={() => {
-              setMenu(null)
-              close()
-              openShare(menuChat.id)
-            }}
-          >
-            <Share2 size={14} />
-            <span>Поделиться</span>
-          </button>
-        )}
-        <button
-          type="button"
-          role="menuitem"
-          className="chat-menu-item"
-          onClick={() => {
-            setMenu(null)
-            downloadChatMarkdown(menuChat)
-          }}
-        >
-          <Download size={14} />
-          <span>Экспорт в Markdown</span>
-        </button>
-        {menuChat.access === 'owner' && !menuChat.indexedCodex && (
-          confirmDeleteId === menuChat.id ? (
-            <div className="chat-menu-confirm">
-              <span>Удалить чат безвозвратно?</span>
-              <div className="chat-menu-confirm-btns">
-                <button
-                  type="button"
-                  className="is-danger"
-                  onClick={() => {
-                    setMenu(null)
-                    setConfirmDeleteId(null)
-                    void deleteChatItem(menuChat.id)
-                  }}
-                >
-                  Удалить
-                </button>
-                <button type="button" onClick={() => setConfirmDeleteId(null)}>Отмена</button>
+            {folderColorSubmenuOpen && (
+              <div className="folder-color-row" role="group" aria-label="Цвет папки">
+                {FOLDER_COLORS.map(c => (
+                  <button
+                    key={c}
+                    type="button"
+                    aria-label={`Выбрать цвет ${c}`}
+                    className={`folder-color-swatch${menuFolder.color.toLowerCase() === c ? ' is-active' : ''}`}
+                    style={{ backgroundColor: c }}
+                    onClick={() => {
+                      setMenu(null)
+                      void updateChatFolder(menuFolder.id, { color: c })
+                    }}
+                  />
+                ))}
               </div>
-            </div>
-          ) : (
+            )}
             <button
               type="button"
               role="menuitem"
               className="chat-menu-item is-danger"
-              onClick={() => setConfirmDeleteId(menuChat.id)}
+              onClick={() => {
+                setMenu(null)
+                void deleteChatFolder(menuFolder.id)
+              }}
             >
               <Trash2 size={14} />
-              <span>Удалить</span>
+              <span>Удалить папку</span>
             </button>
-          )
+          </>
         )}
       </div>,
       document.body,
@@ -358,14 +579,176 @@ export function Sidebar({
         <strong data-tauri-drag-region>Agent Console</strong>
         <button className="mobile icon-btn" aria-label="Закрыть список чатов" onClick={close}><X size={18} /></button>
       </div>
-      <button className="new-chat" onClick={() => { void newChat(); close() }}>
-        <Plus size={15} />
-        <span>Новый чат</span>
-      </button>
+      <div className="side-actions-row">
+        <button className="new-chat" onClick={() => { void newChat(); close() }}>
+          <Plus size={15} />
+          <span>Новый чат</span>
+        </button>
+        {openSearch && (
+          <button
+            type="button"
+            className="side-search-btn"
+            aria-label="Поиск по чатам и сообщениям (Cmd+K)"
+            title="Поиск по чатам (⌘K / Ctrl+K)"
+            onClick={openSearch}
+          >
+            <Search size={14} aria-hidden="true" />
+            <kbd className="side-search-kbd">⌘K</kbd>
+          </button>
+        )}
+      </div>
       <nav aria-label="Чаты">
-        <h2>Мои чаты</h2>
-        {chats.filter(c => c.access === 'owner').map(row)}
+        <div className="side-section-head">
+          <h2>Мои чаты</h2>
+          <button
+            type="button"
+            className="side-folder-add-btn"
+            title="Новая папка"
+            aria-label="Новая папка"
+            onClick={() => setCreatingFolder(v => !v)}
+          >
+            <FolderPlus size={13} aria-hidden="true" />
+            <span>Папка</span>
+          </button>
+        </div>
+
+        {creatingFolder && (
+          <form
+            className="folder-create-box"
+            onSubmit={e => {
+              e.preventDefault()
+              submitCreateFolder()
+            }}
+          >
+            <input
+              ref={newFolderInputRef}
+              type="text"
+              className="folder-create-input"
+              placeholder="Название папки…"
+              maxLength={60}
+              value={newFolderName}
+              onChange={e => setNewFolderName(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Escape') {
+                  setCreatingFolder(false)
+                  setNewFolderName('')
+                }
+              }}
+            />
+            <div className="folder-color-row">
+              {FOLDER_COLORS.map(c => (
+                <button
+                  key={c}
+                  type="button"
+                  aria-label={`Цвет ${c}`}
+                  className={`folder-color-swatch${newFolderColor === c ? ' is-active' : ''}`}
+                  style={{ backgroundColor: c }}
+                  onClick={() => setNewFolderColor(c)}
+                />
+              ))}
+            </div>
+            <div className="folder-create-actions">
+              <button type="submit" className="primary-action" disabled={!newFolderName.trim()}>Создать</button>
+              <button type="button" className="alt-action" onClick={() => { setCreatingFolder(false); setNewFolderName('') }}>Отмена</button>
+            </div>
+          </form>
+        )}
+
+        {folders.map(folder => {
+          const folderChats = activeOwnerChats.filter(c => c.folderId === folder.id)
+          const isCollapsed = Boolean(collapsedSections[`folder:${folder.id}`])
+          const isRenamingFolder = renamingFolderId === folder.id
+          return (
+            <div key={folder.id} className="folder-group">
+              <div
+                className="folder-group-head"
+                onContextMenu={e => {
+                  e.preventDefault()
+                  openFolderMenuAt(folder.id, e.clientX, e.clientY)
+                }}
+              >
+                {isRenamingFolder ? (
+                  <input
+                    ref={renameFolderInputRef}
+                    type="text"
+                    className="chat-rename-input"
+                    aria-label="Новое название папки"
+                    value={renameFolderDraft}
+                    maxLength={60}
+                    onChange={e => setRenameFolderDraft(e.target.value)}
+                    onBlur={() => commitFolderRename(folder.id)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        commitFolderRename(folder.id)
+                      } else if (e.key === 'Escape') {
+                        e.preventDefault()
+                        setRenamingFolderId(null)
+                      }
+                    }}
+                  />
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="folder-toggle-btn"
+                      aria-expanded={!isCollapsed}
+                      onClick={() => toggleSection(`folder:${folder.id}`)}
+                    >
+                      {isCollapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+                      <Folder size={14} style={{ color: folder.color }} aria-hidden="true" />
+                      <span className="folder-name">{folder.name}</span>
+                      <small className="folder-count">{folderChats.length}</small>
+                    </button>
+                    <button
+                      type="button"
+                      className="chat-more-btn folder-more-btn"
+                      aria-label={`Действия с папкой ${folder.name}`}
+                      onClick={e => {
+                        e.stopPropagation()
+                        const rect = e.currentTarget.getBoundingClientRect()
+                        openFolderMenuAt(folder.id, rect.right, rect.bottom + 4)
+                      }}
+                    >
+                      <MoreHorizontal size={13} />
+                    </button>
+                  </>
+                )}
+              </div>
+              {!isCollapsed && (
+                <div className="folder-group-items">
+                  {folderChats.length > 0
+                    ? folderChats.map(row)
+                    : <div className="folder-empty-hint">Пусто</div>}
+                </div>
+              )}
+            </div>
+          )
+        })}
+
+        {unfiledOwnerChats.map(row)}
+
         {shared.length > 0 && <><h2>Доступные мне</h2>{shared.map(row)}</>}
+
+        {archivedOwnerChats.length > 0 && (
+          <div className="archive-section">
+            <button
+              type="button"
+              className="archive-toggle-btn"
+              aria-expanded={!collapsedSections.archive}
+              onClick={() => toggleSection('archive')}
+            >
+              {collapsedSections.archive ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+              <Archive size={13} aria-hidden="true" />
+              <span>Архив ({archivedOwnerChats.length})</span>
+            </button>
+            {!collapsedSections.archive && (
+              <div className="archive-items">
+                {archivedOwnerChats.map(row)}
+              </div>
+            )}
+          </div>
+        )}
       </nav>
       <div className="side-bottom">
         {workspace && (
