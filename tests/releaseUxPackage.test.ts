@@ -8,8 +8,9 @@ import { formatQuoteMarkdown } from '../src/app/QuoteReplyButton'
 import { getMermaidInitConfig } from '../src/app/MermaidBlock'
 import { RichText } from '../src/app/Markdown'
 import { getSpeechRecognitionCtor } from '../src/app/voiceInput'
-import { createChatFolder, useChats } from '../src/app/chatStore'
+import { createChatFolder, toggleChatWebSearch, useChats } from '../src/app/chatStore'
 import { ProjectSettingsModal } from '../src/app/ProjectSettingsModal'
+import { serializeAppearanceSnapshot } from '../src/app/appearanceStore'
 
 function withMockLocalStorage(fn: () => void) {
   const store = new Map<string, string>()
@@ -118,4 +119,24 @@ test('ProjectSettingsModal renders dialog with systemPrompt and project name', (
   assert.match(html, /Настройки проекта/)
   assert.match(html, /Мой проект/)
   assert.match(html, /Отвечай кратко/)
+})
+
+test('toggleChatWebSearch and telegramNotify uiSettings serialize cleanly', () => {
+  toggleChatWebSearch('chat-web-1')
+  assert.equal(useChats.getState().webSearchByChat['chat-web-1'], true)
+  toggleChatWebSearch('chat-web-1')
+  assert.equal(useChats.getState().webSearchByChat['chat-web-1'], false)
+
+  const ui = serializeAppearanceSnapshot({
+    theme: 'dark',
+    accent: 'mint',
+    accentCustomColor: '#7c5cff',
+    ambientGradient: true,
+    gradientPalette: 'accent',
+    gradientCustomColor: '#8b5cf6',
+    gradientCustomColor2: '#3b82f6',
+    templates: [],
+    telegramNotify: true,
+  })
+  assert.equal(ui.telegramNotify, true)
 })

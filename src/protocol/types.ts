@@ -15,6 +15,7 @@ export interface RunRequest {
   reasoning?: string
   target: Target
   prompt: string
+  webSearch?: boolean
   attachmentIds?: string[]
   attachments?: MessageAttachment[]
 }
@@ -201,9 +202,50 @@ export interface AdminAdapter {
   revokeDevices(id: string): Promise<void>
   delete?(id: string): Promise<void>
 }
+export interface PaidAPIModel {
+  id: string
+  label: string
+  inputPricePer1M: number
+  outputPricePer1M: number
+  supportsVision: boolean
+  supportsReasoning: boolean
+}
+
+export interface PaidAPIConfig {
+  id: string
+  name: string
+  baseUrl: string
+  apiKeyMask: string
+  hasApiKey: boolean
+  models: PaidAPIModel[]
+  enabled: boolean
+  createdAt: number
+}
+
+export interface CreatePaidAPIConfig {
+  name: string
+  baseUrl: string
+  apiKey: string
+  models: PaidAPIModel[]
+  enabled?: boolean
+}
+
+export interface UpdatePaidAPIConfig {
+  name?: string
+  baseUrl?: string
+  apiKey?: string
+  models?: PaidAPIModel[]
+  enabled?: boolean
+}
+
 export interface ServerAdminAdapter extends AdminAdapter {
   chats(userId: string, signal?: AbortSignal): Promise<AdminChat[]>
   messages(userId: string, chatId: string, signal?: AbortSignal): Promise<ServerMessage[]>
+  apiProviders?(signal?: AbortSignal): Promise<PaidAPIConfig[]>
+  createAPIProvider?(cfg: CreatePaidAPIConfig): Promise<PaidAPIConfig>
+  updateAPIProvider?(id: string, patch: UpdatePaidAPIConfig): Promise<PaidAPIConfig>
+  deleteAPIProvider?(id: string): Promise<void>
+  testAPIProvider?(id: string): Promise<{ ok: boolean }>
 }
 export interface ServerDevice { id: string; userId: string; name: string; lastSeenAt: number; createdAt: number; isCurrent?: boolean }
 export interface ServerSession { user: ServerUser; device: ServerDevice }
@@ -277,6 +319,7 @@ export interface UISettings {
   gradientCustomColor?: string
   gradientCustomColor2?: string
   templates?: PromptTemplate[]
+  telegramNotify?: boolean
 }
 
 export interface UserProfile {
@@ -287,6 +330,7 @@ export interface UserProfile {
   memoryEnabled: boolean
   memoryUpdatedAt: number
   uiSettings?: UISettings
+  telegramId?: string
 }
 
 export type UserProfilePatch = Partial<Omit<UserProfile, 'memoryUpdatedAt'>>

@@ -39,6 +39,12 @@ func (c *modelCatalog) entry(providerID string) *modelCacheEntry {
 	return e
 }
 
+func (c *modelCatalog) invalidate(providerID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, providerID)
+}
+
 func (a *API) cachedProviderModels(ctx context.Context, provID string) ([]provider.Model, error) {
 	prov, ok := a.live.provider(provID)
 	if !ok {

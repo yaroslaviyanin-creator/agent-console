@@ -1,6 +1,6 @@
 import type {
-  AccountingAdapter, AdminChat, AdminUser, ChatAccess, ChatFolder, ServerAdminAdapter, IndexedCodexChat, LoginRequest, MessageAttachment, RunEvent, RunRequest, SearchResult, ServerChat, ServerCreateChatRequest, ServerError, ServerHealth,
-  ServerDevice, ServerDirectoryUser, ServerLoginResponse, ServerMessage, ServerModel, ServerProvider, ServerProviderInfo, ServerProvidersResponse, ServerQuota, ServerSession, TransportAdapter, UserProfile, UserProfilePatch, Workspace, WorkspaceAdapter,
+  AccountingAdapter, AdminChat, AdminUser, ChatAccess, ChatFolder, CreatePaidAPIConfig, PaidAPIConfig, ServerAdminAdapter, IndexedCodexChat, LoginRequest, MessageAttachment, RunEvent, RunRequest, SearchResult, ServerChat, ServerCreateChatRequest, ServerError, ServerHealth,
+  ServerDevice, ServerDirectoryUser, ServerLoginResponse, ServerMessage, ServerModel, ServerProvider, ServerProviderInfo, ServerProvidersResponse, ServerQuota, ServerSession, TransportAdapter, UpdatePaidAPIConfig, UserProfile, UserProfilePatch, Workspace, WorkspaceAdapter,
 } from '../protocol/types'
 
 type Change =
@@ -162,6 +162,11 @@ export class RemoteTransport implements TransportAdapter {
     messages: (id, chatId, signal) => this.request<ServerMessage[]>('/api/admin/users/' + encodeURIComponent(id) + '/chats/' + encodeURIComponent(chatId) + '/messages', undefined, signal),
     revokeDevices: async id => { await this.request('/api/admin/users/' + encodeURIComponent(id) + '/devices', undefined, undefined, 'DELETE') },
     delete: async id => { await this.request('/api/admin/users/' + encodeURIComponent(id), undefined, undefined, 'DELETE') },
+    apiProviders: signal => this.request<PaidAPIConfig[]>('/api/admin/api-providers', undefined, signal),
+    createAPIProvider: (cfg: CreatePaidAPIConfig) => this.request<PaidAPIConfig>('/api/admin/api-providers', cfg),
+    updateAPIProvider: (id: string, patch: UpdatePaidAPIConfig) => this.request<PaidAPIConfig>('/api/admin/api-providers/' + encodeURIComponent(id), patch, undefined, 'PATCH'),
+    deleteAPIProvider: async id => { await this.request('/api/admin/api-providers/' + encodeURIComponent(id), undefined, undefined, 'DELETE') },
+    testAPIProvider: id => this.request<{ ok: boolean }>('/api/admin/api-providers/' + encodeURIComponent(id) + '/test', {}, undefined, 'POST'),
   }
 
   getProfile() {
@@ -181,6 +186,10 @@ export class RemoteTransport implements TransportAdapter {
       }
     }
     return profile
+  }
+
+  sendTelegramTestNotification() {
+    return this.request<{ ok: boolean }>('/api/profile/telegram-test', {}, undefined, 'POST')
   }
 
   subscribeAccount() { return () => {} }
@@ -768,7 +777,7 @@ export class RemoteTransport implements TransportAdapter {
         this.responses.set(key, controller)
         try {
           // SQLite history is authoritative in server mode.
-          const { chatId, messageId, reuseUserMessageId, provider, model, target, prompt, reasoning, attachmentIds } = request
+          const { chatId, messageId, reuseUserMessageId, provider, model, target, prompt, webSearch, reasoning, attachmentIds } = request
           socket.send(JSON.stringify({
             chatId,
             messageId,
@@ -777,6 +786,7 @@ export class RemoteTransport implements TransportAdapter {
             model,
             target,
             prompt,
+            ...(webSearch ? { webSearch: true } : {}),
             ...(attachmentIds?.length ? { attachmentIds } : {}),
             ...(reasoning ? { reasoning } : {}),
           }))

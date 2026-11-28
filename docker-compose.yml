@@ -29,10 +29,17 @@ services:
       MAX_ATTACHMENTS_PER_MESSAGE: ${MAX_ATTACHMENTS_PER_MESSAGE:-10}
       MAX_ATTACHMENTS_PER_CHAT: ${MAX_ATTACHMENTS_PER_CHAT:-20}
       MAX_ATTACHMENT_CONTEXT_BYTES: ${MAX_ATTACHMENT_CONTEXT_BYTES:-262144}
+      SEARXNG_URL: http://searxng:8080
+      BRAVE_API_KEY: ${BRAVE_API_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      API_KEYS_SECRET: ${API_KEYS_SECRET:-}
+      PUBLIC_URL: ${PUBLIC_URL:-https://macbook-pro.tail2aa739.ts.net}
     depends_on:
       runner:
         condition: service_healthy
-    networks: [frontend, runner_rpc, core_host]
+      searxng:
+        condition: service_healthy
+    networks: [frontend, runner_rpc, core_host, searxng_net]
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -137,8 +144,24 @@ services:
       timeout: 3s
       retries: 5
 
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+    volumes:
+      - ./deploy/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    networks: [searxng_net]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
 networks:
   core_host:
+  searxng_net:
   frontend:
     internal: true
   runner_rpc:

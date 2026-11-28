@@ -4,6 +4,7 @@ import { X } from 'lucide-react'
 import type { AdminChat, AdminUser, PlanTier, ServerAdminAdapter, ServerMessage, UserRole } from '../protocol/types'
 import { RichText } from './Markdown'
 import { SelectMenu } from './SelectMenu'
+import { AdminAPIProvidersPanel } from './AdminAPIProvidersPanel'
 
 const roleLabel = { pending: 'Ожидает', user: 'Пользователь', admin: 'Администратор' }
 import { dollars, limitDollars, quotaPercent } from './Quotas'
@@ -37,6 +38,7 @@ export function AdminDialog({ admin, userId, close }: { admin: ServerAdminAdapte
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
   const [reload, setReload] = useState(0)
+  const [tab, setTab] = useState<'users' | 'api'>('users')
 
   useEffect(() => {
     const dialog = ref.current!
@@ -106,10 +108,16 @@ export function AdminDialog({ admin, userId, close }: { admin: ServerAdminAdapte
   return <dialog ref={ref} className="workspace-dialog admin-dialog" aria-labelledby="admin-heading" onCancel={close} onClick={event => { if (event.target === ref.current) close() }}>
     <section>
       <header className="panel-heading"><h2 id="admin-heading">Админка</h2><button type="button" className="icon-btn" onClick={close} aria-label="Закрыть"><X size={18}/></button></header>
+      {!historyUser && (
+        <div className="admin-tabs" role="tablist" aria-label="Разделы админки">
+          <button type="button" role="tab" aria-selected={tab === 'users'} className="alt-action" onClick={() => setTab('users')}>Пользователи</button>
+          <button type="button" role="tab" aria-selected={tab === 'api'} className="alt-action" onClick={() => setTab('api')}>API-провайдеры</button>
+        </div>
+      )}
       {historyUser ? <AdminUserHistory admin={admin} user={historyUser} back={() => {
         setHistoryUser(null)
         ref.current?.scrollTo(0, 0)
-      }}/> : <>
+      }}/> : tab === 'api' ? <AdminAPIProvidersPanel admin={admin} /> : <>
         <dl className="admin-summary">
           <div><dt>Всего</dt><dd>{users.length}</dd></div>
           <div><dt>Ожидают</dt><dd>{users.filter(user => statusOf(user) === 'pending').length}</dd></div>

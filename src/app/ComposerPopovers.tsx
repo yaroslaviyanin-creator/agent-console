@@ -229,13 +229,15 @@ export function ModelPopover({
             </button>
           </div>
 
-          {(providerDisabled || modelsLoading || modelsError || unavailableModel) && (
+          {(providerDisabled || modelsLoading || modelsError || unavailableModel || (provider === 'paid_api' && groups.length === 0)) && (
             <p className="popover-status-note" role="status">
               {providerDisabled
                 ? 'Провайдер недоступен на сервере.'
                 : modelsLoading
                   ? 'Загружаю модели…'
-                  : modelsError || 'Выберите доступную модель.'}
+                  : provider === 'paid_api' && groups.length === 0
+                    ? 'Нет включённых моделей — добавьте провайдер в Админке'
+                    : modelsError || 'Выберите доступную модель.'}
             </p>
           )}
 
@@ -265,7 +267,7 @@ export function ModelPopover({
                 type="button"
                 role="option"
                 aria-selected={opt.id === provider}
-                disabled={disabled || !canChangeProvider || !opt.available}
+                disabled={disabled || !canChangeProvider || (!opt.available && opt.id !== 'paid_api')}
                 className={`popover-list-item${opt.id === provider ? ' is-active' : ''}`}
                 onClick={() => {
                   if (opt.id !== provider) onSelectProvider(opt.id)
@@ -289,6 +291,11 @@ export function ModelPopover({
           <div className="popover-list" role="listbox" aria-label="Модель">
             {remoteMode ? (
               <>
+                {provider === 'paid_api' && groups.length === 0 && !modelsLoading && (
+                  <p className="popover-status-note" role="status">
+                    Нет включённых моделей — добавьте провайдер в Админке
+                  </p>
+                )}
                 <button
                   type="button"
                   role="option"

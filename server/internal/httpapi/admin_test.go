@@ -493,8 +493,8 @@ func TestNewRejectsUnimplementedProviders(t *testing.T) {
 			t.Fatalf("remote %s: %v", cli, err)
 		}
 	}
-	if _, err := New(t.Context(), nil, config.Config{Provider: "paid_api", CORSOrigin: "*"}, logger); err == nil || !strings.Contains(err.Error(), "not implemented") {
-		t.Fatalf("New(\"paid_api\") expected not implemented error, got: %v", err)
+	if _, err := New(t.Context(), nil, config.Config{Provider: "paid_api", CORSOrigin: "*"}, logger); err != nil {
+		t.Fatalf("New(\"paid_api\") unexpected error: %v", err)
 	}
 	for _, unsupported := range []string{"", "unknown"} {
 		if _, err := New(t.Context(), nil, config.Config{Provider: unsupported, CORSOrigin: "*"}, logger); err == nil {

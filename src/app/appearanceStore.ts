@@ -14,6 +14,7 @@ export interface AppearanceState {
   gradientCustomColor: string
   gradientCustomColor2: string
   templates: PromptTemplate[]
+  telegramNotify: boolean
   setTheme: (theme: ThemePreference) => void
   setAccent: (accent: AccentPreset) => void
   setAccentCustomColor: (hex: string) => void
@@ -22,6 +23,7 @@ export interface AppearanceState {
   setGradientCustomColor: (hex: string) => void
   setGradientCustomColor2: (hex: string) => void
   setTemplates: (templates: PromptTemplate[]) => void
+  setTelegramNotify: (enabled: boolean) => void
 }
 
 export const ACCENT_PRESETS: readonly { id: Exclude<AccentPreset, 'custom'>; label: string; swatch: string }[] = [
@@ -54,6 +56,7 @@ interface StoredAppearance {
   gradientCustomColor?: string
   gradientCustomColor2?: string
   templates?: PromptTemplate[]
+  telegramNotify?: boolean
 }
 
 type AppearanceSnapshot = {
@@ -65,6 +68,7 @@ type AppearanceSnapshot = {
   gradientCustomColor: string
   gradientCustomColor2: string
   templates: PromptTemplate[]
+  telegramNotify: boolean
 }
 
 function normalizeTemplates(raw: unknown, fallback: PromptTemplate[]): PromptTemplate[] {
@@ -100,6 +104,7 @@ function parseSnapshot(parsed: StoredAppearance | null | undefined, base?: Appea
     gradientCustomColor: '#8b5cf6',
     gradientCustomColor2: '#3b82f6',
     templates: [],
+    telegramNotify: false,
   }
   if (!parsed || typeof parsed !== 'object') return fallback
   const theme: ThemePreference = parsed.theme === 'light' || parsed.theme === 'system' || parsed.theme === 'dark' ? parsed.theme : fallback.theme
@@ -116,7 +121,8 @@ function parseSnapshot(parsed: StoredAppearance | null | undefined, base?: Appea
   const gradientCustomColor = normalizeHex(parsed.gradientCustomColor, fallback.gradientCustomColor)
   const gradientCustomColor2 = normalizeHex(parsed.gradientCustomColor2, fallback.gradientCustomColor2)
   const templates = parsed.templates !== undefined ? normalizeTemplates(parsed.templates, fallback.templates) : fallback.templates
-  return { theme, accent, accentCustomColor, ambientGradient, gradientPalette, gradientCustomColor, gradientCustomColor2, templates }
+  const telegramNotify = typeof parsed.telegramNotify === 'boolean' ? parsed.telegramNotify : fallback.telegramNotify
+  return { theme, accent, accentCustomColor, ambientGradient, gradientPalette, gradientCustomColor, gradientCustomColor2, templates, telegramNotify }
 }
 
 function readStored(): AppearanceSnapshot {
@@ -173,7 +179,7 @@ const ORB_CSS_PROPS = [
   '--orb-3-fade',
 ] as const
 
-export function applyAppearanceToDom(state: Omit<AppearanceSnapshot, 'templates'> & { templates?: PromptTemplate[] }) {
+export function applyAppearanceToDom(state: Omit<AppearanceSnapshot, 'templates' | 'telegramNotify'> & { templates?: PromptTemplate[]; telegramNotify?: boolean }) {
   if (typeof document === 'undefined') return
   const resolved = resolveTheme(state.theme)
   const root = document.documentElement
@@ -248,6 +254,7 @@ export function serializeAppearanceSnapshot(s: AppearanceSnapshot): UISettings {
     gradientCustomColor: s.gradientCustomColor,
     gradientCustomColor2: s.gradientCustomColor2,
     templates: s.templates,
+    telegramNotify: s.telegramNotify,
   }
 }
 
@@ -273,6 +280,7 @@ export function applyServerUISettings(raw: UISettings | undefined | null) {
     gradientCustomColor: current.gradientCustomColor,
     gradientCustomColor2: current.gradientCustomColor2,
     templates: current.templates,
+    telegramNotify: current.telegramNotify,
   }
   const merged = parseSnapshot(raw, base)
   saveStored(merged)
@@ -290,6 +298,7 @@ export const useAppearance = create<AppearanceState>((set, get) => {
     gradientCustomColor: patch.gradientCustomColor ?? get().gradientCustomColor,
     gradientCustomColor2: patch.gradientCustomColor2 ?? get().gradientCustomColor2,
     templates: patch.templates ?? get().templates,
+    telegramNotify: patch.telegramNotify ?? get().telegramNotify,
   })
   const commit = (patch: Partial<AppearanceSnapshot>) => {
     const next = snapshot(patch)
@@ -317,6 +326,7 @@ export const useAppearance = create<AppearanceState>((set, get) => {
       commit({ gradientPalette: 'custom', gradientCustomColor2 })
     },
     setTemplates: templates => commit({ templates: normalizeTemplates(templates, []) }),
+    setTelegramNotify: telegramNotify => commit({ telegramNotify }),
   }
 })
 

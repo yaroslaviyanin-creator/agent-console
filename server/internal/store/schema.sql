@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS users (
     memory_md TEXT NOT NULL DEFAULT '',
     memory_enabled INTEGER NOT NULL DEFAULT 1 CHECK (memory_enabled IN (0, 1)),
     memory_updated_at INTEGER NOT NULL DEFAULT 0,
-    ui_settings_json TEXT NOT NULL DEFAULT '{}'
+    ui_settings_json TEXT NOT NULL DEFAULT '{}',
+    telegram_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS devices (
@@ -119,6 +120,16 @@ CREATE TABLE IF NOT EXISTS chat_attachments (
     extracted_text TEXT,
     warning TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'assistant')),
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paid_api_configs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    api_key_enc TEXT NOT NULL,
+    models_json TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     created_at INTEGER NOT NULL
 );
 

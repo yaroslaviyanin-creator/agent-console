@@ -18,7 +18,8 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 FROM debian:bookworm-slim AS core
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends sqlite3 poppler-utils fonts-dejavu-core \
+    && apt-get install -y --no-install-recommends ca-certificates sqlite3 poppler-utils fonts-dejavu-core \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 1001 app \
     && useradd -u 1001 -g app -m -d /home/app -s /usr/sbin/nologin app \

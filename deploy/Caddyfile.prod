@@ -20,6 +20,11 @@
 
 	handle {
 		root * /srv
+		header /manifest.webmanifest Content-Type "application/manifest+json"
+		header /sw.js {
+			Content-Type "application/javascript"
+			Cache-Control "no-cache, no-store, must-revalidate"
+		}
 		try_files {path} /index.html
 		file_server
 	}

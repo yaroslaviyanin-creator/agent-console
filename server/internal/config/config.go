@@ -36,6 +36,11 @@ type Config struct {
 	MaxAttachmentsPerChat     int
 	MaxAttachmentContextBytes int
 	SessionTTLHours           int
+	SearXNGURL                string
+	BraveAPIKey               string
+	TavilyAPIKey              string
+	APIKeysSecret             string
+	PublicURL                 string
 }
 
 const (
@@ -91,7 +96,7 @@ type ProviderConfig struct {
 // IsCanonicalProvider reports whether name is a supported backend provider ID.
 func IsCanonicalProvider(name string) bool {
 	switch name {
-	case "antigravity", "codex", "claude", "stub":
+	case "antigravity", "codex", "claude", "paid_api", "stub":
 		return true
 	default:
 		return false
@@ -99,11 +104,8 @@ func IsCanonicalProvider(name string) bool {
 }
 
 func validateProviderName(name, source string) error {
-	if name == "paid_api" {
-		return fmt.Errorf("provider %q is not implemented yet", name)
-	}
 	if !IsCanonicalProvider(name) {
-		return fmt.Errorf("%s must use antigravity, codex, claude or stub (got %q)", source, name)
+		return fmt.Errorf("%s must use antigravity, codex, claude, paid_api or stub (got %q)", source, name)
 	}
 	return nil
 }
@@ -190,7 +192,7 @@ func Load() (Config, error) {
 	}
 	hasCLI := false
 	for _, p := range provCfg.EnabledProviders {
-		if p != "stub" {
+		if p != "stub" && p != "paid_api" {
 			hasCLI = true
 			break
 		}
@@ -269,6 +271,14 @@ func Load() (Config, error) {
 	if err != nil || cfg.SessionTTLHours < 1 {
 		return Config{}, errors.New("SESSION_TTL_HOURS must be an integer >= 1")
 	}
+	cfg.SearXNGURL = strings.TrimSpace(os.Getenv("SEARXNG_URL"))
+	cfg.BraveAPIKey = strings.TrimSpace(os.Getenv("BRAVE_API_KEY"))
+	cfg.TavilyAPIKey = strings.TrimSpace(os.Getenv("TAVILY_API_KEY"))
+	cfg.APIKeysSecret = os.Getenv("API_KEYS_SECRET")
+	if cfg.APIKeysSecret == "" {
+		cfg.APIKeysSecret = cfg.RunnerSharedSecret
+	}
+	cfg.PublicURL = strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_URL")), "/")
 	return cfg, nil
 }
 

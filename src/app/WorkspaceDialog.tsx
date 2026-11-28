@@ -296,20 +296,77 @@ function DevicesSection({ w }: { w: Workspace }) {
 
 const textEncoder = new TextEncoder()
 
-function IntegrationsBlock() {
-  const telegramId = getTelegramUserId()
+function IntegrationsBlock({
+  remote,
+  savedTelegramId,
+  onTelegramIdSaved,
+}: {
+  remote: RemoteTransport | null
+  savedTelegramId: string
+  onTelegramIdSaved: (profile: UserProfile) => void
+}) {
+  const miniAppTgId = getTelegramUserId() ?? ''
+  const effectiveTgId = savedTelegramId || miniAppTgId
+  const telegramNotify = useAppearance(s => s.telegramNotify)
+  const setTelegramNotify = useAppearance(s => s.setTelegramNotify)
+  const [tgInput, setTgInput] = useState(effectiveTgId)
+  const [savingTg, setSavingTg] = useState(false)
+  const [testingTg, setTestingTg] = useState(false)
+  const [tgStatus, setTgStatus] = useState('')
+  const [tgError, setTgError] = useState('')
   const [copiedTg, setCopiedTg] = useState(false)
   const [githubNote, setGithubNote] = useState('')
 
+  useEffect(() => {
+    if (effectiveTgId) setTgInput(effectiveTgId)
+  }, [effectiveTgId])
+
   async function copyTelegramId() {
-    if (!telegramId) return
+    if (!effectiveTgId) return
     try {
-      await navigator.clipboard.writeText(telegramId)
+      await navigator.clipboard.writeText(effectiveTgId)
     } catch {
       // Fallback ignored if clipboard blocked.
     }
     setCopiedTg(true)
     window.setTimeout(() => setCopiedTg(false), 1800)
+  }
+
+  async function saveTelegramId() {
+    if (!remote) return
+    const clean = tgInput.trim()
+    setSavingTg(true)
+    setTgStatus('')
+    setTgError('')
+    try {
+      const updated = await remote.updateProfile({ telegramId: clean })
+      onTelegramIdSaved(updated)
+      setTgStatus(clean ? 'Telegram ID сохранён' : 'Telegram ID очищен')
+    } catch (e) {
+      setTgError(e instanceof Error ? e.message : 'Не удалось сохранить Telegram ID.')
+    } finally {
+      setSavingTg(false)
+    }
+  }
+
+  async function sendTestNotification() {
+    if (!remote) return
+    setTestingTg(true)
+    setTgStatus('')
+    setTgError('')
+    try {
+      const clean = tgInput.trim()
+      if (clean && clean !== savedTelegramId) {
+        const updated = await remote.updateProfile({ telegramId: clean })
+        onTelegramIdSaved(updated)
+      }
+      await remote.sendTelegramTestNotification()
+      setTgStatus('Тестовое сообщение отправлено в Telegram!')
+    } catch (e) {
+      setTgError(e instanceof Error ? e.message : 'Не удалось отправить тестовое сообщение.')
+    } finally {
+      setTestingTg(false)
+    }
   }
 
   return (
@@ -321,12 +378,32 @@ function IntegrationsBlock() {
       <div className="settings-row">
         <div className="settings-row-info">
           <strong>Telegram ID</strong>
-          <small>Идентификатор пользователя в Telegram Mini App</small>
+          <small>Определяется в Mini App или вводится вручную для уведомлений от бота</small>
         </div>
         <div className="settings-row-control">
-          {telegramId ? (
+          {remote ? (
             <div className="settings-copy-pill">
-              <code>{telegramId}</code>
+              <input
+                type="text"
+                inputMode="numeric"
+                value={tgInput}
+                onChange={e => setTgInput(e.target.value)}
+                placeholder="Например, 123456789"
+                aria-label="Telegram ID"
+                style={{ width: '132px' }}
+              />
+              <button type="button" className="alt-action" disabled={savingTg || tgInput.trim() === savedTelegramId} onClick={() => void saveTelegramId()}>
+                {savingTg ? '…' : 'Сохранить'}
+              </button>
+              {effectiveTgId && (
+                <button type="button" className="icon-btn" onClick={() => void copyTelegramId()} aria-label="Копировать Telegram ID" title="Копировать Telegram ID">
+                  {copiedTg ? <Check size={14} /> : <Copy size={14} />}
+                </button>
+              )}
+            </div>
+          ) : effectiveTgId ? (
+            <div className="settings-copy-pill">
+              <code>{effectiveTgId}</code>
               <button type="button" className="icon-btn" onClick={() => void copyTelegramId()} aria-label="Копировать Telegram ID" title="Копировать Telegram ID">
                 {copiedTg ? <Check size={14} /> : <Copy size={14} />}
               </button>
@@ -336,6 +413,36 @@ function IntegrationsBlock() {
           )}
         </div>
       </div>
+
+      <label className="settings-row memory-toggle">
+        <span className="settings-row-info">
+          <strong>Уведомлять в Telegram о готовых ответах</strong>
+          <small>Присылать сообщение в бот @AgentConsolePreview26Bot о каждом новом ответе (нажмите /start в боте)</small>
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          checked={telegramNotify}
+          aria-label="Уведомлять в Telegram о готовых ответах"
+          onChange={e => setTelegramNotify(e.target.checked)}
+        />
+      </label>
+
+      {remote && (
+        <div className="settings-row">
+          <div className="settings-row-info">
+            <strong>Проверка уведомлений</strong>
+            <small>Отправить тестовое сообщение от бота в ваш Telegram</small>
+          </div>
+          <div className="settings-row-control">
+            <button type="button" className="alt-action" disabled={testingTg} onClick={() => void sendTestNotification()}>
+              {testingTg ? 'Отправляю…' : 'Отправить тест'}
+            </button>
+          </div>
+        </div>
+      )}
+      {tgStatus && <p className="settings-inline-notice" role="status">{tgStatus}</p>}
+      {tgError && <p className="auth-error" role="alert">{tgError}</p>}
 
       <div className="settings-row">
         <div className="settings-row-info settings-row-with-icon">
@@ -382,6 +489,12 @@ function ProfileSection({ w, remote }: { w: Workspace; remote: RemoteTransport |
       if (current) {
         setSaved(profile)
         updateSelfProfileMember({ displayName: profile.displayName, avatarData: profile.avatarData })
+        const tgId = getTelegramUserId()
+        if (tgId && profile.telegramId !== tgId) {
+          void remote.updateProfile({ telegramId: tgId }).then(updated => {
+            if (current) setSaved(updated)
+          }).catch(() => {})
+        }
       }
     }).catch(e => {
       if (current) setError(e instanceof Error ? e.message : 'Не удалось загрузить профиль.')
@@ -598,7 +711,11 @@ function ProfileSection({ w, remote }: { w: Workspace; remote: RemoteTransport |
       )}
 
       <PromptTemplatesBlock />
-      <IntegrationsBlock />
+      <IntegrationsBlock
+        remote={isServer ? remote : null}
+        savedTelegramId={saved?.telegramId ?? ''}
+        onTelegramIdSaved={updated => setSaved(updated)}
+      />
     </form>
   )
 }

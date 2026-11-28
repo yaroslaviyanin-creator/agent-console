@@ -21,6 +21,7 @@ import (
 	"agent-console/server/internal/provider"
 	"agent-console/server/internal/store"
 	"agent-console/server/internal/webfetch"
+	"agent-console/server/internal/websearch"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -35,7 +36,10 @@ type API struct {
 	index           indexedHistory
 	logins          *rateLimiter
 	uploads         *rateLimiter
-	webfetcher      *webfetch.Fetcher
+	webfetcher         *webfetch.Fetcher
+	websearcher        *websearch.Client
+	telegramAPIBaseURL string
+	telegramHTTPClient *http.Client
 }
 
 type session struct {
@@ -56,7 +60,8 @@ func New(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.L
 	var remote *provider.RemoteRunnerProvider
 	for _, id := range enabled {
 		if id == "paid_api" {
-			return nil, fmt.Errorf("provider %q is not implemented yet", id)
+			registry[id] = provider.NewOpenAICompatProvider(&paidAPIResolver{db: db, secret: cfg.APIKeysSecret})
+			continue
 		}
 		if !config.IsCanonicalProvider(id) {
 			return nil, fmt.Errorf("unsupported provider %q", id)
@@ -75,6 +80,9 @@ func New(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.L
 		} else {
 			return nil, errors.New("RUNNER_URL is required for CLI providers")
 		}
+	}
+	if registry["paid_api"] == nil && db != nil {
+		registry["paid_api"] = provider.NewOpenAICompatProvider(&paidAPIResolver{db: db, secret: cfg.APIKeysSecret})
 	}
 	if registry[defaultID] == nil || (cfg.MemoryProvider != "" && registry[cfg.MemoryProvider] == nil) {
 		return nil, errors.New("default and memory providers must be enabled")
@@ -99,10 +107,11 @@ func newRegistryHandler(ctx context.Context, db *store.Store, cfg config.Config,
 		memoryID = cfg.DefaultProvider
 	}
 	api := &API{db: db, config: cfg, logger: logger, defaultProvider: cfg.DefaultProvider, memoryProvider: memoryID,
-		live:    newLiveRunsWithProviders(ctx, cfg.DefaultProvider, registry, max(1, cfg.MaxConcurrentStreams)),
-		logins:     newRateLimiter(),
-		uploads:    newRateLimiter(),
-		webfetcher: webfetch.NewFetcher()}
+		live:        newLiveRunsWithProviders(ctx, cfg.DefaultProvider, registry, max(1, cfg.MaxConcurrentStreams)),
+		logins:      newRateLimiter(),
+		uploads:     newRateLimiter(),
+		webfetcher:  webfetch.NewFetcher(),
+		websearcher: websearch.NewClient(cfg.SearXNGURL, cfg.BraveAPIKey, cfg.TavilyAPIKey)}
 	api.live.db = db
 	api.live.logger = logger
 	if db != nil {
@@ -134,6 +143,11 @@ func newRegistryHandler(ctx context.Context, db *store.Store, cfg config.Config,
 	adminMux.HandleFunc("PATCH /api/admin/users/{id}", api.RequireAdmin(api.adminUpdateUser))
 	adminMux.HandleFunc("DELETE /api/admin/users/{id}", api.RequireAdmin(api.adminDeleteUser))
 	adminMux.HandleFunc("DELETE /api/admin/users/{id}/devices", api.RequireAdmin(api.adminRevokeDevices))
+	adminMux.HandleFunc("GET /api/admin/api-providers", api.RequireAdmin(api.adminListAPIProviders))
+	adminMux.HandleFunc("POST /api/admin/api-providers", api.RequireAdmin(api.adminCreateAPIProvider))
+	adminMux.HandleFunc("PATCH /api/admin/api-providers/{id}", api.RequireAdmin(api.adminUpdateAPIProvider))
+	adminMux.HandleFunc("DELETE /api/admin/api-providers/{id}", api.RequireAdmin(api.adminDeleteAPIProvider))
+	adminMux.HandleFunc("POST /api/admin/api-providers/{id}/test", api.RequireAdmin(api.adminTestAPIProvider))
 	mux.Handle("/api/admin", api.adminGuard(adminMux))
 	mux.Handle("/api/admin/", api.adminGuard(adminMux))
 	mux.HandleFunc("GET /api/codex/chats", api.withAuth(api.indexedChats))
@@ -141,6 +155,7 @@ func newRegistryHandler(ctx context.Context, db *store.Store, cfg config.Config,
 	mux.HandleFunc("GET /api/quotas/current", api.withAuth(api.currentQuota))
 	mux.HandleFunc("GET /api/profile", api.withAuth(api.getProfile))
 	mux.HandleFunc("PATCH /api/profile", api.withAuth(api.patchProfile))
+	mux.HandleFunc("POST /api/profile/telegram-test", api.withAuth(api.testTelegramNotify))
 	mux.HandleFunc("GET /api/models", api.withAuth(api.models))
 	mux.HandleFunc("GET /api/providers", api.withAuth(api.providers))
 	mux.HandleFunc("GET /api/users", api.withAuth(api.directoryUsers))
@@ -678,7 +693,7 @@ func (a *API) regenerateMessage(w http.ResponseWriter, r *http.Request, s sessio
 	targetProvider := strings.ToLower(strings.TrimSpace(req.Provider))
 	targetModel := strings.TrimSpace(req.Model)
 	if targetProvider != "" {
-		if targetProvider == "paid_api" || !a.live.hasProvider(targetProvider) {
+		if !a.live.hasProvider(targetProvider) || (targetProvider == "paid_api" && !a.db.HasEnabledPaidAPI(r.Context())) {
 			fail(w, http.StatusUnprocessableEntity, "provider_unavailable", "Requested provider is not available.")
 			return
 		}
@@ -755,14 +770,18 @@ func (a *API) chats(w http.ResponseWriter, r *http.Request, s session) {
 	reply(w, http.StatusOK, chats)
 }
 
-func (a *API) providers(w http.ResponseWriter, _ *http.Request, _ session) {
+func (a *API) providers(w http.ResponseWriter, r *http.Request, _ session) {
 	type entry struct {
 		ID        string `json:"id"`
 		Available bool   `json:"available"`
 	}
 	items := make([]entry, 0, 5)
 	for _, id := range []string{"antigravity", "codex", "claude", "paid_api"} {
-		items = append(items, entry{id, a.live.hasProvider(id)})
+		avail := a.live.hasProvider(id)
+		if id == "paid_api" && avail && a.db != nil {
+			avail = a.db.HasEnabledPaidAPI(r.Context())
+		}
+		items = append(items, entry{id, avail})
 	}
 	if a.live.hasProvider("stub") {
 		items = append(items, entry{"stub", true})

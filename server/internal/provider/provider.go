@@ -15,6 +15,11 @@ type ImageAttachment struct {
 	Data     []byte
 }
 
+type HistoryMessage struct {
+	Role    string
+	Content string
+}
+
 type Request struct {
 	UserID             string
 	Model              string
@@ -24,6 +29,7 @@ type Request struct {
 	SystemInstructions string
 	Ephemeral          bool
 	Images             []ImageAttachment
+	History            []HistoryMessage
 }
 
 type Usage struct {

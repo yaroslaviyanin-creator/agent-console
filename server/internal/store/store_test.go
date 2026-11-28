@@ -73,7 +73,7 @@ func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 		t.Fatalf("auth after reopening DB failed: %v", err)
 	}
 	var version int
-	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 24 {
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 25 {
 		t.Fatalf("schema version %d: %v", version, err)
 	}
 	if currentDevice.LastSeenAt != device.LastSeenAt {
@@ -161,8 +161,8 @@ func TestUpgradeAndResumeChat(t *testing.T) {
 	if list[0].DurationMs != nil || list[2].DurationMs == nil || *list[2].DurationMs != 276608 {
 		t.Fatalf("unexpected durations after reopen: legacy=%v, reply=%v", list[0].DurationMs, list[2].DurationMs)
 	}
-	if session, err := reopened.BeginRun(ctx, "owner", "chat", "paid", "test", "paid_api", "deepseek"); !errors.Is(err, ErrProviderUnavailable) || session != "" {
-		t.Fatalf("expected ErrProviderUnavailable for paid_api, got session=%q err=%v", session, err)
+	if session, err := reopened.BeginRun(ctx, "owner", "chat", "bad", "test", "unknown_provider", "deepseek"); !errors.Is(err, ErrProviderUnavailable) || session != "" {
+		t.Fatalf("expected ErrProviderUnavailable for unknown_provider, got session=%q err=%v", session, err)
 	}
 	if session, err := reopened.BeginRun(ctx, "owner", "chat", "after-paid", "still codex", "codex", "default"); err != nil || session != sessionID {
 		t.Fatalf("rejected paid_api wiped or changed session: session=%q err=%v", session, err)
@@ -856,8 +856,8 @@ func TestStoreMigrateV16ToV17Attachments(t *testing.T) {
 	defer reopened.Close()
 
 	var version int
-	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 24 {
-		t.Fatalf("expected user_version=24, got %d (err=%v)", version, err)
+	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 25 {
+		t.Fatalf("expected user_version=25, got %d (err=%v)", version, err)
 	}
 	owner, err := reopened.CreateUserWithRole(ctx, "u1", []byte("h"), "user")
 	if err != nil {
@@ -1010,8 +1010,8 @@ func TestUISettingsMigrationAndValidation(t *testing.T) {
 	defer db.Close()
 
 	var version int
-	if err := db.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 24 {
-		t.Fatalf("expected user_version 24, got %d (%v)", version, err)
+	if err := db.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 25 {
+		t.Fatalf("expected user_version 25, got %d (%v)", version, err)
 	}
 	prof, err := db.UserProfile(ctx, "u1")
 	if err != nil {
@@ -1112,8 +1112,8 @@ func TestMigrateV23ToV24FoldersAndProjectAttachments(t *testing.T) {
 	defer reopened.Close()
 
 	var version int
-	if err := reopened.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil || version != 24 {
-		t.Fatalf("expected user_version=24, got %d (%v)", version, err)
+	if err := reopened.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil || version != 25 {
+		t.Fatalf("expected user_version=25, got %d (%v)", version, err)
 	}
 	folders, err := reopened.ListFolders(ctx, userID)
 	if err != nil {

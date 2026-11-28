@@ -26,8 +26,8 @@ func TestLoadProviderValidation(t *testing.T) {
 	}
 
 	t.Setenv("PROVIDER", "paid_api")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "not implemented") {
-		t.Fatalf("Load(\"paid_api\") expected not implemented error, got: %v", err)
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load(\"paid_api\") expected nil, got: %v", err)
 	}
 
 	t.Setenv("PROVIDER", "bogus")
@@ -86,7 +86,6 @@ func TestParseProviderConfigMulti(t *testing.T) {
 	}{
 		{"duplicate", map[string]string{"ENABLED_PROVIDERS": "codex,codex"}},
 		{"empty entry", map[string]string{"ENABLED_PROVIDERS": "codex,"}},
-		{"paid_api in enabled", map[string]string{"ENABLED_PROVIDERS": "codex,paid_api"}},
 		{"unknown in enabled", map[string]string{"ENABLED_PROVIDERS": "codex,gemini"}},
 		{"default not enabled", map[string]string{"ENABLED_PROVIDERS": "codex,claude", "DEFAULT_PROVIDER": "antigravity"}},
 		{"default paid_api", map[string]string{"ENABLED_PROVIDERS": "codex", "DEFAULT_PROVIDER": "paid_api"}},

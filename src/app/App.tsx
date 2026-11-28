@@ -8,7 +8,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Globe, Hourglass, Laptop, Menu, Mic, MicOff, PanelLeft, PanelRight, Paperclip, Receipt, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
-import { clearChatAttachmentError, clearSearchJump, demoPrompt, availableDevices, downloadChatMarkdown, editAndResendPrompt, loadFolderAttachments, models, providerLabels, checkAccountStatus, logout, newChat, reconnectServer, removeChatAttachment, resolveAvailableProviders, resolveModelDisplay, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, setChatDraftText, stopChat, switchChatProvider, updateChat, uploadChatFiles, useChats } from './chatStore'
+import { clearChatAttachmentError, clearSearchJump, demoPrompt, availableDevices, downloadChatMarkdown, editAndResendPrompt, loadFolderAttachments, models, providerLabels, checkAccountStatus, logout, newChat, reconnectServer, removeChatAttachment, resolveAvailableProviders, resolveModelDisplay, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, setChatDraftText, stopChat, switchChatProvider, toggleChatWebSearch, updateChat, uploadChatFiles, useChats } from './chatStore'
 import { useAppearance } from './appearanceStore'
 import { QuoteReplyButton } from './QuoteReplyButton'
 import { SlashCommandMenu, applySlashTemplate, filterPromptTemplates, findSlashQuery } from './SlashCommandMenu'
@@ -289,6 +289,7 @@ function Conversation({
   const [slashDismissed, setSlashDismissed] = useState(false)
   const [cursorPos, setCursorPos] = useState(0)
   const pendingSearchJump = useChats(s => s.pendingSearchJump)
+  const webSearchEnabled = useChats(s => !!s.webSearchByChat[chat.id])
   const running = chat.turns.at(-1)?.state === 'running'
   const editable = chat.access === 'owner' || chat.access === 'write'
   const locked = running || !editable
@@ -743,6 +744,18 @@ function Conversation({
               {chat.target.mode === 'mcp' && <i className={`env-dot ${activeDevice?.online ? 'is-online' : 'is-offline'}`} aria-hidden="true" />}
               <ChevronDown size={12} aria-hidden="true" />
             </button>
+            {remote && !chat.indexedCodex && (
+              <button
+                type="button"
+                className={`composer-trigger composer-search-btn${webSearchEnabled ? ' is-active' : ''}`}
+                aria-pressed={webSearchEnabled}
+                onClick={() => toggleChatWebSearch(chat.id)}
+                title="Веб-поиск через SearXNG / внешний поиск"
+              >
+                <Globe size={13} aria-hidden="true" />
+                <span>Поиск</span>
+              </button>
+            )}
           </div>
           <div className="composer-actions">
             {(statusTone === 'is-error' || (remote && (!connected || !chat.historyLoaded))) && (

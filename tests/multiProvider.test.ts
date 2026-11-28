@@ -139,7 +139,7 @@ test('multi-provider chatStore scopes models, guards stale loads, switches provi
   assert.equal(switchedChat?.turns.length, beforeTurns)
 
   // Disabled / unavailable provider switch is ignored
-  await switchChatProvider('c-anti', 'paid_api')
+  await switchChatProvider('c-anti', 'claude')
   assert.equal(useChats.getState().chats.find(c => c.id === 'c-anti')?.provider, 'codex')
 
   // Switching back to another chat and returning restores c-anti's selected provider and model
@@ -200,4 +200,52 @@ test('multi-provider chatStore scopes models, guards stale loads, switches provi
     onChangeReasoning: () => {},
   }))
   assert.ok(html2.includes('gpt-5.2-codex'))
+})
+
+test('switchChatProvider allows switching to paid_api and loads paid_api models', async () => {
+  const { switchChatProvider, useChats } = await import('../src/app/chatStore')
+  const { RemoteTransport } = await import('../src/transport/RemoteTransport')
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    const u = String(url)
+    if (u.includes('/api/models?provider=paid_api')) {
+      return new Response(JSON.stringify([
+        { id: 'deepseek-chat', displayName: 'DeepSeek Chat', isDefault: true, reasoningLevels: [] },
+        { id: 'gpt-4o-mini', displayName: 'GPT-4o Mini', isDefault: false, reasoningLevels: [] },
+      ]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    return new Response('{}', { status: 200 })
+  }) as typeof fetch
+
+  try {
+    const remote = new RemoteTransport('http://127.0.0.1:8080')
+    useChats.setState({
+      remote,
+      providersLoaded: true,
+      serverProviders: [
+        { id: 'codex', available: true },
+        { id: 'paid_api', available: true },
+      ],
+      serverModelsByProvider: {},
+      chats: [{
+        id: 'c1',
+        title: 'Test',
+        provider: 'codex',
+        model: 'gpt-5.2-codex',
+        access: 'owner',
+        target: { mode: 'chat' },
+        turns: [],
+        draft: '',
+        attachments: [],
+      }],
+    })
+
+    await switchChatProvider('c1', 'paid_api')
+    const updated = useChats.getState().chats.find(c => c.id === 'c1')
+    assert.equal(updated?.provider, 'paid_api')
+    assert.equal(updated?.model, 'deepseek-chat')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })

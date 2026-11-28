@@ -174,6 +174,11 @@ func loadConfig(getenv func(string) (string, bool)) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	for _, p := range provCfg.EnabledProviders {
+		if p == "paid_api" {
+			return config{}, fmt.Errorf("runner does not host provider %q", p)
+		}
+	}
 
 	codexBin := strings.TrimSpace(get("CODEX_BIN"))
 	if codexBin == "" {

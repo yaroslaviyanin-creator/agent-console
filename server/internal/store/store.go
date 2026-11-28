@@ -203,7 +203,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version == 24 {
+	if version == 25 {
 		return nil
 	}
 	// SQLite requires disabling foreign keys outside the transaction on this connection.
@@ -220,7 +220,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	switch version {
 	case 0:
-		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=24;"); err != nil {
+		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=25;"); err != nil {
 			return err
 		}
 	case 1:
@@ -634,7 +634,32 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=24;`); err != nil {
 			return err
 		}
+		fallthrough
 	case 24:
+		var tgIDExists bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('users') WHERE name='telegram_id')").Scan(&tgIDExists); err != nil {
+			return err
+		}
+		if !tgIDExists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE users ADD COLUMN telegram_id TEXT NOT NULL DEFAULT '';`); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS paid_api_configs (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			base_url TEXT NOT NULL,
+			api_key_enc TEXT NOT NULL,
+			models_json TEXT NOT NULL DEFAULT '[]',
+			enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+			created_at INTEGER NOT NULL
+		);`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=25;`); err != nil {
+			return err
+		}
+	case 25:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}

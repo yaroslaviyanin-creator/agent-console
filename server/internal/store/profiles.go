@@ -26,17 +26,18 @@ type UserProfile struct {
 	MemoryEnabled   bool            `json:"memoryEnabled"`
 	MemoryUpdatedAt int64           `json:"memoryUpdatedAt"`
 	UISettings      json.RawMessage `json:"uiSettings"`
+	TelegramID      string          `json:"telegramId"`
 }
 
 var ErrInvalidProfile = errors.New("invalid profile fields")
 var ErrInvalidUISettings = errors.New("invalid uiSettings")
 
-const profileColumns = "display_name,avatar_data,profile_md,memory_md,memory_enabled,memory_updated_at,ui_settings_json"
+const profileColumns = "display_name,avatar_data,profile_md,memory_md,memory_enabled,memory_updated_at,ui_settings_json,telegram_id"
 
 func readUserProfile(db rowQuerier, ctx context.Context, query string, args ...any) (UserProfile, error) {
 	var p UserProfile
 	var uiRaw string
-	err := db.QueryRowContext(ctx, query, args...).Scan(&p.DisplayName, &p.AvatarData, &p.ProfileMD, &p.MemoryMD, &p.MemoryEnabled, &p.MemoryUpdatedAt, &uiRaw)
+	err := db.QueryRowContext(ctx, query, args...).Scan(&p.DisplayName, &p.AvatarData, &p.ProfileMD, &p.MemoryMD, &p.MemoryEnabled, &p.MemoryUpdatedAt, &uiRaw, &p.TelegramID)
 	if err == nil {
 		if strings.TrimSpace(p.MemoryMD) == "[]" {
 			p.MemoryMD = ""
@@ -110,7 +111,7 @@ func ValidateAndNormalizeUISettings(raw json.RawMessage) (string, error) {
 				return "", ErrInvalidUISettings
 			}
 			normalized[k] = strings.ToLower(trimmed)
-		case "ambientGradient":
+		case "ambientGradient", "telegramNotify":
 			b, ok := v.(bool)
 			if !ok {
 				return "", ErrInvalidUISettings
@@ -208,6 +209,35 @@ func (s *Store) UpdateUserProfileWithUI(ctx context.Context, userID string, disp
   memory_updated_at=CASE WHEN ?4 IS NOT NULL OR (?5 IS NOT NULL AND ?5 != memory_enabled)
     THEN MAX(memory_updated_at+1,?6) ELSE memory_updated_at END
   WHERE id=?1 RETURNING `+profileColumns, userID, displayName, profileMD, memoryMD, memoryEnabled, time.Now().UnixMilli(), avatar, uiJSON)
+}
+
+func (s *Store) UpdateUserTelegramID(ctx context.Context, userID, telegramID string) error {
+	clean := strings.TrimSpace(telegramID)
+	if len(clean) > 32 {
+		return ErrInvalidProfile
+	}
+	for _, r := range clean {
+		if r < '0' || r > '9' {
+			return ErrInvalidProfile
+		}
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET telegram_id=?2 WHERE id=?1`, userID, clean)
+	return err
+}
+
+func (s *Store) UserTelegramNotifyInfo(ctx context.Context, userID string) (telegramID string, enabled bool, err error) {
+	var uiRaw string
+	err = s.db.QueryRowContext(ctx, `SELECT telegram_id, ui_settings_json FROM users WHERE id=?`, userID).Scan(&telegramID, &uiRaw)
+	if err != nil {
+		return "", false, err
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(uiRaw), &obj) == nil {
+		if v, ok := obj["telegramNotify"].(bool); ok {
+			enabled = v
+		}
+	}
+	return strings.TrimSpace(telegramID), enabled, nil
 }
 
 func (s *Store) SaveUserMemory(ctx context.Context, userID, memoryMD string, updatedAt int64) error {

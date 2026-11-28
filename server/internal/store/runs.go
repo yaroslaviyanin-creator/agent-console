@@ -20,7 +20,7 @@ var (
 
 func isRunnableProvider(id string) bool {
 	switch id {
-	case "antigravity", "codex", "claude", "stub":
+	case "antigravity", "codex", "claude", "paid_api", "stub":
 		return true
 	default:
 		return false

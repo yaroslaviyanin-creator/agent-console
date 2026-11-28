@@ -9,6 +9,7 @@ import { clearChatDraft, readChatDraft, writeChatDraft } from './drafts'
 import { readConnection, saveConnection, setTransport, transport } from './runtime'
 import type { ConnectionMode } from './runtime'
 import { RemoteError, RemoteTransport, fallbackProviders, normalizeServerAddress } from '../transport/RemoteTransport'
+import { getTelegramUserId } from '../platform/telegram'
 
 export const providerLabels = { antigravity: 'Antigravity', codex: 'Codex', claude: 'Claude', paid_api: 'Paid API' } satisfies Record<Provider, string>
 export const models = [
@@ -126,6 +127,7 @@ export const useChats = create<{
   codexIndex: 'hidden' | 'loading' | 'ready' | 'error'
   folders: ChatFolder[]
   folderAttachmentsById: Record<string, MessageAttachment[]>
+  webSearchByChat: Record<string, boolean>
   pendingSearchJump: { chatId: string; messageId: string; nonce: number } | null
 }>(() => ({
   activeId: '', chats: [], workspace: null, mode: savedConnection.mode, address: savedConnection.address,
@@ -135,6 +137,7 @@ export const useChats = create<{
   codexIndex: 'hidden',
   folders: [],
   folderAttachmentsById: {},
+  webSearchByChat: {},
   pendingSearchJump: null,
 }))
 
@@ -358,8 +361,11 @@ function attachRemote(remote: RemoteTransport, workspace: Workspace) {
     startRemote(remote)
     setAppearanceSyncHandler(uiSettings => remote.updateProfile({ uiSettings }).then(() => undefined))
     void remote.getProfile().then(profile => {
-      if (useChats.getState().remote === remote && profile.uiSettings) {
-        applyServerUISettings(profile.uiSettings)
+      if (useChats.getState().remote !== remote) return
+      if (profile.uiSettings) applyServerUISettings(profile.uiSettings)
+      const tgId = getTelegramUserId()
+      if (tgId && profile.telegramId !== tgId) {
+        void remote.updateProfile({ telegramId: tgId }).catch(() => {})
       }
     }).catch(() => {})
   }
@@ -377,8 +383,11 @@ export async function checkAccountStatus() {
     startRemote(remote)
     setAppearanceSyncHandler(uiSettings => remote.updateProfile({ uiSettings }).then(() => undefined))
     void remote.getProfile().then(profile => {
-      if (useChats.getState().remote === remote && profile.uiSettings) {
-        applyServerUISettings(profile.uiSettings)
+      if (useChats.getState().remote !== remote) return
+      if (profile.uiSettings) applyServerUISettings(profile.uiSettings)
+      const tgId = getTelegramUserId()
+      if (tgId && profile.telegramId !== tgId) {
+        void remote.updateProfile({ telegramId: tgId }).catch(() => {})
       }
     }).catch(() => {})
   }
@@ -609,7 +618,13 @@ function applyRemoteWorkspace(remote: RemoteTransport, workspace: Workspace, pre
   })
   const chats = sortChatsPinnedFirst(rawChats)
   for (const id of runs.keys()) if (!accessById.has(id)) stopChat(id)
-  const selected = preferred ?? state.activeId
+  let initialChatParam: string | null = null
+  if (!state.activeId && typeof window !== 'undefined' && window.location) {
+    try {
+      initialChatParam = new URLSearchParams(window.location.search).get('chat')
+    } catch { /* ignore */ }
+  }
+  const selected = preferred ?? (initialChatParam && chats.some(c => c.id === initialChatParam) ? initialChatParam : state.activeId)
   const activeId = chats.some(c => c.id === selected) ? selected : chats[0]?.id ?? ''
   useChats.setState({ workspace, chats, activeId })
   if (activeId !== state.activeId && activeId) {
@@ -914,8 +929,8 @@ export async function switchChatProvider(chatId: string, nextProvider: ServerPro
   if (!source || source.access !== 'owner' || source.indexedCodex) return
   if (source.turns.some(t => t.state === 'running')) return
   const currentProvider = source.provider ?? state.defaultServerProvider ?? remote.provider
-  if (nextProvider === currentProvider || nextProvider === 'paid_api') return
-  if (providersLoaded && !serverProviders.some(p => p.id === nextProvider && p.available)) return
+  if (nextProvider === currentProvider) return
+  if (providersLoaded && nextProvider !== 'paid_api' && !serverProviders.some(p => p.id === nextProvider && p.available)) return
 
   const savedCurrent = { model: source.model, ...(source.reasoning ? { reasoning: source.reasoning } : {}) }
   const existingCatalog = serverModelsByProvider[nextProvider]
@@ -1317,6 +1332,12 @@ export async function removeFolderFile(folderId: string, attachmentId: string) {
 }
 
 const draftSaveTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+export function toggleChatWebSearch(chatId: string) {
+  useChats.setState(s => ({
+    webSearchByChat: { ...s.webSearchByChat, [chatId]: !s.webSearchByChat[chatId] },
+  }))
+}
 
 export function setChatDraftText(chatId: string, text: string) {
   updateChat(chatId, c => ({ ...c, draft: text }))
@@ -1790,6 +1811,7 @@ async function startRun(id: string, input: string, retry?: { turnId: string; mod
       ...(c.reasoning ? { reasoning: c.reasoning } : {}),
       target,
       prompt,
+      ...(remote && useChats.getState().webSearchByChat[id] ? { webSearch: true } : {}),
       ...(attachmentIds.length ? { attachmentIds } : {}),
       ...(history ? { history } : {}),
       ...retryFields,

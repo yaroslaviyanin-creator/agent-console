@@ -13,3 +13,8 @@ initializePlatform()
 void restoreConnection()
 createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>)
 void initializeTelegram()
+if ('serviceWorker' in navigator && import.meta.env.PROD) {
+  window.addEventListener('load', () => {
+    void navigator.serviceWorker.register('/sw.js').catch(() => {})
+  })
+}

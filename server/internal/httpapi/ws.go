@@ -19,8 +19,10 @@ import (
 	"agent-console/server/internal/artifacts"
 	"agent-console/server/internal/provider"
 	"agent-console/server/internal/store"
+	"agent-console/server/internal/telegram"
 	"agent-console/server/internal/uploads"
 	"agent-console/server/internal/webfetch"
+	"agent-console/server/internal/websearch"
 	"github.com/gorilla/websocket"
 )
 
@@ -33,6 +35,7 @@ type runRequest struct {
 	AttachmentIDs      []string `json:"attachmentIds,omitempty"`
 	Reasoning          string   `json:"reasoning,omitempty"`
 	Provider           string   `json:"provider,omitempty"`
+	WebSearch          bool     `json:"webSearch,omitempty"`
 	Model              struct {
 		Provider string `json:"provider"`
 		ID       string `json:"id"`
@@ -133,6 +136,15 @@ func (r *liveRuns) provider(id string) (provider.Provider, bool) {
 func (r *liveRuns) hasProvider(id string) bool {
 	_, ok := r.provider(id)
 	return ok
+}
+
+func (r *liveRuns) hasUserWS(userID string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.clients[userID]) > 0
 }
 
 func (a *API) issueWSTicket(w http.ResponseWriter, r *http.Request, s session) {
@@ -417,27 +429,23 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 	}
 	reqProvider := strings.ToLower(strings.TrimSpace(req.Provider))
 	modelProvider := strings.ToLower(strings.TrimSpace(req.Model.Provider))
-	if reqProvider == "paid_api" || modelProvider == "paid_api" {
-		reject("provider_unavailable", "Paid API provider is not available.", false)
-		return
-	}
 	targetProvider := chatProvider
 	if reqProvider != "" {
 		targetProvider = reqProvider
 	}
 	switch targetProvider {
-	case "antigravity", "codex", "claude", "stub":
+	case "antigravity", "codex", "claude", "paid_api", "stub":
 	default:
 		reject("unsupported_model", "Unknown model provider.", false)
 		return
 	}
-	if !a.live.hasProvider(targetProvider) {
+	if !a.live.hasProvider(targetProvider) || (targetProvider == "paid_api" && a.db != nil && !a.db.HasEnabledPaidAPI(a.live.ctx)) {
 		reject("provider_unavailable", "The selected provider is not available.", false)
 		return
 	}
 	if modelProvider != "" {
 		switch modelProvider {
-		case "antigravity", "codex", "claude", "stub":
+		case "antigravity", "codex", "claude", "paid_api", "stub":
 		default:
 			reject("unsupported_model", "Unknown model provider.", false)
 			return
@@ -617,6 +625,86 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 
 	resumeSessionID := ""
 	effectivePrompt := req.Prompt
+	if req.WebSearch && a.websearcher != nil && a.websearcher.Enabled() && strings.TrimSpace(req.Prompt) != "" {
+		if a.logger != nil {
+			a.logger.Info("websearch requested", "chatId", req.ChatID, "provider", targetProvider)
+		}
+		results, sErr := a.websearcher.Search(runCtx, req.Prompt, websearch.DefaultMaxResults)
+		if sErr != nil || len(results) == 0 {
+			if a.logger != nil {
+				a.logger.Warn("websearch returned no results", "chatId", req.ChatID, "error", sErr, "count", len(results))
+			}
+			statusTitle := "Поиск: нет результатов"
+			detail := "empty"
+			if sErr != nil {
+				statusTitle = "Поиск: ошибка"
+				detail = sErr.Error()
+			}
+			errSources := []store.WebSource{{
+				URL:    "https://searxng.internal/search",
+				Title:  statusTitle,
+				Status: "error",
+				Detail: detail,
+			}}
+			_ = a.db.SaveRunWebSources(runCtx, req.ChatID, req.MessageID, errSources)
+			seq++
+			a.live.publish(runEvent{
+				ChatID:     req.ChatID,
+				MessageID:  req.MessageID,
+				Seq:        seq,
+				Type:       "web_sources",
+				WebSources: errSources,
+			})
+		} else {
+			if a.logger != nil {
+				a.logger.Info("websearch completed", "chatId", req.ChatID, "results", len(results))
+			}
+			var fetched []webfetch.Page
+			if a.webfetcher != nil {
+				topURLs := make([]string, 0, 2)
+				for _, r := range results {
+					if len(topURLs) >= 2 {
+						break
+					}
+					topURLs = append(topURLs, r.URL)
+				}
+				if len(topURLs) > 0 {
+					fetched = a.webfetcher.FetchAll(runCtx, topURLs)
+				}
+			}
+			webSources := make([]store.WebSource, 0, len(results))
+			fetchedByURL := make(map[string]webfetch.Page, len(fetched))
+			for _, p := range fetched {
+				fetchedByURL[p.URL] = p
+			}
+			for _, r := range results {
+				status := string(webfetch.StatusOK)
+				detail := ""
+				if fp, ok := fetchedByURL[r.URL]; ok {
+					status = string(fp.Status)
+					detail = fp.Detail
+				}
+				webSources = append(webSources, store.WebSource{
+					URL:    r.URL,
+					Title:  r.Title,
+					Status: status,
+					Detail: detail,
+				})
+			}
+			if err := a.db.SaveRunWebSources(runCtx, req.ChatID, req.MessageID, webSources); err != nil {
+				a.logger.Warn("save web search sources failed", "chatId", req.ChatID, "error", err)
+			}
+			seq++
+			a.live.publish(runEvent{
+				ChatID:     req.ChatID,
+				MessageID:  req.MessageID,
+				Seq:        seq,
+				Type:       "web_sources",
+				WebSources: webSources,
+			})
+			effectivePrompt = websearch.BuildSearchContext(effectivePrompt, req.Prompt, results, fetched)
+		}
+	}
 	if len(projectAtts) > 0 {
 		effectivePrompt = buildProjectPromptWithAttachments(effectivePrompt, projectAtts, a.config.EffectiveMaxAttachmentContextBytes())
 	}
@@ -647,7 +735,18 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 		}
 	}
 	prompt := buildPromptWithAttachmentsBudget(effectivePrompt, attached, a.config.EffectiveMaxAttachmentContextBytes())
-	if sessionID != "" && targetProvider == sessionProvider {
+	var apiHistory []provider.HistoryMessage
+	if targetProvider == "paid_api" {
+		prior, err := a.db.ChatPriorMessages(runCtx, req.ChatID, req.MessageID)
+		if err != nil {
+			return failure("storage_error", "Could not load chat history.", err)
+		}
+		for _, m := range prior {
+			if (m.Role == "user" || m.Role == "assistant") && strings.TrimSpace(m.Content) != "" {
+				apiHistory = append(apiHistory, provider.HistoryMessage{Role: m.Role, Content: m.Content})
+			}
+		}
+	} else if sessionID != "" && targetProvider == sessionProvider {
 		resumeSessionID = sessionID
 	} else {
 		prior, err := a.db.ChatPriorMessages(runCtx, req.ChatID, req.MessageID)
@@ -665,14 +764,24 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 		return failure("storage_error", "Could not load your profile.", err)
 	}
 	started := time.Now()
-	events, err := backend.Stream(runCtx, provider.Request{UserID: ownerID, Model: req.Model.ID, Reasoning: req.Reasoning, Prompt: prompt, SessionID: resumeSessionID, SystemInstructions: instructions, Images: promptImages})
+	events, err := backend.Stream(runCtx, provider.Request{UserID: ownerID, Model: req.Model.ID, Reasoning: req.Reasoning, Prompt: prompt, SessionID: resumeSessionID, SystemInstructions: instructions, Images: promptImages, History: apiHistory})
 	if err != nil {
 		if errors.Is(err, provider.ErrUnsupportedImageAttachments) {
 			return req.failure(seq+1, "unsupported_attachment", err.Error(), false)
 		}
+		if targetProvider == "paid_api" {
+			msg := err.Error()
+			if errors.Is(err, sql.ErrNoRows) {
+				msg = "Выбранная модель или провайдер больше не найдены — выберите модель заново в меню"
+			} else if strings.Contains(msg, "model_not_found") || strings.Contains(msg, "HTTP 404") {
+				msg = "Модель не найдена у провайдера (" + msg + ")"
+			}
+			return failure("provider_error", msg, err)
+		}
 		return failure("provider_error", "Could not start the provider.", err)
 	}
 	var text, thinking bytes.Buffer
+	var doneCleanText string
 	for {
 		select {
 		case <-runCtx.Done():
@@ -718,6 +827,7 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 				if err != nil {
 					return failure("storage_error", "Could not save the response.", err)
 				}
+				doneCleanText = parsed.CleanText
 				wire.Reason = "completed"
 				wire.DurationMs = &durationMs
 				wire.Provider = targetProvider
@@ -739,12 +849,16 @@ func (a *API) streamRunForProvider(ctx context.Context, userID, ownerID, targetP
 					}
 				}
 			case provider.Error:
+				durationMs := time.Since(started).Milliseconds()
+				a.maybeNotifyTelegram(ownerID, userID, req.ChatID, req.Model.ID, "", 0, durationMs, true)
 				return failure("provider_error", "The provider could not complete the response.", event.Err)
 			default:
 				continue
 			}
 			seq++
 			if event.Type == provider.Done {
+				durationMs := time.Since(started).Milliseconds()
+				a.maybeNotifyTelegram(ownerID, userID, req.ChatID, req.Model.ID, doneCleanText, len(wire.Attachments), durationMs, false)
 				return wire
 			}
 			a.live.publish(wire)
@@ -875,4 +989,38 @@ func buildHandoffPromptWithAttachments(messages []store.Message, priorAtts map[s
 
 func (req runRequest) failure(seq int, code, message string, retryable bool) runEvent {
 	return runEvent{ChatID: req.ChatID, MessageID: req.MessageID, Seq: seq, Type: "error", Code: code, Message: message, Retryable: &retryable}
+}
+
+func (a *API) maybeNotifyTelegram(ownerID, callerID, chatID, modelLabel, cleanText string, attachmentsCount int, durationMs int64, isError bool) {
+	if a.db == nil || a.config.TelegramBotToken == "" || ownerID != callerID {
+		return
+	}
+	tgID, enabled, err := a.db.UserTelegramNotifyInfo(context.Background(), ownerID)
+	if err != nil || !enabled || tgID == "" {
+		return
+	}
+	chatTitle := ""
+	if chats, err := a.db.Chats(context.Background(), ownerID); err == nil {
+		for _, c := range chats {
+			if c.ID == chatID {
+				chatTitle = c.Title
+				break
+			}
+		}
+	}
+	msg := telegram.FormatReplyNotification(chatTitle, modelLabel, cleanText, attachmentsCount, isError)
+	openURL := ""
+	if a.config.PublicURL != "" {
+		openURL = a.config.PublicURL + "/?chat=" + chatID
+	}
+	apiBase := a.telegramAPIBaseURL
+	httpClient := a.telegramHTTPClient
+	token := a.config.TelegramBotToken
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		if err := telegram.SendNotification(ctx, httpClient, apiBase, token, tgID, msg, openURL); err != nil && a.logger != nil {
+			a.logger.Warn("telegram notify failed", "chatId", chatID, "error", err)
+		}
+	}()
 }

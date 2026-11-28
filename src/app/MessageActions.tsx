@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Check, Copy, FileText, GitFork, Info, MoreHorizontal, Pencil, RefreshCw, Trash2 } from 'lucide-react'
 import { deleteChatMessage, forkChatAt, providerLabels, regenerateTurn, type Turn } from './chatStore'
 
@@ -82,11 +83,51 @@ export function AssistantMessageActions({
   const [infoOpen, setInfoOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const wrapRef = useRef<HTMLDivElement>(null)
+  const moreBtnRef = useRef<HTMLButtonElement>(null)
+  const moreMenuRef = useRef<HTMLDivElement>(null)
+  const infoMenuRef = useRef<HTMLDivElement>(null)
+  const [popoverPos, setPopoverPos] = useState<{ left: number; top: number } | null>(null)
+
+  useLayoutEffect(() => {
+    if (!moreOpen && !infoOpen) {
+      setPopoverPos(null)
+      return
+    }
+    const updatePosition = () => {
+      const btn = moreBtnRef.current
+      const menuEl = moreOpen ? moreMenuRef.current : infoMenuRef.current
+      if (!btn || !menuEl || typeof window === 'undefined') return
+      const anchor = btn.getBoundingClientRect()
+      const menuRect = menuEl.getBoundingClientRect()
+      const menuWidth = menuRect.width || 220
+      const menuHeight = menuRect.height || 180
+      const preferredLeft = anchor.right - menuWidth
+      const left = Math.max(8, Math.min(preferredLeft, window.innerWidth - menuWidth - 8))
+      const topAbove = anchor.top - menuHeight - 6
+      const topBelow = anchor.bottom + 6
+      const top = topAbove >= 8
+        ? topAbove
+        : Math.max(8, Math.min(topBelow, window.innerHeight - menuHeight - 8))
+      setPopoverPos({ left, top })
+    }
+    updatePosition()
+    window.addEventListener('resize', updatePosition)
+    window.addEventListener('scroll', updatePosition, true)
+    return () => {
+      window.removeEventListener('resize', updatePosition)
+      window.removeEventListener('scroll', updatePosition, true)
+    }
+  }, [moreOpen, infoOpen, confirmDelete])
 
   useEffect(() => {
     if (!moreOpen && !infoOpen) return
     const onPointerDown = (e: PointerEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+      const target = e.target as Node
+      if (
+        (!wrapRef.current || !wrapRef.current.contains(target)) &&
+        (!moreMenuRef.current || !moreMenuRef.current.contains(target)) &&
+        (!infoMenuRef.current || !infoMenuRef.current.contains(target))
+      ) {
         setMoreOpen(false)
         setInfoOpen(false)
         setConfirmDelete(false)
@@ -174,6 +215,7 @@ export function AssistantMessageActions({
       )}
       <div className="msg-action-anchor">
         <button
+          ref={moreBtnRef}
           type="button"
           className={`msg-action-btn is-icon${moreOpen ? ' is-open' : ''}`}
           aria-label="Ещё действия"
@@ -188,8 +230,15 @@ export function AssistantMessageActions({
         >
           <MoreHorizontal size={14} />
         </button>
-        {moreOpen && (
-          <div className="msg-action-popover align-right" role="menu">
+        {moreOpen && typeof document !== 'undefined' && createPortal(
+          <div
+            ref={moreMenuRef}
+            className="msg-action-popover"
+            role="menu"
+            style={popoverPos
+              ? { position: 'fixed', left: `${popoverPos.left}px`, top: `${popoverPos.top}px`, right: 'auto', bottom: 'auto' }
+              : { position: 'fixed', left: '-9999px', top: '-9999px', right: 'auto', bottom: 'auto' }}
+          >
             {rawMarkdown && (
               <button type="button" role="menuitem" className="msg-popover-item" onClick={() => void handleCopyPlain()}>
                 {copiedPlain ? <Check size={14} /> : <FileText size={14} />}
@@ -239,10 +288,19 @@ export function AssistantMessageActions({
                 </button>
               )
             )}
-          </div>
+          </div>,
+          document.body,
         )}
-        {infoOpen && (
-          <div className="msg-info-popover align-right" role="dialog" aria-label="Информация о сообщении">
+        {infoOpen && typeof document !== 'undefined' && createPortal(
+          <div
+            ref={infoMenuRef}
+            className="msg-info-popover"
+            role="dialog"
+            aria-label="Информация о сообщении"
+            style={popoverPos
+              ? { position: 'fixed', left: `${popoverPos.left}px`, top: `${popoverPos.top}px`, right: 'auto', bottom: 'auto' }
+              : { position: 'fixed', left: '-9999px', top: '-9999px', right: 'auto', bottom: 'auto' }}
+          >
             <div className="msg-info-row"><span>Провайдер</span><strong>{providerLabel(turn.provider)}</strong></div>
             <div className="msg-info-row"><span>Модель</span><strong>{turn.model || (turn.modelId && turn.modelId !== 'default' ? turn.modelId : 'По умолчанию')}</strong></div>
             <div className="msg-info-row"><span>Время</span><strong>{fullDateTime.format(turn.time)}</strong></div>
@@ -274,7 +332,8 @@ export function AssistantMessageActions({
                 </div>
               </>
             )}
-          </div>
+          </div>,
+          document.body,
         )}
       </div>
     </div>
