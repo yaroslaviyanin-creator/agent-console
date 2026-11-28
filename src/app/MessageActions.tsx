@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Check, Copy, FileText, GitFork, Info, MoreHorizontal, Pencil, RefreshCw, Sparkles, Trash2 } from 'lucide-react'
-import type { ServerProvider, ServerProviderInfo } from '../protocol/types'
+import { Check, Copy, FileText, GitFork, Info, MoreHorizontal, Pencil, RefreshCw, Trash2 } from 'lucide-react'
 import { deleteChatMessage, forkChatAt, providerLabels, regenerateTurn, type Turn } from './chatStore'
 
 /** Strips common Markdown syntax to clean readable plain text. */
@@ -65,33 +64,29 @@ const fullDateTime = new Intl.DateTimeFormat('ru-RU', {
 export function AssistantMessageActions({
   chatId,
   turn,
-  currentProvider,
-  availableProviders,
   writable,
   canFork,
   busy,
+  isLast = true,
 }: {
   chatId: string
   turn: Turn
-  currentProvider: ServerProvider
-  availableProviders: readonly ServerProviderInfo[]
   writable: boolean
   canFork: boolean
   busy: boolean
+  isLast?: boolean
 }) {
   const [copiedMd, setCopiedMd] = useState(false)
   const [copiedPlain, setCopiedPlain] = useState(false)
-  const [regenOpen, setRegenOpen] = useState(false)
   const [moreOpen, setMoreOpen] = useState(false)
   const [infoOpen, setInfoOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const wrapRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    if (!regenOpen && !moreOpen && !infoOpen) return
+    if (!moreOpen && !infoOpen) return
     const onPointerDown = (e: PointerEvent) => {
       if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
-        setRegenOpen(false)
         setMoreOpen(false)
         setInfoOpen(false)
         setConfirmDelete(false)
@@ -99,7 +94,6 @@ export function AssistantMessageActions({
     }
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        setRegenOpen(false)
         setMoreOpen(false)
         setInfoOpen(false)
         setConfirmDelete(false)
@@ -111,7 +105,7 @@ export function AssistantMessageActions({
       window.removeEventListener('pointerdown', onPointerDown)
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [regenOpen, moreOpen, infoOpen])
+  }, [moreOpen, infoOpen])
 
   if (turn.state === 'running') return null
 
@@ -119,9 +113,6 @@ export function AssistantMessageActions({
     .flatMap(p => (p.kind === 'text' ? [p.text] : []))
     .join('\n\n')
     .trim()
-
-  const otherProviders = availableProviders.filter(p => p.id !== currentProvider && p.available)
-  const showSwitchProvider = writable && availableProviders.length >= 2 && otherProviders.length > 0
 
   const handleCopyMarkdown = async () => {
     if (!rawMarkdown) return
@@ -142,81 +133,43 @@ export function AssistantMessageActions({
   }
 
   return (
-    <div className="msg-actions" ref={wrapRef} aria-label="Действия с ответом">
+    <div
+      className={`msg-actions${isLast ? ' is-last' : ''}${moreOpen || infoOpen ? ' is-menu-open' : ''}`}
+      ref={wrapRef}
+      aria-label="Действия с ответом"
+    >
       {rawMarkdown && (
         <button
           type="button"
-          className={`msg-action-btn${copiedMd ? ' is-done' : ''}`}
+          className={`msg-action-btn is-icon${copiedMd ? ' is-done' : ''}`}
           onClick={() => void handleCopyMarkdown()}
-          title="Скопировать Markdown"
-          aria-label="Скопировать Markdown"
+          title={copiedMd ? 'Скопировано' : 'Копировать'}
+          aria-label={copiedMd ? 'Скопировано' : 'Копировать'}
         >
           {copiedMd ? <Check size={14} /> : <Copy size={14} />}
-          <span>{copiedMd ? 'Скопировано' : 'Копировать'}</span>
         </button>
       )}
       {writable && (
         <button
           type="button"
-          className="msg-action-btn"
+          className="msg-action-btn is-icon"
           disabled={busy}
           onClick={() => void regenerateTurn(chatId, turn.id)}
           title="Повторить ответ"
           aria-label="Повторить"
         >
           <RefreshCw size={14} />
-          <span>Повторить</span>
         </button>
-      )}
-      {showSwitchProvider && (
-        <div className="msg-action-anchor">
-          <button
-            type="button"
-            className={`msg-action-btn${regenOpen ? ' is-open' : ''}`}
-            disabled={busy}
-            aria-expanded={regenOpen}
-            aria-haspopup="menu"
-            onClick={() => {
-              setMoreOpen(false)
-              setInfoOpen(false)
-              setRegenOpen(v => !v)
-            }}
-            title="Перегенерировать в другом провайдере"
-          >
-            <Sparkles size={14} />
-            <span>Другой провайдер</span>
-          </button>
-          {regenOpen && (
-            <div className="msg-action-popover" role="menu" aria-label="Выбор провайдера">
-              <div className="msg-popover-title">Перегенерировать через:</div>
-              {otherProviders.map(p => (
-                <button
-                  key={p.id}
-                  type="button"
-                  role="menuitem"
-                  className="msg-popover-item"
-                  onClick={() => {
-                    setRegenOpen(false)
-                    void regenerateTurn(chatId, turn.id, { provider: p.id })
-                  }}
-                >
-                  {providerLabel(p.id)}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
       )}
       {canFork && (
         <button
           type="button"
-          className="msg-action-btn"
+          className="msg-action-btn is-icon"
           onClick={() => void forkChatAt(chatId, turn.id)}
           title="Создать ветку отсюда"
           aria-label="Создать ветку отсюда"
         >
           <GitFork size={14} />
-          <span>Ветка отсюда</span>
         </button>
       )}
       <div className="msg-action-anchor">
@@ -224,10 +177,10 @@ export function AssistantMessageActions({
           type="button"
           className={`msg-action-btn is-icon${moreOpen ? ' is-open' : ''}`}
           aria-label="Ещё действия"
+          title="Ещё действия"
           aria-expanded={moreOpen}
           aria-haspopup="menu"
           onClick={() => {
-            setRegenOpen(false)
             setInfoOpen(false)
             setConfirmDelete(false)
             setMoreOpen(v => !v)
@@ -290,8 +243,8 @@ export function AssistantMessageActions({
         )}
         {infoOpen && (
           <div className="msg-info-popover align-right" role="dialog" aria-label="Информация о сообщении">
-            <div className="msg-info-row"><span>Провайдер</span><strong>{providerLabel(turn.provider ?? currentProvider)}</strong></div>
-            <div className="msg-info-row"><span>Модель</span><strong>{turn.modelId && turn.modelId !== 'default' ? turn.modelId : turn.model}</strong></div>
+            <div className="msg-info-row"><span>Провайдер</span><strong>{providerLabel(turn.provider)}</strong></div>
+            <div className="msg-info-row"><span>Модель</span><strong>{turn.model || (turn.modelId && turn.modelId !== 'default' ? turn.modelId : 'По умолчанию')}</strong></div>
             <div className="msg-info-row"><span>Время</span><strong>{fullDateTime.format(turn.time)}</strong></div>
             {turn.durationMs != null && (
               <div className="msg-info-row"><span>Длительность</span><strong>{(turn.durationMs / 1000).toFixed(1)} с</strong></div>

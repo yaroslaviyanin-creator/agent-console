@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -21,11 +22,12 @@ const (
 // Privileged fields (id, userId, role, planTier, status, isAdmin, isActive) are intentionally absent
 // and rejected by decodeLimit's DisallowUnknownFields.
 type profilePatchRequest struct {
-	DisplayName   *string `json:"displayName"`
-	AvatarData    *string `json:"avatarData"`
-	ProfileMD     *string `json:"profileMd"`
-	MemoryMD      *string `json:"memoryMd"`
-	MemoryEnabled *bool   `json:"memoryEnabled"`
+	DisplayName   *string          `json:"displayName"`
+	AvatarData    *string          `json:"avatarData"`
+	ProfileMD     *string          `json:"profileMd"`
+	MemoryMD      *string          `json:"memoryMd"`
+	MemoryEnabled *bool            `json:"memoryEnabled"`
+	UISettings    *json.RawMessage `json:"uiSettings"`
 }
 
 func (a *API) getProfile(w http.ResponseWriter, r *http.Request, s session) {
@@ -53,8 +55,10 @@ func (a *API) patchProfile(w http.ResponseWriter, r *http.Request, s session) {
 		}
 		patch.AvatarData = &sanitized
 	}
-	profile, err := a.db.UpdateUserProfile(r.Context(), s.User.ID, patch.DisplayName, patch.ProfileMD, patch.MemoryMD, patch.MemoryEnabled, patch.AvatarData)
+	profile, err := a.db.UpdateUserProfileWithUI(r.Context(), s.User.ID, patch.DisplayName, patch.ProfileMD, patch.MemoryMD, patch.MemoryEnabled, patch.UISettings, patch.AvatarData)
 	switch {
+	case errors.Is(err, store.ErrInvalidUISettings):
+		fail(w, http.StatusBadRequest, "invalid_ui_settings", "Некорректные настройки оформления (допустимы только известные поля, HEX #RRGGBB и размер до 8 КБ).")
 	case errors.Is(err, store.ErrInvalidProfile):
 		fail(w, http.StatusBadRequest, "invalid_profile", "Имя должно занимать до 80 символов, аватар — до 2 МБ, а каждый текст — до 4096 байт.")
 	case err != nil:

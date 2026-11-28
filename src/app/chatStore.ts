@@ -4,6 +4,7 @@ import type { LoginRequest, MessageAttachment, MessageUsage, Workspace, Permissi
 import { MockWorkspace } from '../transport/MockWorkspace'
 import { type DraftAttachment, inferDraftKind, isSafeRasterPreviewFile, MAX_ATTACHMENT_MB, MAX_CHAT_ATTACHMENTS, MAX_CHAT_TOTAL_ATTACHMENTS, MAX_IMAGE_MB } from './attachments'
 import { useAccountStore, blockReason } from './accountStore'
+import { applyServerUISettings, setAppearanceSyncHandler } from './appearanceStore'
 import { readConnection, saveConnection, setTransport, transport } from './runtime'
 import type { ConnectionMode } from './runtime'
 import { RemoteError, RemoteTransport, fallbackProviders, normalizeServerAddress } from '../transport/RemoteTransport'
@@ -270,6 +271,7 @@ export function logout() {
 }
 
 function clearSession() {
+  setAppearanceSyncHandler(null)
   useAccountStore.setState({ serverQuota: null })
   const { remote, mode, address } = useChats.getState()
   for (const id of runs.keys()) stopChat(id)
@@ -328,7 +330,15 @@ function attachRemote(remote: RemoteTransport, workspace: Workspace) {
         useChats.setState({ connectionError: 'Сессия закончилась. Войдите снова.' })
     }
   })
-  if (workspace.user.role !== 'pending') startRemote(remote)
+  if (workspace.user.role !== 'pending') {
+    startRemote(remote)
+    setAppearanceSyncHandler(uiSettings => remote.updateProfile({ uiSettings }).then(() => undefined))
+    void remote.getProfile().then(profile => {
+      if (useChats.getState().remote === remote && profile.uiSettings) {
+        applyServerUISettings(profile.uiSettings)
+      }
+    }).catch(() => {})
+  }
 }
 
 export async function checkAccountStatus() {
@@ -339,7 +349,15 @@ export async function checkAccountStatus() {
   useAccountStore.setState({ serverQuota: remote.sessionQuota })
   applyRemoteWorkspace(remote, workspace)
   useChats.setState({ connectionError: '' })
-  if (workspace.user.role !== 'pending') startRemote(remote)
+  if (workspace.user.role !== 'pending') {
+    startRemote(remote)
+    setAppearanceSyncHandler(uiSettings => remote.updateProfile({ uiSettings }).then(() => undefined))
+    void remote.getProfile().then(profile => {
+      if (useChats.getState().remote === remote && profile.uiSettings) {
+        applyServerUISettings(profile.uiSettings)
+      }
+    }).catch(() => {})
+  }
   else useChats.setState({
     connected: false,
     serverProviders: [], defaultServerProvider: null, providersLoaded: false,
@@ -417,6 +435,34 @@ export async function refreshServerProviders(targetRemote = useChats.getState().
   }
 }
 
+export function resolveModelDisplay(
+  providerId: string | undefined,
+  rawModelId: string | undefined,
+  serverModelsByProvider: Partial<Record<ServerProvider, ServerModel[]>>,
+  fallbackLabel?: string,
+): { modelId?: string; modelLabel: string } {
+  const pid = providerId as ServerProvider | undefined
+  const catalog = pid ? (serverModelsByProvider[pid] ?? []) : []
+  const trimmed = rawModelId?.trim() ?? ''
+  const isDefault = !trimmed || trimmed === 'default' || (!!pid && trimmed.toLowerCase() === pid.toLowerCase())
+  if (isDefault) {
+    const def = catalog.find(m => m.isDefault) ?? catalog[0]
+    if (def) return { modelId: def.id, modelLabel: def.name || def.id }
+    const demoDef = pid ? models.find(m => m.provider === pid) : undefined
+    if (demoDef) return { modelId: demoDef.id, modelLabel: demoDef.label }
+    const provName = pid === 'stub' ? 'StubProvider' : (pid ? (providerLabels[pid as Provider] ?? pid) : undefined)
+    return { ...(trimmed ? { modelId: trimmed } : {}), modelLabel: provName ?? fallbackLabel ?? 'По умолчанию' }
+  }
+  const serverMatch = catalog.find(m => m.id === trimmed)
+  if (serverMatch) return { modelId: serverMatch.id, modelLabel: serverMatch.name || serverMatch.id }
+  const demoMatch = models.find(m => m.id === trimmed)
+  if (demoMatch) return { modelId: demoMatch.id, modelLabel: demoMatch.label }
+  const cleanFallback = fallbackLabel && fallbackLabel !== 'default' && (!pid || fallbackLabel.toLowerCase() !== pid.toLowerCase())
+    ? fallbackLabel
+    : undefined
+  return { modelId: trimmed, modelLabel: cleanFallback ?? trimmed }
+}
+
 export async function refreshServerModels(
   provider?: ServerProvider,
   force = true,
@@ -444,13 +490,26 @@ export async function refreshServerModels(
   try {
     const serverModels = await remote.models(resolvedProvider)
     if (useChats.getState().remote !== remote || modelLoadSeq.get(remote)?.[resolvedProvider] !== seq) return
-    useChats.setState(s => ({
-      serverModelsByProvider: { ...s.serverModelsByProvider, [resolvedProvider]: serverModels },
-      modelsErrorByProvider: {
-        ...s.modelsErrorByProvider,
-        [resolvedProvider]: serverModels.length ? '' : `${label} не вернул доступных моделей.`,
-      },
-    }))
+    useChats.setState(s => {
+      const nextCatalog = { ...s.serverModelsByProvider, [resolvedProvider]: serverModels }
+      return {
+        serverModelsByProvider: nextCatalog,
+        modelsErrorByProvider: {
+          ...s.modelsErrorByProvider,
+          [resolvedProvider]: serverModels.length ? '' : `${label} не вернул доступных моделей.`,
+        },
+        chats: s.chats.map(c => ({
+          ...c,
+          turns: c.turns.map(t => {
+            const tp = t.provider ?? c.provider
+            if (tp !== resolvedProvider) return t
+            const res = resolveModelDisplay(tp, t.modelId, nextCatalog, t.model)
+            if (res.modelId === t.modelId && res.modelLabel === t.model) return t
+            return { ...t, ...(res.modelId ? { modelId: res.modelId } : {}), model: res.modelLabel }
+          }),
+        })),
+      }
+    })
   } catch (error) {
     if (useChats.getState().remote !== remote || modelLoadSeq.get(remote)?.[resolvedProvider] !== seq) return
     useChats.setState(s => ({
@@ -632,13 +691,14 @@ function restoreTurns(messages: ServerMessage[], local: Turn[], label: string): 
       const parts: Part[] = []
       if (message.thinking) parts.push({ kind: 'thinking', text: message.thinking })
       if (message.content) parts.push({ kind: 'text', text: message.content })
-      const resolvedModelLabel = localByID.get(message.id)?.model ?? (message.model && message.model !== 'default' ? message.model : undefined) ?? label
+      const catalogSnapshot = useChats.getState().serverModelsByProvider
+      const resolved = resolveModelDisplay(message.provider, message.model, catalogSnapshot, localByID.get(message.id)?.model ?? label)
       turns.set(message.id, {
         id: message.id,
         ...(prompt?.userMessageId ? { userMessageId: prompt.userMessageId } : {}),
         prompt: prompt?.prompt ?? '',
-        model: resolvedModelLabel,
-        ...(message.model ? { modelId: message.model } : {}),
+        model: resolved.modelLabel,
+        ...(resolved.modelId ? { modelId: resolved.modelId } : {}),
         ...(message.provider ? { provider: message.provider } : {}),
         ...(message.usage ? { usage: message.usage } : {}),
         time: prompt?.time ?? message.createdAt,
@@ -718,13 +778,17 @@ export function applyEvent(turn: Turn, event: RunEvent): Turn {
       break
     case 'refusal_detected': next.refusalReason = event.reason; break
     case 'error': next.state = 'error'; next.notice = event.message; break
-    case 'done':
+    case 'done': {
       next.state = event.reason
       if (event.durationMs != null) next.durationMs = event.durationMs
       if (event.provider) next.provider = event.provider
       if (event.model) next.modelId = event.model
+      const resolved = resolveModelDisplay(next.provider, next.modelId, useChats.getState().serverModelsByProvider, next.model)
+      if (resolved.modelId) next.modelId = resolved.modelId
+      next.model = resolved.modelLabel
       if (event.usage) next.usage = event.usage
       break
+    }
   }
   return next
 }
@@ -1248,7 +1312,7 @@ export async function regenerateTurn(
 
   try {
     const prep = await remote.regenerateMessage(chatId, source.id, { provider: targetProvider, model: resolved.model })
-    const serverModel = catalog.find(m => m.id === resolved.model)
+    const resolvedDisplay = resolveModelDisplay(targetProvider, resolved.model, latest.serverModelsByProvider)
     const wireProvider: Provider = targetProvider === 'stub' ? 'codex' : targetProvider
     const turn: Turn = {
       id: crypto.randomUUID(),
@@ -1258,8 +1322,8 @@ export async function regenerateTurn(
       time: source.time,
       authorId: workspace.user.id,
       provider: targetProvider,
-      modelId: resolved.model,
-      model: serverModel?.name ?? (targetProvider === 'stub' ? 'StubProvider' : providerLabels[wireProvider]),
+      ...(resolvedDisplay.modelId ? { modelId: resolvedDisplay.modelId } : {}),
+      model: resolvedDisplay.modelLabel,
       seq: 0,
       state: 'running',
       parts: [],
@@ -1384,8 +1448,9 @@ async function startRun(id: string, input: string, retry?: { turnId: string; mod
   const serverModel = catalog.find(m => m.id === c.model)
   if (remote && c.model !== 'default' && !serverModel) return
   const remoteProvider: Provider = chatProvider === 'stub' ? 'codex' : chatProvider
+  const resolvedRemote = remote ? resolveModelDisplay(chatProvider, c.model, serverModelsByProvider) : undefined
   const model = remote
-    ? { id: c.model, provider: remoteProvider, label: serverModel?.name ?? (chatProvider === 'stub' ? 'StubProvider' : providerLabels[remoteProvider]) }
+    ? { id: resolvedRemote?.modelId ?? c.model, provider: remoteProvider, label: resolvedRemote?.modelLabel ?? (chatProvider === 'stub' ? 'StubProvider' : providerLabels[remoteProvider]) }
     : models.find(m => m.id === (retry?.modelId ?? c.model))
   if (!model || (retry && (!source || source.state === 'running' || source.model === model.label))) return
 

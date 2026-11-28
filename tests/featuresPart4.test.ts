@@ -93,7 +93,7 @@ test('Light theme removes ambient background gradient completely while dark them
   assert.match(darkHtml, /class="ambient-bg"/)
 
   const ambientSource = readFileSync(new URL('../src/app/AmbientBackground.tsx', import.meta.url), 'utf8')
-  assert.match(ambientSource, /resolveTheme\(theme\) === 'light'\) return null/)
+  assert.match(ambientSource, /resolveTheme\(theme\) !== 'light'/)
 
   const cssSource = readFileSync(new URL('../src/style.css', import.meta.url), 'utf8')
   assert.match(cssSource, /:root\[data-theme="light"\]\s+\.ambient-bg\s*\{\s*display:\s*none;/)
@@ -162,28 +162,30 @@ test('Adaptive multi-provider UI hides provider switcher and multi-provider rege
     parts: [{ kind: 'text', text: '**Ответ** от модели' }],
   }
 
-  const singleActionsHtml = renderToStaticMarkup(createElement(AssistantMessageActions, {
+  const lastActionsHtml = renderToStaticMarkup(createElement(AssistantMessageActions, {
     chatId: 'c1',
     turn: sampleTurn,
-    currentProvider: 'codex',
-    availableProviders: oneProvider,
     writable: true,
     canFork: true,
     busy: false,
+    isLast: true,
   }))
-  assert.match(singleActionsHtml, /Повторить/)
-  assert.doesNotMatch(singleActionsHtml, /Другой провайдер/)
+  assert.match(lastActionsHtml, /aria-label="Повторить"/)
+  assert.match(lastActionsHtml, /aria-label="Копировать"/)
+  assert.match(lastActionsHtml, /aria-label="Создать ветку отсюда"/)
+  assert.doesNotMatch(lastActionsHtml, /Другой провайдер/)
+  assert.match(lastActionsHtml, /msg-actions is-last/)
 
-  const multiActionsHtml = renderToStaticMarkup(createElement(AssistantMessageActions, {
+  const olderActionsHtml = renderToStaticMarkup(createElement(AssistantMessageActions, {
     chatId: 'c1',
     turn: sampleTurn,
-    currentProvider: 'codex',
-    availableProviders: twoProviders,
     writable: true,
     canFork: true,
     busy: false,
+    isLast: false,
   }))
-  assert.match(multiActionsHtml, /Другой провайдер/)
+  assert.doesNotMatch(olderActionsHtml, /msg-actions is-last/)
+  assert.doesNotMatch(olderActionsHtml, /Другой провайдер/)
 
   const singlePopoverHtml = renderToStaticMarkup(createElement(ModelPopover, {
     remoteMode: true,

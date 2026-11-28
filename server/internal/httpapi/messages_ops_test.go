@@ -342,6 +342,9 @@ func TestChatPinForkMessageOpsAndIDOR(t *testing.T) {
 	if _, err := db.GetAttachment(ctx, aliceID, att.ID); err == nil {
 		t.Fatalf("expected deleted user message attachment to be removed")
 	}
+	if sessID, _, _, _, err := db.ChatRunSessionState(ctx, chat1.ID); err != nil || sessID != "" {
+		t.Fatalf("expected CLI session reset after message delete, got session=%q err=%v", sessID, err)
+	}
 	// Verify forked attachment file still exists on disk and can be read via API even after deleting source chat!
 	if code, _ := doJSON("DELETE", "/api/chats/"+chat1.ID, aliceTok, nil); code != 204 {
 		t.Fatalf("delete source chat: got %d want 204", code)

@@ -8,9 +8,9 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { ArrowUp, Brain, ChevronDown, ChevronRight, CodeXml, Cpu, GitFork, Hourglass, Laptop, Menu, PanelLeft, PanelRight, Paperclip, Receipt, Square, Terminal } from 'lucide-react'
 import { transport } from './runtime'
 import { blockReason, useAccountStore } from './accountStore'
-import { clearChatAttachmentError, demoPrompt, availableDevices, editAndResendPrompt, models, providerLabels, checkAccountStatus, logout, newChat, removeChatAttachment, resolveAvailableProviders, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, stopChat, switchChatProvider, updateChat, uploadChatFiles, useChats } from './chatStore'
+import { clearChatAttachmentError, demoPrompt, availableDevices, editAndResendPrompt, models, providerLabels, checkAccountStatus, logout, newChat, removeChatAttachment, resolveAvailableProviders, resolveModelDisplay, retryAnswer, retryHistory, selectChatModel, selectChatReasoning, sendPrompt, stopChat, switchChatProvider, updateChat, uploadChatFiles, useChats } from './chatStore'
 import type { Chat, Turn } from './chatStore'
-import type { Provider, ServerProvider, ServerProviderInfo } from '../protocol/types'
+import type { Provider, ServerProvider } from '../protocol/types'
 import { CHAT_ATTACHMENT_ACCEPT, MAX_CHAT_ATTACHMENTS } from './attachments'
 import { DraftAttachmentsBar, TurnAttachments } from './AttachmentViews'
 import { ChatContextPanel, collectChatAttachments, extractChatLinks, formatUsageInline, formatUsageTooltip } from './ChatContextPanel'
@@ -57,8 +57,7 @@ function Transcript({
   busy,
   retry,
   demo,
-  currentProvider,
-  availableProviders,
+  isLast,
 }: {
   turn: Turn
   chatId: string
@@ -67,8 +66,7 @@ function Transcript({
   busy: boolean
   retry: (modelId: string) => void
   demo: boolean
-  currentProvider: ServerProvider
-  availableProviders: readonly ServerProviderInfo[]
+  isLast: boolean
 }) {
   const w = useChats(s => s.workspace)!
   const remote = useChats(s => s.remote)
@@ -167,11 +165,10 @@ function Transcript({
       <AssistantMessageActions
         chatId={chatId}
         turn={turn}
-        currentProvider={currentProvider}
-        availableProviders={availableProviders}
         writable={writable}
         canFork={canFork}
         busy={busy}
+        isLast={isLast}
       />
       {demo && turn.state === 'refused' && <RetryActions turn={turn} writable={writable} busy={busy} retry={retry}/>}
     </div>
@@ -396,7 +393,7 @@ function Conversation({
             <div className="skeleton-line is-medium" />
             <div className="skeleton-line is-long" />
           </div>
-        ) : chat.turns.length ? chat.turns.map(turn => <Transcript
+        ) : chat.turns.length ? chat.turns.map((turn, idx) => <Transcript
           key={turn.id}
           chatId={chat.id}
           turn={turn}
@@ -404,8 +401,7 @@ function Conversation({
           canFork={canForkChat}
           busy={running}
           demo={!remote}
-          currentProvider={remote ? chatServerProvider : provider}
-          availableProviders={availableProviders}
+          isLast={idx === chat.turns.length - 1}
           retry={modelId => {
             follow.current = true
             void retryAnswer(chat.id, turn.id, modelId)
@@ -491,6 +487,9 @@ function Conversation({
           onDismissError={() => clearChatAttachmentError(chat.id)}
         />
         <textarea disabled={!!reason} ref={input} rows={1} aria-label="Сообщение агенту" placeholder="Сообщение агенту…" value={chat.draft}
+          onPointerDown={() => setOpenMenu(null)}
+          onMouseDown={() => setOpenMenu(null)}
+          onFocus={() => setOpenMenu(null)}
           onChange={e => updateChat(chat.id, c => ({ ...c, draft: e.target.value }))}
           onPaste={e => {
             if (!remote || locked || chat.indexedCodex) return
@@ -561,7 +560,9 @@ function Conversation({
             </button>
           </div>
           <div className="composer-actions">
-            <span className={`status-lamp ${statusTone}`} role="status" title={statusText} aria-label={statusText} />
+            {(statusTone === 'is-error' || (remote && (!connected || !chat.historyLoaded))) && (
+              <span className={`status-lamp ${statusTone}`} role="status" title={statusText} aria-label={statusText} />
+            )}
             {running && !remote ? <button className="send stop" title="Остановить ответ" aria-label="Остановить ответ" onClick={() => stopChat(chat.id)}><Square size={13} fill="currentColor"/></button>
               : <button className="send" title="Отправить" aria-label="Отправить" disabled={blocked || running || uploadingAttachments || (!chat.draft.trim() && !hasReadyAttachments)} onClick={submit}><ArrowUp size={17}/></button>}
           </div>
@@ -766,7 +767,7 @@ function Connected() {
         onDoubleClick={() => { setSidebarWidth(DEFAULT_SIDEBAR_WIDTH); saveSidebarWidth(DEFAULT_SIDEBAR_WIDTH) }}
       />
     )}
-    <dialog ref={drawer} onClose={() => setDrawerOpen(false)} className="drawer" aria-label="Список чатов" onClick={e => { if (e.target === drawer.current) drawer.current.close() }}><Sidebar openBilling={() => { drawer.current?.close(); setView('billing') }} openSettings={() => { drawer.current?.close(); setPanel('devices') }} openShare={id => { drawer.current?.close(); openShareDialog(id) }} close={() => { drawer.current?.close(); setView('chat') }}/></dialog>
+    <dialog ref={drawer} onClose={() => setDrawerOpen(false)} className="drawer" aria-label="Список чатов" onClick={e => { if (e.target === drawer.current) drawer.current.close() }}><Sidebar openBilling={() => { drawer.current?.close(); setView('billing') }} openSettings={() => { drawer.current?.close(); setPanel('devices') }} openAdmin={isAdmin ? () => { drawer.current?.close(); setPanel('admin') } : undefined} openShare={id => { drawer.current?.close(); openShareDialog(id) }} close={() => { drawer.current?.close(); setView('chat') }}/></dialog>
     <main className="main">
       <header className="chat-heading unified-header" data-tauri-drag-region>
         <div className="heading-inner">
@@ -787,9 +788,6 @@ function Connected() {
                 <div className="heading-text">
                   <h1 title={chat.title}>{chat.title}</h1>
                   <div className="heading-meta">
-                    <i />
-                    {remote ? 'Сервер' : 'Демо-сессия'}
-                    <span>/</span>
                     <span>{chat.indexedCodex ? 'История Codex' : chat.access === 'owner' ? 'Личный чат' : 'Общий чат'}</span>
                     {!editableChat && chat.model && <><span>/</span><span className="heading-model-tag">{chat.model}</span></>}
                   </div>
@@ -798,8 +796,10 @@ function Connected() {
             ) : null}
           </div>
           <div className="topbar-actions">
-            {remote ? <ServerQuotas menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> : <Quotas userId={w.user.id} menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> }
-            {isAdmin && <button className="alt-action admin-entry" onClick={() => setPanel('admin')}>Админка</button>}
+            <div className="topbar-desktop-only">
+              {remote ? <ServerQuotas menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> : <Quotas userId={w.user.id} menuRef={quotaMenu} onOpenChange={setQuotasOpen}/> }
+              {isAdmin && <button className="alt-action admin-entry" onClick={() => setPanel('admin')}>Админка</button>}
+            </div>
             {view === 'chat' && chat && (
               <button
                 type="button"
@@ -854,11 +854,16 @@ function Connected() {
         >
           <ChatContextPanel
             turns={chat.turns}
+            defaultProviderId={chat.provider ?? defaultServerProvider ?? remote?.provider ?? 'stub'}
             providerLabel={(() => {
               const p = chat.provider ?? defaultServerProvider ?? remote?.provider ?? 'stub'
               return p === 'stub' ? 'StubProvider' : (providerLabels[p] ?? p)
             })()}
-            modelLabel={chat.model === 'default' ? 'По умолчанию' : chat.model}
+            modelLabel={(() => {
+              const p = chat.provider ?? defaultServerProvider ?? remote?.provider ?? 'stub'
+              return resolveModelDisplay(p, chat.model, useChats.getState().serverModelsByProvider).modelLabel
+            })()}
+            serverModelsByProvider={useChats.getState().serverModelsByProvider}
             remote={remote}
             canAttach={!!remote && editableChat && !chat.indexedCodex}
             onAttachClick={() => document.querySelector<HTMLInputElement>('.composer input[type="file"]')?.click()}

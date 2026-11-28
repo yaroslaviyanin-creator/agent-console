@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS users (
     profile_md TEXT NOT NULL DEFAULT '',
     memory_md TEXT NOT NULL DEFAULT '',
     memory_enabled INTEGER NOT NULL DEFAULT 1 CHECK (memory_enabled IN (0, 1)),
-    memory_updated_at INTEGER NOT NULL DEFAULT 0
+    memory_updated_at INTEGER NOT NULL DEFAULT 0,
+    ui_settings_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS devices (

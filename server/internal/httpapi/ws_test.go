@@ -889,3 +889,44 @@ func TestBuildHandoffPromptTruncationValidUTF8(t *testing.T) {
 		t.Fatalf("handoff exceeded budget: %d", len(out))
 	}
 }
+
+type mockModelListerProvider struct {
+	models []provider.Model
+}
+
+func (m mockModelListerProvider) Stream(context.Context, provider.Request) (<-chan provider.Event, error) {
+	ch := make(chan provider.Event)
+	close(ch)
+	return ch, nil
+}
+
+func (m mockModelListerProvider) ListModels(context.Context) ([]provider.Model, error) {
+	return m.models, nil
+}
+
+func TestResolveDefaultModelID(t *testing.T) {
+	mockCodex := mockModelListerProvider{
+		models: []provider.Model{
+			{ID: "gpt-6.2-astra", Name: "GPT-6.2-Astra", IsDefault: false},
+			{ID: "gpt-6.2-sol", Name: "GPT-6.2-Sol", IsDefault: true},
+		},
+	}
+	api := &API{
+		live: newLiveRuns(t.Context(), mockCodex, 1),
+	}
+	api.live.providers = map[string]provider.Provider{
+		"codex": mockCodex,
+	}
+	if got := api.resolveDefaultModelID(t.Context(), "codex"); got != "gpt-6.2-sol" {
+		t.Fatalf("expected gpt-6.2-sol, got %q", got)
+	}
+	if got := api.resolveDefaultModelID(t.Context(), "claude"); got != "sonnet" {
+		t.Fatalf("expected fallback sonnet, got %q", got)
+	}
+	if !isDefaultModelPlaceholder("", "codex") || !isDefaultModelPlaceholder("default", "codex") || !isDefaultModelPlaceholder("codex", "codex") {
+		t.Fatal("expected empty, default, and provider name to be treated as default placeholder")
+	}
+	if isDefaultModelPlaceholder("gpt-6.2-sol", "codex") {
+		t.Fatal("explicit model slug must not be treated as placeholder")
+	}
+}

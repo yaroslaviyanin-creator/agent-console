@@ -103,4 +103,19 @@ test('App renders user attachments above .user-bubble and skips empty .user-bubb
   assert.match(appSource, /\{hasPrompt && \(\s*<div className="user-bubble">/)
   assert.ok(!appSource.includes('Рабочее пространство'), 'breadcrumb should be removed from header')
   assert.ok(GRADIENT_PALETTES.length >= 5)
+  assert.match(appSource, /onPointerDown=\{\(\) => setOpenMenu\(null\)\}/)
+  assert.match(appSource, /onFocus=\{\(\) => setOpenMenu\(null\)\}/)
+})
+
+test('appearanceStore syncs server uiSettings without feedback loop', async () => {
+  const { applyServerUISettings, setAppearanceSyncHandler, useAppearance } = await import('../src/app/appearanceStore')
+  let synced: unknown = null
+  setAppearanceSyncHandler(ui => {
+    synced = ui
+  })
+  applyServerUISettings({ theme: 'light', accent: 'ocean', accentCustomColor: '#123456' })
+  assert.equal(useAppearance.getState().theme, 'light')
+  assert.equal(useAppearance.getState().accent, 'ocean')
+  assert.equal(synced, null)
+  setAppearanceSyncHandler(null)
 })

@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { Download, ExternalLink, FileArchive, FileCode, FileText, Image as ImageIcon, Link2, Paperclip, Plus, Sparkles, X } from 'lucide-react'
-import type { MessageAttachment, MessageUsage } from '../protocol/types'
+import type { MessageAttachment, MessageUsage, ServerModel, ServerProvider } from '../protocol/types'
 import type { RemoteTransport } from '../transport/RemoteTransport'
-import type { Turn } from './chatStore'
+import { resolveModelDisplay, type Turn } from './chatStore'
 import { formatAttachmentSize, isRenderableImageAttachment } from './attachments'
 
 const URL_RE = /https?:\/\/[^\s<>"'`]+/g
@@ -128,6 +128,8 @@ export function summarizeChatContext(
   turns: Turn[],
   providerLabel: string,
   modelLabel: string,
+  serverModelsByProvider: Partial<Record<ServerProvider, ServerModel[]>> = {},
+  defaultProviderId?: string,
 ): ChatContextSummary {
   let messagesCount = 0
   let inputTokens = 0
@@ -172,10 +174,13 @@ export function summarizeChatContext(
     }
 
     if (hasAssistant) {
-      const pid = turn.provider ?? 'unknown'
-      const pLabel = turn.provider ? (PROVIDER_DISPLAY_NAMES[turn.provider] ?? turn.provider) : providerLabel
-      const mid = (turn.modelId && turn.modelId !== 'default' ? turn.modelId : turn.model) || modelLabel
-      const mLabel = (turn.model && turn.model !== 'default' ? turn.model : mid) || modelLabel
+      const rawPid = (turn.provider ?? defaultProviderId ?? '').trim().toLowerCase()
+      const pid = rawPid || 'unknown'
+      const pLabel = pid !== 'unknown' ? (PROVIDER_DISPLAY_NAMES[pid] ?? pid) : providerLabel
+      const resolved = resolveModelDisplay(pid !== 'unknown' ? pid : undefined, turn.modelId, serverModelsByProvider, turn.model)
+      const rawMid = (resolved.modelId && resolved.modelId !== 'default' ? resolved.modelId : resolved.modelLabel) || modelLabel
+      const mid = rawMid.trim().toLowerCase()
+      const mLabel = resolved.modelLabel || modelLabel
 
       let pEntry = providerMap.get(pid)
       if (!pEntry) {
@@ -306,18 +311,38 @@ function PanelAttachmentThumb({
   )
 }
 
+function renderTokenPairs(inTok: number, outTok: number, reasonTok: number) {
+  return (
+    <>
+      <span className="context-token-pair">↑ {formatCompactTokens(inTok)}</span>
+      <span className="context-token-sep" aria-hidden="true">·</span>
+      <span className="context-token-pair">↓ {formatCompactTokens(outTok)}</span>
+      {reasonTok > 0 && (
+        <>
+          <span className="context-token-sep" aria-hidden="true">·</span>
+          <span className="context-token-pair">мысли {formatCompactTokens(reasonTok)}</span>
+        </>
+      )}
+    </>
+  )
+}
+
 export function ChatContextPanel({
   turns,
+  defaultProviderId,
   providerLabel,
   modelLabel,
+  serverModelsByProvider = {},
   remote,
   canAttach,
   onAttachClick,
   onClose,
 }: {
   turns: Turn[]
+  defaultProviderId?: string
   providerLabel: string
   modelLabel: string
+  serverModelsByProvider?: Partial<Record<ServerProvider, ServerModel[]>>
   remote: RemoteTransport | null
   canAttach: boolean
   onAttachClick: () => void
@@ -325,7 +350,7 @@ export function ChatContextPanel({
 }) {
   const attachments = collectChatAttachments(turns)
   const links = extractChatLinks(turns)
-  const summary = summarizeChatContext(turns, providerLabel, modelLabel)
+  const summary = summarizeChatContext(turns, providerLabel, modelLabel, serverModelsByProvider, defaultProviderId)
   const showBreakdown = summary.byProvider.length >= 2 || (summary.byProvider[0]?.models.length ?? 0) >= 2
 
   return (
@@ -337,24 +362,25 @@ export function ChatContextPanel({
         </button>
       </div>
 
-      <section className="context-section">
+      <section className={`context-section${attachments.length === 0 ? ' is-empty' : ''}`}>
         <div className="context-section-head">
           <h3>Источники и файлы</h3>
-          {canAttach && (
-            <button
-              type="button"
-              className="icon-btn context-add-btn"
-              aria-label="Прикрепить файлы"
-              title="Прикрепить файлы"
-              onClick={onAttachClick}
-            >
-              <Plus size={14} />
-            </button>
-          )}
+          <div className="context-section-meta">
+            {attachments.length === 0 && <span className="context-empty-inline">Нет</span>}
+            {canAttach && (
+              <button
+                type="button"
+                className="icon-btn context-add-btn"
+                aria-label="Прикрепить файлы"
+                title="Прикрепить файлы"
+                onClick={onAttachClick}
+              >
+                <Plus size={14} />
+              </button>
+            )}
+          </div>
         </div>
-        {attachments.length === 0 ? (
-          <p className="context-empty">В этом чате пока нет файлов.</p>
-        ) : (
+        {attachments.length > 0 && (
           <ul className="context-file-list">
             {attachments.map((att, idx) => (
               <PanelAttachmentThumb
@@ -368,14 +394,12 @@ export function ChatContextPanel({
         )}
       </section>
 
-      <section className="context-section">
+      <section className={`context-section${links.length === 0 ? ' is-empty' : ''}`}>
         <div className="context-section-head">
           <h3>Ссылки</h3>
-          {links.length > 0 && <span className="context-count">{links.length}</span>}
+          {links.length > 0 ? <span className="context-count">{links.length}</span> : <span className="context-empty-inline">Нет</span>}
         </div>
-        {links.length === 0 ? (
-          <p className="context-empty">Ссылки из переписки не найдены.</p>
-        ) : (
+        {links.length > 0 && (
           <ul className="context-link-list">
             {links.map(url => (
               <li key={url}>
@@ -441,18 +465,21 @@ export function ChatContextPanel({
                 <li key={p.providerId} className="context-provider-item">
                   <div className="context-provider-head">
                     <strong>{p.providerLabel}</strong>
-                    <span className="context-provider-stats">
-                      {p.count} отв. · ↑ {formatCompactTokens(p.inputTokens)} / ↓ {formatCompactTokens(p.outputTokens)}
-                    </span>
+                    <span className="context-provider-count">{p.count} отв.</span>
+                  </div>
+                  <div className="context-provider-stats">
+                    {renderTokenPairs(p.inputTokens, p.outputTokens, p.reasoningTokens)}
                   </div>
                   <ul className="context-model-list">
                     {p.models.map(m => (
                       <li key={m.modelId} className="context-model-item">
-                        <span className="context-model-name" title={m.modelLabel}>{m.modelLabel}</span>
-                        <span className="context-model-stats">
-                          {m.count} · ↑ {formatCompactTokens(m.inputTokens)} / ↓ {formatCompactTokens(m.outputTokens)}
-                          {m.reasoningTokens > 0 ? ` · мысли ${formatCompactTokens(m.reasoningTokens)}` : ''}
-                        </span>
+                        <div className="context-model-head">
+                          <span className="context-model-name" title={m.modelLabel}>{m.modelLabel}</span>
+                          <span className="context-model-count">{m.count}</span>
+                        </div>
+                        <div className="context-model-stats">
+                          {renderTokenPairs(m.inputTokens, m.outputTokens, m.reasoningTokens)}
+                        </div>
                       </li>
                     ))}
                   </ul>

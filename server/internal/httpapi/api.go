@@ -708,6 +708,13 @@ func (a *API) messages(w http.ResponseWriter, r *http.Request, s session) {
 	case err != nil:
 		a.internal(w, r, err)
 	default:
+		for i := range messages {
+			if messages[i].Role == "assistant" && messages[i].Provider != "" && isDefaultModelPlaceholder(messages[i].Model, messages[i].Provider) {
+				if resolved := a.resolveDefaultModelID(r.Context(), messages[i].Provider); resolved != "" {
+					messages[i].Model = resolved
+				}
+			}
+		}
 		reply(w, http.StatusOK, messages)
 	}
 }

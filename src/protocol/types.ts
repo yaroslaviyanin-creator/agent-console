@@ -228,6 +228,16 @@ export interface ServerMessage {
 }
 export interface ServerError { code: string; message: string }
 
+export interface UISettings {
+  theme?: 'dark' | 'light' | 'system'
+  accent?: 'mint' | 'ocean' | 'violet' | 'amber' | 'rose' | 'graphite' | 'custom'
+  accentCustomColor?: string
+  ambientGradient?: boolean
+  gradientPalette?: 'accent' | 'indigo' | 'ocean' | 'emerald' | 'sunset' | 'monochrome' | 'custom'
+  gradientCustomColor?: string
+  gradientCustomColor2?: string
+}
+
 export interface UserProfile {
   displayName: string
   avatarData: string
@@ -235,6 +245,7 @@ export interface UserProfile {
   memoryMd: string
   memoryEnabled: boolean
   memoryUpdatedAt: number
+  uiSettings?: UISettings
 }
 
 export type UserProfilePatch = Partial<Omit<UserProfile, 'memoryUpdatedAt'>>

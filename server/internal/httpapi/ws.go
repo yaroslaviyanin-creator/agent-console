@@ -443,6 +443,11 @@ func (a *API) submit(userID string, client *socket, req runRequest) {
 			return
 		}
 	}
+	if isDefaultModelPlaceholder(req.Model.ID, targetProvider) {
+		if resolved := a.resolveDefaultModelID(a.live.ctx, targetProvider); resolved != "" {
+			req.Model.ID = resolved
+		}
+	}
 	ctx, cancel := context.WithCancel(a.live.ctx)
 	release, code := a.live.acquire(userID, req.ChatID, client, cancel)
 	if release == nil {

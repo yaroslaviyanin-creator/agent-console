@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import type { UISettings } from '../protocol/types'
 
 export type ThemePreference = 'dark' | 'light' | 'system'
 export type AccentPreset = 'mint' | 'ocean' | 'violet' | 'amber' | 'rose' | 'graphite' | 'custom'
@@ -68,8 +69,8 @@ function normalizeHex(raw: unknown, fallback: string): string {
   return HEX_COLOR_RE.test(trimmed) ? trimmed.toLowerCase() : fallback
 }
 
-function readStored(): AppearanceSnapshot {
-  const fallback: AppearanceSnapshot = {
+function parseSnapshot(parsed: StoredAppearance | null | undefined, base?: AppearanceSnapshot): AppearanceSnapshot {
+  const fallback: AppearanceSnapshot = base ?? {
     theme: 'dark',
     accent: 'mint',
     accentCustomColor: '#7c5cff',
@@ -78,24 +79,29 @@ function readStored(): AppearanceSnapshot {
     gradientCustomColor: '#8b5cf6',
     gradientCustomColor2: '#3b82f6',
   }
+  if (!parsed || typeof parsed !== 'object') return fallback
+  const theme: ThemePreference = parsed.theme === 'light' || parsed.theme === 'system' || parsed.theme === 'dark' ? parsed.theme : fallback.theme
+  const accent: AccentPreset =
+    parsed.accent === 'custom' || ACCENT_PRESETS.some(p => p.id === parsed.accent)
+      ? parsed.accent!
+      : fallback.accent
+  const accentCustomColor = normalizeHex(parsed.accentCustomColor, fallback.accentCustomColor)
+  const ambientGradient = typeof parsed.ambientGradient === 'boolean' ? parsed.ambientGradient : fallback.ambientGradient
+  const gradientPalette: GradientPalette =
+    parsed.gradientPalette === 'custom' || GRADIENT_PALETTES.some(p => p.id === parsed.gradientPalette)
+      ? parsed.gradientPalette!
+      : fallback.gradientPalette
+  const gradientCustomColor = normalizeHex(parsed.gradientCustomColor, fallback.gradientCustomColor)
+  const gradientCustomColor2 = normalizeHex(parsed.gradientCustomColor2, fallback.gradientCustomColor2)
+  return { theme, accent, accentCustomColor, ambientGradient, gradientPalette, gradientCustomColor, gradientCustomColor2 }
+}
+
+function readStored(): AppearanceSnapshot {
+  const fallback = parseSnapshot(null)
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return fallback
-    const parsed = JSON.parse(raw) as StoredAppearance
-    const theme: ThemePreference = parsed.theme === 'light' || parsed.theme === 'system' || parsed.theme === 'dark' ? parsed.theme : 'dark'
-    const accent: AccentPreset =
-      parsed.accent === 'custom' || ACCENT_PRESETS.some(p => p.id === parsed.accent)
-        ? parsed.accent!
-        : 'mint'
-    const accentCustomColor = normalizeHex(parsed.accentCustomColor, fallback.accentCustomColor)
-    const ambientGradient = typeof parsed.ambientGradient === 'boolean' ? parsed.ambientGradient : true
-    const gradientPalette: GradientPalette =
-      parsed.gradientPalette === 'custom' || GRADIENT_PALETTES.some(p => p.id === parsed.gradientPalette)
-        ? parsed.gradientPalette!
-        : 'accent'
-    const gradientCustomColor = normalizeHex(parsed.gradientCustomColor, fallback.gradientCustomColor)
-    const gradientCustomColor2 = normalizeHex(parsed.gradientCustomColor2, fallback.gradientCustomColor2)
-    return { theme, accent, accentCustomColor, ambientGradient, gradientPalette, gradientCustomColor, gradientCustomColor2 }
+    return parseSnapshot(JSON.parse(raw) as StoredAppearance, fallback)
   } catch {
     return fallback
   }
@@ -197,6 +203,58 @@ export function applyAppearanceToDom(state: AppearanceSnapshot) {
 
 const initial = readStored()
 
+type AppearanceSyncHandler = ((uiSettings: UISettings) => Promise<void> | void) | null
+let syncHandler: AppearanceSyncHandler = null
+let syncTimer: ReturnType<typeof setTimeout> | null = null
+
+export function setAppearanceSyncHandler(handler: AppearanceSyncHandler) {
+  syncHandler = handler
+  if (!handler && syncTimer) {
+    clearTimeout(syncTimer)
+    syncTimer = null
+  }
+}
+
+export function serializeAppearanceSnapshot(s: AppearanceSnapshot): UISettings {
+  return {
+    theme: s.theme,
+    accent: s.accent,
+    accentCustomColor: s.accentCustomColor,
+    ambientGradient: s.ambientGradient,
+    gradientPalette: s.gradientPalette,
+    gradientCustomColor: s.gradientCustomColor,
+    gradientCustomColor2: s.gradientCustomColor2,
+  }
+}
+
+function scheduleServerSync(next: AppearanceSnapshot) {
+  if (!syncHandler) return
+  if (syncTimer) clearTimeout(syncTimer)
+  syncTimer = setTimeout(() => {
+    syncTimer = null
+    if (!syncHandler) return
+    void Promise.resolve(syncHandler(serializeAppearanceSnapshot(next))).catch(() => {})
+  }, 450)
+}
+
+export function applyServerUISettings(raw: UISettings | undefined | null) {
+  if (!raw || typeof raw !== 'object' || Object.keys(raw).length === 0) return
+  const current = useAppearance.getState()
+  const base: AppearanceSnapshot = {
+    theme: current.theme,
+    accent: current.accent,
+    accentCustomColor: current.accentCustomColor,
+    ambientGradient: current.ambientGradient,
+    gradientPalette: current.gradientPalette,
+    gradientCustomColor: current.gradientCustomColor,
+    gradientCustomColor2: current.gradientCustomColor2,
+  }
+  const merged = parseSnapshot(raw, base)
+  saveStored(merged)
+  applyAppearanceToDom(merged)
+  useAppearance.setState(merged)
+}
+
 export const useAppearance = create<AppearanceState>((set, get) => {
   const snapshot = (patch: Partial<AppearanceSnapshot>): AppearanceSnapshot => ({
     theme: patch.theme ?? get().theme,
@@ -207,52 +265,30 @@ export const useAppearance = create<AppearanceState>((set, get) => {
     gradientCustomColor: patch.gradientCustomColor ?? get().gradientCustomColor,
     gradientCustomColor2: patch.gradientCustomColor2 ?? get().gradientCustomColor2,
   })
+  const commit = (patch: Partial<AppearanceSnapshot>) => {
+    const next = snapshot(patch)
+    saveStored(next)
+    applyAppearanceToDom(next)
+    scheduleServerSync(next)
+    set(patch)
+  }
   return {
     ...initial,
-    setTheme: theme => {
-      const next = snapshot({ theme })
-      saveStored(next)
-      applyAppearanceToDom(next)
-      set({ theme })
-    },
-    setAccent: accent => {
-      const next = snapshot({ accent })
-      saveStored(next)
-      applyAppearanceToDom(next)
-      set({ accent })
-    },
+    setTheme: theme => commit({ theme }),
+    setAccent: accent => commit({ accent }),
     setAccentCustomColor: hex => {
       const accentCustomColor = normalizeHex(hex, get().accentCustomColor)
-      const next = snapshot({ accent: 'custom', accentCustomColor })
-      saveStored(next)
-      applyAppearanceToDom(next)
-      set({ accent: 'custom', accentCustomColor })
+      commit({ accent: 'custom', accentCustomColor })
     },
-    setAmbientGradient: ambientGradient => {
-      const next = snapshot({ ambientGradient })
-      saveStored(next)
-      applyAppearanceToDom(next)
-      set({ ambientGradient })
-    },
-    setGradientPalette: gradientPalette => {
-      const next = snapshot({ gradientPalette })
-      saveStored(next)
-      applyAppearanceToDom(next)
-      set({ gradientPalette })
-    },
+    setAmbientGradient: ambientGradient => commit({ ambientGradient }),
+    setGradientPalette: gradientPalette => commit({ gradientPalette }),
     setGradientCustomColor: hex => {
       const gradientCustomColor = normalizeHex(hex, get().gradientCustomColor)
-      const next = snapshot({ gradientPalette: 'custom', gradientCustomColor })
-      saveStored(next)
-      applyAppearanceToDom(next)
-      set({ gradientPalette: 'custom', gradientCustomColor })
+      commit({ gradientPalette: 'custom', gradientCustomColor })
     },
     setGradientCustomColor2: hex => {
       const gradientCustomColor2 = normalizeHex(hex, get().gradientCustomColor2)
-      const next = snapshot({ gradientPalette: 'custom', gradientCustomColor2 })
-      saveStored(next)
-      applyAppearanceToDom(next)
-      set({ gradientPalette: 'custom', gradientCustomColor2 })
+      commit({ gradientPalette: 'custom', gradientCustomColor2 })
     },
   }
 })

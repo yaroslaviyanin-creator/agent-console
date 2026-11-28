@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Check, ChevronRight, Copy, Laptop, LogOut, Monitor, Palette, Trash2, Upload, User, X } from 'lucide-react'
+import { Check, ChevronRight, Copy, Laptop, Link2, LogOut, Monitor, Palette, Trash2, Upload, User, X } from 'lucide-react'
 import type { ShareAccess, UserProfile, UserProfilePatch, Workspace } from '../protocol/types'
 import { getTelegramUserId } from '../platform/telegram'
 import type { RemoteTransport } from '../transport/RemoteTransport'
@@ -595,21 +595,28 @@ function AppearanceSection() {
           </div>
         </div>
         {accentTab === 'presets' ? (
-          <div className="accent-swatches" role="group" aria-label="Цветовая гамма">
-            {ACCENT_PRESETS.map(preset => (
-              <button
-                key={preset.id}
-                type="button"
-                className={`accent-swatch${accent === preset.id ? ' is-selected' : ''}`}
-                style={{ '--swatch': preset.swatch } as React.CSSProperties}
-                aria-label={preset.label}
-                title={preset.label}
-                aria-pressed={accent === preset.id}
-                onClick={() => setAccent(preset.id)}
-              >
-                {accent === preset.id && <Check size={12} />}
-              </button>
-            ))}
+          <div className="swatch-row-wrap">
+            <div className="accent-swatches" role="group" aria-label="Цветовая гамма">
+              {ACCENT_PRESETS.map(preset => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  className={`accent-swatch${accent === preset.id ? ' is-selected' : ''}`}
+                  style={{ '--swatch': preset.swatch } as React.CSSProperties}
+                  aria-label={preset.label}
+                  title={preset.label}
+                  aria-pressed={accent === preset.id}
+                  onClick={() => setAccent(preset.id)}
+                >
+                  {accent === preset.id && <Check size={12} />}
+                </button>
+              ))}
+            </div>
+            {accent !== 'custom' && (
+              <span className="swatch-selected-name">
+                {ACCENT_PRESETS.find(p => p.id === accent)?.label}
+              </span>
+            )}
           </div>
         ) : (
           <ColorWheelPicker
@@ -674,20 +681,33 @@ function AppearanceSection() {
             </div>
           </div>
           {paletteTab === 'presets' ? (
-            <div className="palette-picker" role="group" aria-label="Палитра градиента">
-              {GRADIENT_PALETTES.map(preset => (
-                <button
-                  key={preset.id}
-                  type="button"
-                  className={`palette-chip${gradientPalette === preset.id ? ' is-selected' : ''}`}
-                  aria-pressed={gradientPalette === preset.id}
-                  disabled={isLight || !ambientGradient}
-                  onClick={() => setGradientPalette(preset.id)}
-                >
-                  <span className="palette-dot" style={{ background: preset.swatch }} aria-hidden="true" />
-                  <span>{preset.label}</span>
-                </button>
-              ))}
+            <div className="swatch-row-wrap">
+              <div className="accent-swatches palette-picker" role="group" aria-label="Палитра градиента">
+                {GRADIENT_PALETTES.map(preset => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    className={`accent-swatch palette-swatch${preset.id === 'accent' ? ' is-accent-link' : ''}${gradientPalette === preset.id ? ' is-selected' : ''}`}
+                    style={{ '--swatch': preset.swatch } as React.CSSProperties}
+                    aria-label={preset.label}
+                    title={preset.label}
+                    aria-pressed={gradientPalette === preset.id}
+                    disabled={isLight || !ambientGradient}
+                    onClick={() => setGradientPalette(preset.id)}
+                  >
+                    {gradientPalette === preset.id ? (
+                      <Check size={12} />
+                    ) : preset.id === 'accent' ? (
+                      <Link2 size={11} aria-hidden="true" />
+                    ) : null}
+                  </button>
+                ))}
+              </div>
+              {gradientPalette !== 'custom' && (
+                <span className="swatch-selected-name">
+                  {GRADIENT_PALETTES.find(p => p.id === gradientPalette)?.label}
+                </span>
+              )}
             </div>
           ) : (
             <div className="custom-gradient-editor">

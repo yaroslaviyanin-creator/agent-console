@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -70,7 +72,7 @@ func TestMigrationsAndHashedDeviceToken(t *testing.T) {
 		t.Fatalf("auth after reopening DB failed: %v", err)
 	}
 	var version int
-	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 19 {
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 20 {
 		t.Fatalf("schema version %d: %v", version, err)
 	}
 	if currentDevice.LastSeenAt != device.LastSeenAt {
@@ -466,7 +468,7 @@ func TestProfileMigrationAndMemoryIsolation(t *testing.T) {
 	}
 	defer db.Close()
 	initial, err := db.UserProfile(ctx, owner)
-	if err != nil || initial != (UserProfile{MemoryEnabled: true}) {
+	if err != nil || !reflect.DeepEqual(initial, UserProfile{MemoryEnabled: true, UISettings: json.RawMessage("{}")}) {
 		t.Fatalf("migrated profile: %+v %v", initial, err)
 	}
 	name := strings.Repeat("Я", 80)
@@ -846,8 +848,8 @@ func TestStoreMigrateV16ToV17Attachments(t *testing.T) {
 	defer reopened.Close()
 
 	var version int
-	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 19 {
-		t.Fatalf("expected user_version=19, got %d (err=%v)", version, err)
+	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 20 {
+		t.Fatalf("expected user_version=20, got %d (err=%v)", version, err)
 	}
 	owner, err := reopened.CreateUserWithRole(ctx, "u1", []byte("h"), "user")
 	if err != nil {
@@ -968,5 +970,67 @@ func TestMigrateV18ToV19AddsReasoningTokensAndReadsLegacyMessages(t *testing.T) 
 	}
 	if len(msgs) != 2 || msgs[1].Usage == nil || msgs[1].Usage.InputTokens != 100 || msgs[1].Usage.ReasoningTokens != 0 {
 		t.Fatalf("unexpected migrated messages: %+v", msgs)
+	}
+}
+
+func TestUISettingsMigrationAndValidation(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "v19.db")
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash BLOB NOT NULL, role TEXT NOT NULL DEFAULT 'user', is_active INTEGER NOT NULL DEFAULT 1, plan_tier TEXT NOT NULL DEFAULT 'none', bypass_5h_limit INTEGER NOT NULL DEFAULT 0, subscription_until INTEGER NOT NULL DEFAULT 0, display_name TEXT NOT NULL DEFAULT '', avatar_data TEXT NOT NULL DEFAULT '', profile_md TEXT NOT NULL DEFAULT '', memory_md TEXT NOT NULL DEFAULT '', memory_enabled INTEGER NOT NULL DEFAULT 1, memory_updated_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+		CREATE TABLE devices (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, last_seen_at INTEGER NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL DEFAULT 0);
+		CREATE TABLE chats (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'codex', session_provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL, provider_session_id TEXT, pinned INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+		CREATE TABLE chat_messages (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, run_id TEXT, duration_ms INTEGER, run_user_id TEXT, memory_private INTEGER NOT NULL DEFAULT 1);
+		CREATE TABLE chat_shares (chat_id TEXT NOT NULL, user_id TEXT NOT NULL, access TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (chat_id, user_id));
+		CREATE TABLE usage_events (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, chat_id TEXT NOT NULL, run_id TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0, cost_cents INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, UNIQUE (chat_id, run_id));
+		CREATE TABLE chat_attachments (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, message_id TEXT, user_id TEXT NOT NULL, original_name TEXT NOT NULL, mime_type TEXT NOT NULL, kind TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, storage_key TEXT NOT NULL UNIQUE, extracted_text TEXT, warning TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
+		INSERT INTO users (id,username,password_hash,role,created_at) VALUES ('u1','demo',X'00','admin',1);
+		PRAGMA user_version=19;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.Close()
+
+	db, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open v19 db failed: %v", err)
+	}
+	defer db.Close()
+
+	var version int
+	if err := db.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 20 {
+		t.Fatalf("expected user_version 20, got %d (%v)", version, err)
+	}
+	prof, err := db.UserProfile(ctx, "u1")
+	if err != nil {
+		t.Fatalf("UserProfile failed: %v", err)
+	}
+	if string(prof.UISettings) != "{}" {
+		t.Fatalf("expected default uiSettings {}, got %s", prof.UISettings)
+	}
+
+	validRaw := json.RawMessage(`{"theme":"dark","accent":"custom","accentCustomColor":"#AABBCC","ambientGradient":true,"gradientPalette":"sunset","gradientCustomColor":"#112233","gradientCustomColor2":"#445566"}`)
+	updated, err := db.UpdateUserProfileWithUI(ctx, "u1", nil, nil, nil, nil, &validRaw)
+	if err != nil {
+		t.Fatalf("UpdateUserProfileWithUI valid failed: %v", err)
+	}
+	if !strings.Contains(string(updated.UISettings), `"accentCustomColor":"#aabbcc"`) {
+		t.Fatalf("expected normalized lowercase hex in %s", updated.UISettings)
+	}
+
+	for _, bad := range []json.RawMessage{
+		json.RawMessage(`{"unknownKey":true}`),
+		json.RawMessage(`{"accentCustomColor":"#12345"}`),
+		json.RawMessage(`{"theme":"sepia"}`),
+		json.RawMessage(`[]`),
+		json.RawMessage(`{"theme":"dark","padding":"` + strings.Repeat("a", MaxUISettingsBytes) + `"}`),
+	} {
+		if _, err := db.UpdateUserProfileWithUI(ctx, "u1", nil, nil, nil, nil, &bad); !errors.Is(err, ErrInvalidUISettings) {
+			t.Fatalf("expected ErrInvalidUISettings for %s, got %v", string(bad), err)
+		}
 	}
 }

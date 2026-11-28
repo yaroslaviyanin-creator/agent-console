@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -402,7 +403,7 @@ func TestProfileEndpoints(t *testing.T) {
 	request("GET", pending, "", 403)
 	request("PATCH", pending, `{"displayName":"No"}`, 403)
 	for _, token := range []string{user, admin} {
-		if got := request("GET", token, "", 200); got != (store.UserProfile{MemoryEnabled: true}) {
+		if got := request("GET", token, "", 200); !reflect.DeepEqual(got, store.UserProfile{MemoryEnabled: true, UISettings: json.RawMessage("{}")}) {
 			t.Fatalf("default: %+v", got)
 		}
 	}
@@ -415,11 +416,16 @@ func TestProfileEndpoints(t *testing.T) {
 	}
 	request("PATCH", user, `{"profileMd":"`+strings.Repeat("я", 2049)+`"}`, 400)
 	request("PATCH", user, `{"userId":"Other"}`, 400)
-	if got := request("GET", user, "", 200); got != profile {
+	request("PATCH", user, `{"uiSettings":{"accentCustomColor":"not-hex"}}`, 400)
+	if got := request("GET", user, "", 200); !reflect.DeepEqual(got, profile) {
 		t.Fatalf("invalid patch modified profile")
 	}
-	if got := request("GET", admin, "", 200); got != (store.UserProfile{MemoryEnabled: true}) {
+	if got := request("GET", admin, "", 200); !reflect.DeepEqual(got, store.UserProfile{MemoryEnabled: true, UISettings: json.RawMessage("{}")}) {
 		t.Fatalf("admin received another user's profile")
+	}
+	uiUpdated := request("PATCH", user, `{"uiSettings":{"theme":"light","accent":"ocean"}}`, 200)
+	if !strings.Contains(string(uiUpdated.UISettings), `"theme":"light"`) {
+		t.Fatalf("expected uiSettings persisted, got %s", uiUpdated.UISettings)
 	}
 	if got := request("PATCH", admin, `{"displayName":"Админ"}`, 200); got.DisplayName != "Админ" {
 		t.Fatalf("admin patch: %+v", got)

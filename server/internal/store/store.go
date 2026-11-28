@@ -178,7 +178,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version == 19 {
+	if version == 20 {
 		return nil
 	}
 	// SQLite requires disabling foreign keys outside the transaction on this connection.
@@ -195,7 +195,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	switch version {
 	case 0:
-		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=19;"); err != nil {
+		if _, err := tx.ExecContext(ctx, initialSchema+"\nPRAGMA user_version=20;"); err != nil {
 			return err
 		}
 	case 1:
@@ -506,7 +506,21 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=19;`); err != nil {
 			return err
 		}
+		fallthrough
 	case 19:
+		var uiSettingsExists bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('users') WHERE name='ui_settings_json')").Scan(&uiSettingsExists); err != nil {
+			return err
+		}
+		if !uiSettingsExists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE users ADD COLUMN ui_settings_json TEXT NOT NULL DEFAULT '{}';`); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=20;`); err != nil {
+			return err
+		}
+	case 20:
 	default:
 		return fmt.Errorf("unsupported schema version %d", version)
 	}

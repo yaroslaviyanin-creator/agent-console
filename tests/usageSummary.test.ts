@@ -107,3 +107,87 @@ test('formatCompactTokens, formatUsageInline, and formatUsageTooltip format inpu
   assert.match(tip, /Выход:/)
   assert.match(tip, /Обдумывание:/)
 })
+
+test('ChatContextPanel merges default/empty modelId with explicit model name and renders compact empty sections', () => {
+  const turns: Turn[] = [
+    {
+      id: 't1',
+      prompt: 'Первый',
+      time: 1000,
+      provider: 'codex',
+      model: 'Codex',
+      seq: 1,
+      state: 'completed',
+      parts: [{ kind: 'text', text: 'Ок' }],
+      usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 20, totalTokens: 120 },
+    },
+    {
+      id: 't2',
+      prompt: 'Второй',
+      time: 2000,
+      provider: 'codex',
+      modelId: 'gpt-6.2-sol',
+      model: 'GPT-6.2-Sol',
+      seq: 2,
+      state: 'completed',
+      parts: [{ kind: 'text', text: 'Ок 2' }],
+      usage: { inputTokens: 200, cachedInputTokens: 0, outputTokens: 40, totalTokens: 240 },
+    },
+  ]
+  const catalog = {
+    codex: [
+      { id: 'gpt-6.2-sol', name: 'GPT-6.2-Sol', isDefault: true },
+      { id: 'gpt-6.2-astra', name: 'GPT-6.2-Astra', isDefault: false },
+    ],
+  }
+  const summary = summarizeChatContext(turns, 'Codex', 'GPT-6.2-Sol', catalog)
+  assert.equal(summary.byProvider.length, 1)
+  assert.equal(summary.byProvider[0]?.models.length, 1)
+  assert.equal(summary.byProvider[0]?.models[0]?.modelLabel, 'GPT-6.2-Sol')
+  assert.equal(summary.byProvider[0]?.models[0]?.count, 2)
+
+  const emptyHtml = renderToStaticMarkup(createElement(ChatContextPanel, {
+    turns: [],
+    providerLabel: 'Codex',
+    modelLabel: 'GPT-6.2-Sol',
+    serverModelsByProvider: catalog,
+    remote: null,
+    canAttach: true,
+    onAttachClick: () => {},
+    onClose: () => {},
+  }))
+  assert.match(emptyHtml, /context-section is-empty/)
+  assert.doesNotMatch(emptyHtml, /В этом чате пока нет файлов/)
+
+  // Deduplicates provider when old turns omit provider/modelId and new turns set 'codex' / 'gpt-6.2-sol'
+  const mixedTurns: Turn[] = [
+    {
+      id: 'legacy-1',
+      prompt: 'Старый запрос',
+      time: 1000,
+      model: 'Codex',
+      seq: 1,
+      state: 'completed',
+      parts: [{ kind: 'text', text: 'Ответ 1' }],
+      usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 20, totalTokens: 120 },
+    },
+    {
+      id: 'new-1',
+      prompt: 'Новый запрос',
+      time: 2000,
+      provider: 'codex',
+      modelId: 'gpt-6.2-sol',
+      model: 'GPT-6.2-Sol',
+      seq: 2,
+      state: 'completed',
+      parts: [{ kind: 'text', text: 'Ответ 2' }],
+      usage: { inputTokens: 300, cachedInputTokens: 0, outputTokens: 60, totalTokens: 360 },
+    },
+  ]
+  const dedupSummary = summarizeChatContext(mixedTurns, 'Codex', 'GPT-6.2-Sol', catalog, 'codex')
+  assert.equal(dedupSummary.byProvider.length, 1)
+  assert.equal(dedupSummary.byProvider[0]?.providerId, 'codex')
+  assert.equal(dedupSummary.byProvider[0]?.count, 2)
+  assert.equal(dedupSummary.byProvider[0]?.models.length, 1)
+  assert.equal(dedupSummary.byProvider[0]?.models[0]?.modelLabel, 'GPT-6.2-Sol')
+})

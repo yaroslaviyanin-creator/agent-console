@@ -1,12 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
-  CodeXml, Download, Eye, GitFork, MessageSquare, MoreHorizontal, Pencil, Pin, PinOff, Plus, Radio, Receipt, RefreshCw, Settings2, Share2, Trash2, Users, X,
+  CodeXml, Download, Eye, GitFork, MessageSquare, MoreHorizontal, Pencil, Pin, PinOff, Plus, Radio, Receipt, Settings2, Share2, Shield, Trash2, Users, X,
 } from 'lucide-react'
 import {
-  deleteChatItem, downloadChatMarkdown, forkChatAt, newChat, refreshCodexIndex, renameChat, selectChat, togglePinChat, useChats,
+  deleteChatItem, downloadChatMarkdown, forkChatAt, newChat, renameChat, selectChat, togglePinChat, useChats,
   type Chat,
 } from './chatStore'
+import { Quotas, ServerQuotas } from './Quotas'
 import { useAccountStore } from './accountStore'
 import { UserAvatar } from './UserAvatar'
 
@@ -35,14 +36,17 @@ export function Sidebar({
   close,
   openBilling,
   openSettings,
+  openAdmin,
   openShare,
 }: {
   close: () => void
   openBilling: () => void
   openSettings: () => void
+  openAdmin?: (() => void) | undefined
   openShare: (chatId: string) => void
 }) {
-  const { chats, activeId, mode, connected, codexIndex, workspace } = useChats()
+  const { chats, activeId, mode, connected, workspace, remote } = useChats()
+  const mobileQuotaRef = useRef<HTMLDetailsElement>(null)
   const serverQuota = useAccountStore(s => s.serverQuota)
   const online = mode === 'demo' || connected
   const [menu, setMenu] = useState<MenuState | null>(null)
@@ -362,27 +366,23 @@ export function Sidebar({
         <h2>Мои чаты</h2>
         {chats.filter(c => c.access === 'owner').map(row)}
         {shared.length > 0 && <><h2>Доступные мне</h2>{shared.map(row)}</>}
-        {codexIndex !== 'hidden' && <>
-          <div className="codex-index-heading">
-            <h2>Чаты Codex</h2>
-            <button
-              className="icon-btn"
-              type="button"
-              aria-label="Обновить чаты Codex"
-              title="Обновить чаты Codex"
-              disabled={codexIndex === 'loading'}
-              onClick={() => void refreshCodexIndex()}
-            >
-              <RefreshCw size={14} />
-            </button>
-          </div>
-          {codexIndex === 'loading' && <p className="index-status" role="status">Загружаю чаты…</p>}
-          {codexIndex === 'error' && <p className="index-status" role="status">История Codex недоступна.</p>}
-          {chats.filter(c => c.indexedCodex).map(row)}
-          {codexIndex === 'ready' && !chats.some(c => c.indexedCodex) && <p className="index-status">На сервере нет чатов Codex.</p>}
-        </>}
       </nav>
       <div className="side-bottom">
+        {workspace && (
+          <div className="side-mobile-meta">
+            <div className="side-mobile-quotas">
+              {remote
+                ? <ServerQuotas menuRef={mobileQuotaRef} onOpenChange={() => {}} />
+                : <Quotas userId={workspace.user.id} menuRef={mobileQuotaRef} onOpenChange={() => {}} />}
+            </div>
+            {openAdmin && (
+              <button type="button" className="alt-action side-admin-btn" onClick={openAdmin}>
+                <Shield size={14} aria-hidden="true" />
+                <span>Админка</span>
+              </button>
+            )}
+          </div>
+        )}
         {mode === 'demo' && (
           <button className="billing-link" onClick={openBilling}>
             <Receipt size={15} />
